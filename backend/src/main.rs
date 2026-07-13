@@ -24,39 +24,29 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use zbus::Connection;
 
-mod auth;
+mod api;
 mod automation;
-mod cell_lock_store;
-mod config;
-mod db;
-mod device_network;
-mod device_status;
-mod esim;
-mod handlers;
-mod iptables;
-mod models;
-mod modem_manager;
-mod notification;
-mod notification_queue;
-mod ota;
-mod serial;
-mod sms_listener;
+mod ims;
+mod infra;
+mod cellular;
+mod network;
+mod notify;
+mod messaging;
+mod sim;
 mod state;
-mod system_event;
-mod system_event_monitor;
-mod utils;
-mod verification_code;
+mod system;
+mod access;
 
-use config::{get_default_config_path, ConfigManager};
-use db::Database;
-use device_network::DdnsManager;
-use esim::EsimSupervisor;
-use handlers::*;
-use modem_manager::{ensure_nm_modem_profile, init_data_connection};
-use notification::NotificationSender;
-use notification_queue::*;
+use infra::config::{get_default_config_path, ConfigManager};
+use infra::db::Database;
+use network::device_network::DdnsManager;
+use sim::esim::EsimSupervisor;
+use api::handlers::*;
+use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
+use notify::notification::NotificationSender;
+use notify::notification_queue::*;
 use state::AppState;
-use system_event::{
+use system::system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,
     SystemEventEmitter,
 };
@@ -297,8 +287,8 @@ async fn main() -> Result<()> {
         let config_manager = ConfigManager::new(get_default_config_path());
         let security = config_manager.get_security();
         return match command {
-            AuthCommand::ResetPassword => auth::reset_admin_password_interactive(&db, &security),
-            AuthCommand::Clear => auth::clear_admin_auth(&db),
+            AuthCommand::ResetPassword => api::auth::reset_admin_password_interactive(&db, &security),
+            AuthCommand::Clear => api::auth::clear_admin_auth(&db),
         };
     }
 
@@ -326,6 +316,8 @@ async fn main() -> Result<()> {
     let data_user_disabled = Arc::new(AtomicBool::new(!config_manager.get_data_enabled()));
     let airplane_mode_requested = Arc::new(AtomicBool::new(false));
     let cell_monitoring_active = Arc::new(AtomicBool::new(false));
+    let vowifi_runtime = Arc::new(access::vowifi::runtime::VowifiRuntime::new());
+    let volte_runtime = Arc::new(access::volte::runtime::VolteRuntime::new());
     let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
 
     let nm_result = ensure_nm_modem_profile().await;
@@ -338,7 +330,7 @@ async fn main() -> Result<()> {
         Arc::clone(&app_db),
     ));
     let system_event_emitter = Arc::new(SystemEventEmitter::new(Arc::clone(&notification_sender)));
-    let (sms_resync, sms_resync_rx) = sms_listener::sms_resync_channel();
+    let (sms_resync, sms_resync_rx) = messaging::sms_listener::sms_resync_channel();
     let ddns_manager = Arc::new(DdnsManager::new());
     {
         let notification_queue_worker = Arc::clone(&notification_sender);
@@ -346,11 +338,11 @@ async fn main() -> Result<()> {
             notification_queue_worker.run_queue_worker().await;
         });
     }
-    system_event_monitor::spawn_system_event_monitor(
+    system::system_event_monitor::spawn_system_event_monitor(
         Arc::clone(&system_event_emitter),
         Arc::clone(&dbus_conn),
     );
-    device_status::spawn_device_status_scheduler(
+    system::device_status::spawn_device_status_scheduler(
         Arc::clone(&config_manager),
         Arc::clone(&notification_sender),
         Arc::clone(&app_db),
@@ -385,10 +377,10 @@ async fn main() -> Result<()> {
         let notification_clone = Arc::clone(&notification_sender);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(crate::ota::duration_until_next_update_check()).await;
+                tokio::time::sleep(crate::system::ota::duration_until_next_update_check()).await;
                 let config = config_clone.get_version_update_notifications();
                 if config.enabled {
-                    if let Err(err) = crate::ota::check_and_notify_version_update(
+                    if let Err(err) = crate::system::ota::check_and_notify_version_update(
                         Arc::clone(&config_clone),
                         Arc::clone(&notification_clone),
                     )
@@ -406,12 +398,14 @@ async fn main() -> Result<()> {
         let conn_clone = Connection::system().await?;
         let db_clone = Arc::clone(&app_db);
         let notification_clone = Arc::clone(&notification_sender);
+        let sms_config_clone = Arc::clone(&config_manager);
         let resync_rx = sms_resync_rx;
         tokio::spawn(async move {
-            let _ = sms_listener::start_sms_listener(
+            let _ = messaging::sms_listener::start_sms_listener(
                 conn_clone,
                 db_clone,
                 notification_clone,
+                sms_config_clone,
                 resync_rx,
             )
             .await;
@@ -452,7 +446,7 @@ async fn main() -> Result<()> {
             // 初始延迟 5 秒，等待系统稳定
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             tracing::info!(interval = 15, "Watchdog started");
-            modem_manager::data_connection_watchdog(
+            cellular::modem_manager::data_connection_watchdog(
                 conn_clone,
                 15,
                 user_off,
@@ -481,8 +475,6 @@ async fn main() -> Result<()> {
         .allow_headers(Any);
 
     // 创建统一的应用状态
-    spawn_system_stats_sampler(Arc::clone(&dbus_conn));
-
     let app_state = AppState::new(
         dbus_conn,
         app_db,
@@ -494,6 +486,8 @@ async fn main() -> Result<()> {
         sms_resync,
         data_user_disabled,
         airplane_mode_requested,
+        vowifi_runtime,
+        volte_runtime,
         cell_monitoring_active,
     );
 
@@ -501,15 +495,13 @@ async fn main() -> Result<()> {
     automation::spawn_automation_scheduler(app_state.clone());
 
     // Build protected routes - 使用统一的 AppState
+    spawn_vowifi_auto_restore(app_state.clone());
+
     let protected_routes = Router::new()
         // ========== 设备信息接口 ==========
         .route("/api/device", get(get_device_info).options(options_handler))
         // ========== SIM 卡接口 ==========
         .route("/api/sim", get(get_sim_info).options(options_handler))
-        .route(
-            "/api/sim/details/refresh",
-            post(refresh_sim_details_handler).options(options_handler),
-        )
         .route(
             "/api/sim/cache",
             post(update_sim_cache_handler).options(options_handler),
@@ -768,6 +760,74 @@ async fn main() -> Result<()> {
             get(get_ims_status_handler).options(options_handler),
         )
         .route(
+            "/api/vowifi/status",
+            get(get_vowifi_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/control",
+            get(get_vowifi_control_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/feature",
+            post(set_vowifi_feature_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/connection",
+            post(set_vowifi_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/connect",
+            post(connect_vowifi_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/profile",
+            get(get_vowifi_profile_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/diagnostics",
+            get(get_vowifi_diagnostics_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/profiles",
+            get(get_vowifi_profiles_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/events",
+            get(get_vowifi_events_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/soak",
+            get(get_vowifi_soak_runs_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/sms/delivery",
+            get(get_vowifi_sms_deliveries_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/sms/delivery/{message_id}",
+            get(get_vowifi_sms_delivery_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/esim-restore/status",
+            get(get_vowifi_esim_restore_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/control",
+            get(get_volte_control_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/feature",
+            post(set_volte_feature_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/call/status",
+            get(get_volte_call_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/voice",
+            post(set_volte_voice_handler).options(options_handler),
+        )
+        .route(
             "/api/voicemail/status",
             get(get_voicemail_status_handler).options(options_handler),
         )
@@ -803,6 +863,11 @@ async fn main() -> Result<()> {
         .route(
             "/api/sms/clear",
             post(clear_sms_handler).options(options_handler),
+        )
+        // ========== 语音通话接口 (VoWiFi) ==========
+        .route(
+            "/api/voice/call",
+            post(place_call_handler).options(options_handler),
         )
         // ========== 系统接口 ==========
         .route("/api/stats", get(get_system_stats).options(options_handler))
@@ -906,36 +971,36 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/auth/password",
-            post(auth::change_password).options(options_handler),
+            post(api::auth::change_password).options(options_handler),
         )
         .route(
             "/api/auth/settings",
-            get(auth::get_settings)
-                .post(auth::set_settings)
+            get(api::auth::get_settings)
+                .post(api::auth::set_settings)
                 .options(options_handler),
         )
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
-            auth::auth_middleware,
+            api::auth::auth_middleware,
         ));
 
     let app = Router::new()
         .route("/api/health", get(health_check).options(options_handler))
         .route(
             "/api/auth/status",
-            get(auth::status).options(options_handler),
+            get(api::auth::status).options(options_handler),
         )
         .route(
             "/api/auth/setup",
-            post(auth::setup).options(options_handler),
+            post(api::auth::setup).options(options_handler),
         )
         .route(
             "/api/auth/login",
-            post(auth::login).options(options_handler),
+            post(api::auth::login).options(options_handler),
         )
         .route(
             "/api/auth/logout",
-            post(auth::logout).options(options_handler),
+            post(api::auth::logout).options(options_handler),
         )
         .merge(protected_routes)
         .with_state(app_state)
@@ -1039,4 +1104,11 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+
+    warn!("Shutdown signal received; starting graceful shutdown");
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
+        std::process::exit(0);
+    });
 }

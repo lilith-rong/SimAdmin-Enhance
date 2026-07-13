@@ -1,5 +1,5 @@
-pub mod traits;
-pub mod tasks;
 pub mod scheduler;
+pub mod tasks;
+pub mod traits;
 
 pub use scheduler::spawn_automation_scheduler;

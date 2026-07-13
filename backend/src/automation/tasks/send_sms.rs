@@ -1,8 +1,8 @@
 use crate::automation::traits::AutomationTaskHandler;
+use crate::infra::db::beijing_sms_now_string;
+use crate::cellular::modem_manager::send_sms;
 use crate::state::AppState;
-use crate::modem_manager::send_sms;
-use crate::db::beijing_sms_now_string;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use ring::rand::{SecureRandom, SystemRandom};
 use tracing::{info, warn};
 
@@ -13,7 +13,8 @@ fn generate_random_string(len: usize) -> String {
     let mut bytes = vec![0u8; len];
     if rng.fill(&mut bytes).is_ok() {
         const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        bytes.iter()
+        bytes
+            .iter()
             .map(|&b| CHARS[(b as usize) % CHARS.len()] as char)
             .collect()
     } else {
@@ -57,22 +58,28 @@ impl AutomationTaskHandler for SendSmsHandler {
         "send_sms"
     }
 
-    fn execute<'a>(&'a self, app: &'a AppState, params: &'a serde_json::Value) -> BoxFuture<'a, Result<()>> {
+    fn execute<'a>(
+        &'a self,
+        app: &'a AppState,
+        params: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<()>> {
         let phone_number = match params
             .get("phone_number")
             .and_then(|v| v.as_str())
-            .context("缺少接收号码") {
-                Ok(pn) => pn.to_string(),
-                Err(e) => return async move { Err(e) }.boxed(),
-            };
+            .context("缺少接收号码")
+        {
+            Ok(pn) => pn.to_string(),
+            Err(e) => return async move { Err(e) }.boxed(),
+        };
 
         let content_template = match params
             .get("content")
             .and_then(|v| v.as_str())
-            .context("缺少短信内容") {
-                Ok(c) => c.to_string(),
-                Err(e) => return async move { Err(e) }.boxed(),
-            };
+            .context("缺少短信内容")
+        {
+            Ok(c) => c.to_string(),
+            Err(e) => return async move { Err(e) }.boxed(),
+        };
 
         let random_delay_seconds = params
             .get("random_delay_seconds")

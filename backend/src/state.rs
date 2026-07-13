@@ -9,14 +9,16 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
-use crate::cell_lock_store::CellLockStore;
-use crate::config::ConfigManager;
-use crate::db::Database;
-use crate::device_network::DdnsManager;
-use crate::esim::EsimSupervisor;
-use crate::notification::NotificationSender;
-use crate::sms_listener::SmsResyncHandle;
-use crate::system_event::SystemEventEmitter;
+use crate::access::volte::runtime::VolteRuntime;
+use crate::access::vowifi::runtime::VowifiRuntime;
+use crate::cellular::cell_lock_store::CellLockStore;
+use crate::infra::config::ConfigManager;
+use crate::infra::db::Database;
+use crate::network::device_network::DdnsManager;
+use crate::sim::esim::EsimSupervisor;
+use crate::notify::notification::NotificationSender;
+use crate::messaging::sms_listener::SmsResyncHandle;
+use crate::system::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
 pub struct ActiveCallRecord {
@@ -49,6 +51,10 @@ pub struct AppState {
     /// 用户在界面关闭蜂窝数据后，禁止 init/watchdog 自动再次 Connect。
     pub data_user_disabled: Arc<AtomicBool>,
     pub airplane_mode_requested: Arc<AtomicBool>,
+    pub vowifi_runtime: Arc<VowifiRuntime>,
+    pub vowifi_connect_lock: Arc<Mutex<()>>,
+    pub volte_runtime: Arc<VolteRuntime>,
+    pub volte_connect_lock: Arc<Mutex<()>>,
     /// 小区/信号轮询是否已按需唤醒。
     pub cell_monitoring_active: Arc<AtomicBool>,
 }
@@ -66,6 +72,8 @@ impl AppState {
         sms_resync: SmsResyncHandle,
         data_user_disabled: Arc<AtomicBool>,
         airplane_mode_requested: Arc<AtomicBool>,
+        vowifi_runtime: Arc<VowifiRuntime>,
+        volte_runtime: Arc<VolteRuntime>,
         cell_monitoring_active: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -82,6 +90,10 @@ impl AppState {
             cell_lock: Arc::new(Mutex::new(CellLockStore::default())),
             data_user_disabled,
             airplane_mode_requested,
+            vowifi_runtime,
+            vowifi_connect_lock: Arc::new(Mutex::new(())),
+            volte_runtime,
+            volte_connect_lock: Arc::new(Mutex::new(())),
             cell_monitoring_active,
         }
     }
@@ -129,6 +141,18 @@ impl FromRef<AppState> for Arc<DdnsManager> {
 impl FromRef<AppState> for Arc<EsimSupervisor> {
     fn from_ref(state: &AppState) -> Self {
         state.esim_supervisor.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<VowifiRuntime> {
+    fn from_ref(state: &AppState) -> Self {
+        state.vowifi_runtime.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<VolteRuntime> {
+    fn from_ref(state: &AppState) -> Self {
+        state.volte_runtime.clone()
     }
 }
 

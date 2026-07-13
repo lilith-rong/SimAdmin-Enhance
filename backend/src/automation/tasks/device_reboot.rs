@@ -1,6 +1,6 @@
 use crate::automation::traits::AutomationTaskHandler;
+use crate::api::handlers::run_safe_os_reboot_sequence;
 use crate::state::AppState;
-use crate::handlers::run_safe_os_reboot_sequence;
 use anyhow::Result;
 use futures_util::future::{BoxFuture, FutureExt};
 
@@ -11,7 +11,11 @@ impl AutomationTaskHandler for DeviceRebootHandler {
         "reboot_device"
     }
 
-    fn execute<'a>(&'a self, app: &'a AppState, params: &'a serde_json::Value) -> BoxFuture<'a, Result<()>> {
+    fn execute<'a>(
+        &'a self,
+        app: &'a AppState,
+        params: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<()>> {
         let delay_seconds = params
             .get("delay_seconds")
             .and_then(|v| v.as_u64())

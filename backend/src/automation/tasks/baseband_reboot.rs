@@ -1,9 +1,9 @@
 use crate::automation::traits::AutomationTaskHandler;
+use crate::cellular::modem_manager::restart_baseband;
 use crate::state::AppState;
-use crate::modem_manager::restart_baseband;
-use anyhow::{Result, Context, anyhow};
-use std::sync::atomic::Ordering;
+use anyhow::{anyhow, Context, Result};
 use futures_util::future::{BoxFuture, FutureExt};
+use std::sync::atomic::Ordering;
 
 pub struct BasebandRebootHandler;
 
@@ -12,7 +12,11 @@ impl AutomationTaskHandler for BasebandRebootHandler {
         "restart_baseband"
     }
 
-    fn execute<'a>(&'a self, app: &'a AppState, _params: &'a serde_json::Value) -> BoxFuture<'a, Result<()>> {
+    fn execute<'a>(
+        &'a self,
+        app: &'a AppState,
+        _params: &'a serde_json::Value,
+    ) -> BoxFuture<'a, Result<()>> {
         async move {
             let auto_connect_data = !app.data_user_disabled.load(Ordering::SeqCst);
             let allow_roaming = app.config_manager.get_roaming_allowed();
