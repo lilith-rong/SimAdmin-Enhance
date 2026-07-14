@@ -1,12 +1,15 @@
-# SimAdmin 扩展开发文档：多路径语音/短信统一接入与 SIP Trunk 网关
+﻿# SimAdmin 扩展开发文档：多路径语音/短信统一接入与 SIP Trunk 网关（进度更新版 v2：视频切换与 Trunk 对接）
 
-> **开发对象**：`SimAdmin-main`（**最新上游，版本 1.1.5**，无 vowifi、无 volte）
-> **文档性质**：四版本对比 + VoWiFi 代码回迁 + VoLTE 逆向重构 + 二次开发扩展 + 分阶段实施路线图 + TodoList
-> **撰写依据**：对以下四个项目的实际代码/二进制对比分析
-> - `SimAdmin-main`（**最新上游 1.1.5**，vowifi 已被原作者移除，无 volte）
-> - `SimAdmin-main-vowifi`（旧上游 1.1.3，**含完整 vowifi 脚手架**，原 `SimAdmin-main` 重命名而来）
-> - `SimAdmin`（旧上游 1.1.3 + AI 编写的 `vowifi/voice.rs` 语音信令层）
+> **文档性质**：进度快照 + 四版本对比 + VoWiFi 代码回迁 + VoLTE 逆向重构 + 二次开发扩展 + 分阶段实施路线图 + TodoList
+> **本版说明**：本文在原规划文档基础上，依据**当前代码库真实状态**更新进度、重排 TodoList（已完成阶段前置、未完成阶段后置）。
+> **v2 增补（本副本新增）**：在 `_进度更新版.md` 基础上，新增记录 —— (a) 阶段 C 三层 SMS 编排器与阶段 F ViLTE 离线层的落地；(b) **活跃通话中 VoLTE↔ViLTE 视频升级/降级**（re-INVITE 媒体重协商）的实现与用法；(c) 预留的 **Trunk 对接接口**如何在注册 Trunk / 对接 Asterisk / 后期自研语音网关后，让外部 Linphone 软电话在通话中切换语音/视频。本副本是独立文件，便于回溯开发过程；原 `_进度更新版.md` 保持不动。
+> **撰写依据**：对以下项目的实际代码/二进制对比分析
+> - `SimAdmin`（**当前开发工作树**，基线为旧上游 1.1.3 + 完整 vowifi + AI 语音信令 + 本次新增 volte + ims 共享核心 + 领域化目录重构）
+> - `SimAdmin-main`（最新上游 1.1.5，vowifi 已被原作者移除，无 volte）
+> - `SimAdmin-main-vowifi`（旧上游 1.1.3，**含完整 vowifi 脚手架**）
 > - `SimAdmin-VoLTE`（未开源的已编译二进制 1.1.6-dev18，含独立 `src/volte.rs`，经 clean-room 静态分析）
+>
+> ⚠️ **基线校正（重要）**：原规划以"迁移到最新上游 1.1.5"为前提（含阶段 0 回迁手册）。但**实际二次开发是在 `SimAdmin`（1.1.3 + vowifi）工作树上直接进行的**，并未迁移到 1.1.5。因此原"阶段 0：VoWiFi 回迁到 1.1.5"在当前工作树中**不适用/已跳过**（vowifi 本就在树内）。迁移到 1.1.5 作为一项独立的、尚未执行的可选任务保留在文末。
 >
 > **合规声明**：本文档对 `SimAdmin-VoLTE` 的描述均基于对已编译二进制的**行为级静态分析**（字符串锚点 + 前端 API），不含任何反编译的原始源码。VoWiFi 代码回迁使用的是用户已合法持有的旧版本 GPLv3 源码。所有重构实现基于公开 3GPP/RFC 规范独立完成（clean-room），遵循 GPLv3。
 
@@ -14,6 +17,7 @@
 
 ## 目录
 
+0. [进度快照（截至本版更新）](#零进度快照截至本版更新)
 1. [文档目标与背景](#一文档目标与背景)
 2. [四个版本对比分析](#二四个版本对比分析)
 3. [关键发现：1.1.5 不是 1.1.3 删 vowifi](#三关键发现115-不是-113-删-vowifi)
@@ -28,6 +32,66 @@
 12. [完整 TodoList](#十二完整-todolist)
 13. [合规与可验证性边界](#十三合规与可验证性边界)
 14. [工程规范与交付标准](#十四工程规范与交付标准)
+15. [【v2】活跃通话中 VoLTE↔ViLTE 视频切换（re-INVITE）](#十五v2活跃通话中-volteviilte-视频切换re-invite)
+16. [【v2】Trunk 对接与外部 Linphone 通话中切换语音/视频](#十六v2trunk-对接与外部-linphone-通话中切换语音视频)
+17. [【v2】名词解释：什么是"真机 IO"](#十七v2名词解释什么是真机-io)
+
+---
+
+## 零、进度快照（截至本版更新）
+
+> **本节是本次更新新增的活动状态区**，用于快速对齐"计划 vs 已落地"。下方各章的技术方案保持原样（作为设计蓝图），**实际完成状态以本节 + 第十二章 TodoList 的勾选为准**。
+>
+> ⚠️ **重要基线澄清**：本文档原计划以 **1.1.5** 为开发底座（先回迁 vowifi 再扩展）。但**实际的二次开发是在 `SimAdmin`（1.1.3 + vowifi + voice 基线）工作树上直接进行的**，并未迁移到 1.1.5。因此："阶段 0 VoWiFi 回迁"在当前工作树中**不适用**（vowifi 本就在树内）；迁移到 1.1.5 作为一项**独立的、尚未进行**的任务另列。下方状态均针对**当前 `SimAdmin` 工作树的真实代码**。
+
+### 0.1 阶段完成状态总览
+
+| 阶段 | 目标 | 状态 | 说明 |
+|------|------|:---:|------|
+| **目录/架构重构** | 领域化分层 + 共享核心抽离 | 🟢 **已完成** | `ims/` 共享核心 + `access/{vowifi,volte}` 接入腿 + 8 个业务领域目录；378 单测全绿；已建 git 基线 |
+| **A. 共享 IMS 核心** | VoWiFi/VoLTE 合并 SIP/AKA 层 | 🟢 **部分完成** | `ims/` 已抽出 `digest_aka`（AKAv1/v2-MD5 + HMAC-MD5）+ `sip_frame`（组帧/解析原语），volte 与 vowifi/live.rs **均已复用**；但**未做**完整 `ImsChannel` trait / `AccessLeg` enum / `context.rs` 中立参数层 |
+| **B. VoLTE SMS 腿** | VoLTE 收发短信离线层 | 🟢 **部分完成** | `access/volte/` 全套离线层已就位（identity/bearer/pcscf/ipsec/sip/sms/runtime）+ 单测；**未做** `channel.rs`（`ImsChannel` 实现）、`live.rs` 真机 IO、真机验证 |
+| **E. 语音（部分）** | VoLTE 语音编排 + 信令 | 🟢 **部分完成** | `voice.rs` 已参数化（解 `CarrierProfile` 耦合）；`access/volte/voice.rs` 语音编排 + SIP INVITE/ACK/BYE/CANCEL + `rtp_relay.rs` 骨架 + 单测；**未做** relay 接入真实呼叫、编排器选路、真机通话 |
+| **C. 三层 SMS 编排器** | 可配置优先级 + 活跃监听者 + 去重 | 🟢 **离线层完成** | `orchestrator/`（sms_router 优先级发送+回退 / listener_election 活跃监听者 / dedup 跨传输指纹）+ DB 独立 `sms_dedup` 表 + 每日清理任务 + `/api/sms/path-policy` 读写 API；**未做** live 发送/接收接线（依赖 B-live）、前端策略 UI |
+| **D. SIP Trunk 网关** | 对外 SIP endpoint + RTP relay | 🟡 **接口预留** | `trunk/` 目录尚未建；但 ViLTE 侧已预留 `TrunkVideoSeam` trait + `UnwiredTrunkVideoSeam` 占位；`rtp_relay.rs` 的 relay 核心媒体无关、可直接复用 |
+| **F. ViLTE 视频** | SDP video + H.264 relay | 🟢 **离线层完成** | `access/volte/vilte.rs`（H.264 `m=video` SDP 构造/解析 + 音视频合并 SDP + 视频协商 + `VideoRelay` 复用 relay 核心 + `TrunkVideoSeam` 预留）+ `VilteConfig` + `/api/vilte/*` API + 单测；**未做** 真机 IO、Trunk 接入 |
+| **G. 通话中 VoLTE↔ViLTE 切换** | 活跃通话内加/撤视频（re-INVITE） | 🟢 **离线层完成** | `sip::build_reinvite`（对话内 INVITE + CSeq 递增）+ `VolteVoiceCall::upgrade_to_video`/`downgrade_to_audio`/`confirm_media_switch` + `CallMediaMode` + 单测；**未做** 真机 IO、经 Trunk 传导到 Linphone |
+| **迁移到 1.1.5** | 把成果搬到最新上游底座 | 🔴 **未开始** | 当前在 1.1.3 基线；含 Email/ServerChan3 等 1.1.5 新功能的合并 |
+
+### 0.2 当前工作树实际目录结构（已重构）
+
+```
+SimAdmin/backend/src/
+├── main.rs / state.rs          # 入口 + 全局 AppState
+├── ims/                        # 🟢 共享 IMS 核心（digest_aka + sip_frame）
+│   ├── digest_aka.rs           #   AKAv1/v2-MD5 + HMAC-MD5 + nonce 解码（RFC 向量单测）
+│   └── sip_frame.rs            #   SIP 组帧/解析原语（parse_status/body/frame_len/header_*）
+├── access/                     # 🟢 接入腿分组
+│   ├── vowifi/                 #   VoWiFi 腿（ike*/ims/sms/qmi_uim/live/voice/... 31 文件，复用 ims/）
+│   └── volte/                  #   VoLTE 腿（identity/bearer/pcscf/ipsec/sip/sms/runtime/voice/rtp_relay/vilte，复用 ims/）
+│       └── vilte.rs            #   🟢 ViLTE 视频离线层（H.264 SDP + VideoRelay + TrunkVideoSeam 预留）
+├── orchestrator/               # 🟢 三层 SMS 编排器（sms_router/listener_election/dedup）
+├── automation/                 # 自动化任务调度
+├── api/                        # handlers + models + auth
+├── cellular/                   # modem_manager + cell_lock_store + serial
+├── messaging/                  # sms_listener + verification_code
+├── notify/                     # notification + notification_queue
+├── network/                    # device_network + iptables
+├── system/                     # ota + system_event + system_event_monitor + device_status
+├── sim/                        # esim
+└── infra/                      # config + db + utils
+```
+
+> 注意：与原第 4.2 节"规划目录"的差异——实际把 vowifi/volte **收进了 `access/` 伞下**（而非顶层平级），共享核心 `ims/` 目前是**轻量版**（只含 digest_aka + sip_frame 两个纯逻辑文件），尚未实现规划中的 `context.rs`/`access.rs`（`ImsChannel`/`AccessLeg`）/`register.rs`/`sms_codec.rs`。这些是阶段 A 的剩余工作。`orchestrator/`（阶段 C）与 `access/volte/vilte.rs`（阶段 F）已作为离线层落地。`trunk/`（阶段 D）尚未建，但 ViLTE 侧已预留 `TrunkVideoSeam` 对接点。
+
+### 0.3 下一步建议顺序
+
+1. **补齐阶段 A 剩余**：`ims/context.rs`（中立参数）+ `ims/access.rs`（`ImsChannel`/`AccessLeg`），把 volte/vowifi 的通道差异真正收敛到 trait/enum 后（目前两腿仍各自持有通道逻辑）。
+2. **阶段 B 收尾**：`access/volte/channel.rs` + `live.rs` **真机 IO**；真机验证 VoLTE 注册/收发短信。（真机 IO 定义见 §十五）
+3. ~~**阶段 C 编排器**~~：✅ 离线层已完成（`orchestrator/`）。剩余：live 发送/接收接线、前端策略 UI。
+4. **阶段 D Trunk 网关**：这是让离线信令层真正跑起来的关键一步（外部软电话经设备拨打运营商电话），也是 ViLTE 通话中视频切换端到端可用的前提。见 §十六。
+5. ~~**阶段 E/F**~~：✅ 语音信令骨架 + ViLTE 视频离线层已完成。剩余：relay 接入真实呼叫、真机通话。
+6. ~~**阶段 G 通话中 VoLTE↔ViLTE 切换**~~：✅ 离线层已完成。见 §十七。
 
 ---
 
@@ -722,11 +786,14 @@ pub struct RtpRelay { ims_side: UdpSocket, trunk_side: UdpSocket }
 ## 十一、分阶段实施路线图
 
 > 每阶段独立可编译、带单元测试。触碰上游代码的阶段标注 ⚠️。
+>
+> **进度标记（本次更新）**：🟢 已完成/部分完成 · 🔴 未开始。详见第零节快照与第十二章 TodoList。
 
-### 阶段 0：VoWiFi 回迁到 1.1.5 ⚠️（前置，见第五章）
-让 1.1.5 重获 VoWiFi 能力且不破坏新功能。**所有后续阶段的基础。**
+### 阶段 0：VoWiFi 回迁到 1.1.5 ⚠️（前置，见第五章）— 🟢 不适用/已具备
+> **状态说明**：当前工作树 `SimAdmin` 本就是 1.1.3+vowifi 基线，VoWiFi 能力已在树中，**无需回迁**。本章手册保留，用于**未来迁移到 1.1.5 上游底座**时参考（见 TodoList「迁移到 1.1.5」）。
 
-### 阶段 A：抽取共享 IMS 核心 ⚠️（**前置于 VoLTE，取代旧“可选阶段C”**）
+### 阶段 A：抽取共享 IMS 核心 ⚠️（**前置于 VoLTE，取代旧“可选阶段C”**）— 🟢 部分完成
+> **状态说明**：已轻量抽出 `ims/digest_aka.rs` + `ims/sip_frame.rs`，volte 与 vowifi/live.rs 均已复用（消除 AKA/HMAC/SIP 组帧重复）。**未做**完整的 `ImsChannel` trait / `ImsRegisterParams` 中立入参 / `live.rs` 报文构造上移（见 TodoList A2/A3/A6/A7）。
 > **决策修正（相对旧版）**：经核对 `live.rs`（6585 行）后确认，VoWiFi 与 VoLTE 在 IMS 层高度重合（REGISTER 事务、Digest-AKA、SIP MESSAGE/RP-ACK 构造、响应解析/粘包全部一致），差异只在“受保护通道”。因此**先抽共享层再写 VoLTE**，比“VoLTE 独立重写再回头抽取”省 3000+ 行重复代码、少一次回归。旧版把这步列为“可选/后置”的结论已作废（当时误判 `ims.rs` 是唯一 SIP 载体，实际真实报文在 `live.rs`）。
 - A1 建 `ims/` 模块骨架 + `context.rs`（`ImsIdentity`/`ImsRoute`/`ImsRegisterParams` 中立类型）
 - A2 从 `live.rs` 抽 `ims/sip_message.rs`（`build_register/message/rp_ack/invite/ack`，入参改吃 `ImsRegisterParams` 而非 `&CarrierProfile`）
@@ -738,7 +805,8 @@ pub struct RtpRelay { ims_side: UdpSocket, trunk_side: UdpSocket }
 - A8 **VoWiFi 全量回归**（10 个 voice 单测 + ims/live 单测全过，行为不变）
 - 验证：全离线单测，Windows CI 可跑（`ims/` 无 IO）
 
-### 阶段 B：VoLTE SMS 腿（复用阶段 A 的 `ims/`）
+### 阶段 B：VoLTE SMS 腿（复用阶段 A 的 `ims/`）— 🟢 离线层完成
+> **状态说明**：`volte/` 下 identity/bearer/pcscf/ipsec/sip/sms/runtime 全套离线层已实现并单测（离线可验证部分）。**未做**：`channel.rs` 的 `ImsChannel` 实现（当前 volte 直接用自己的 sip.rs 而非经统一 ImsChannel）、`live.rs` 真机 IO 装配、真机注册收发验证。
 - B1 `volte/identity.rs` IMSI（`AT+CIMI`）+ USIM AID（复用 `vowifi::qmi_uim`，见 §4.2.3）
 - B2 `volte/bearer.rs` ModemManager IMS bearer 建立/删除陈旧/重建
 - B3 `volte/pcscf.rs` P-CSCF 发现（data-path probe）
@@ -749,7 +817,8 @@ pub struct RtpRelay { ims_side: UdpSocket, trunk_side: UdpSocket }
 - B8 `config.rs` `VolteConfig` + `handlers.rs` 两个 handler + `main.rs` 两条路由
 - 验证：离线单测；真机需目标设备（抓包比对）
 
-### 阶段 C：三层 SMS 编排器 ⚠️
+### 阶段 C：三层 SMS 编排器 ⚠️ — 🔴 未开始
+> `orchestrator/` 目录尚不存在。
 - C1 `config.rs` `SmsPathPolicy`（独立于语音的优先级 + 各层 enabled）
 - C2 `orchestrator/sms_router.rs` 优先级发送 + 回退
 - C3 `orchestrator/listener_election.rs` 活跃监听者选举（同一时刻仅一条 IMS 腿注册收信）
@@ -757,14 +826,16 @@ pub struct RtpRelay { ims_side: UdpSocket, trunk_side: UdpSocket }
 - C5 改造 `sms_listener.rs` IMS 活跃时暂停/去重 CS
 - C6 API + 前端策略 UI
 
-### 阶段 D：SIP Trunk 网关
+### 阶段 D：SIP Trunk 网关 — 🔴 未开始
+> `trunk/` 目录尚不存在。这是让内网软电话经设备拨打运营商电话的关键一步。
 - D1 `trunk/sip_endpoint.rs` UAS/UAC
 - D2 `trunk/rtp_relay.rs` RTP 转发
 - D3 `trunk/bridge.rs` 内外腿桥接
 - D4 强制鉴权 + 内网默认 ⚠️安全
 - 与本地 Linphone/Asterisk 联调
 
-### 阶段 E：语音编排（网关模式）
+### 阶段 E：语音编排（网关模式） — 🟡 部分完成（信令骨架已就位）
+> 已完成：`access/volte/voice.rs`（VoLTE 语音编排层，复用参数化后的 `voice.rs` 信令）、SIP INVITE/ACK/BYE/CANCEL/200OK 报文构造、`access/volte/rtp_relay.rs`（RTP 双向转发纯逻辑核心 + `#[cfg(unix)]` UDP relay 循环骨架）。未完成：`VoicePathPolicy` 配置、`voice_router` 选路、relay 接入真实呼叫流程、经 Trunk 桥接外部软电话、真机通话。
 - E1 `config.rs` `VoicePathPolicy`
 - E2 移植呼叫状态机/SDP 到共享层 `ims/`（依赖阶段 A；voice.rs 的 INVITE/SDP/RTP 逻辑）
 - E3 VoLTE 语音腿 INVITE over IMS（复用阶段 A `ims/` + 阶段 B `volte/channel.rs`）
@@ -794,76 +865,105 @@ pub struct RtpRelay { ims_side: UdpSocket, trunk_side: UdpSocket }
 
 ## 十二、完整 TodoList
 
-### 阶段 0 — VoWiFi 回迁（前置）
-- [ ] 0.1 Cargo.toml 加回 num-bigint/num-traits/aes/cbc，保留 lettre
-- [ ] 0.2 拷入 `src/vowifi/` 目录（31 文件）
-- [ ] 0.3 db.rs：transport 字段 + **列索引同步** + vowifi 表/方法/建表迁移
-- [ ] 0.4 config.rs：VowifiConfig + ConfigManager 方法 + **NotificationRule 补 title_template**
-- [ ] 0.5 state.rs：vowifi_runtime/connect_lock 字段 + 入参 + FromRef
-- [ ] 0.6 sms_listener.rs：config_manager 参数 + maybe_scan_sms_paths 门控
-- [ ] 0.7 handlers.rs：13 handler + 辅助函数 + **eSIM 钩子重新植入**
-- [ ] 0.8 main.rs：mod vowifi + 13 路由 + AppState 传参 + auto_restore + listener 传参
-- [ ] 0.9 前端 VoWiFi 页面回迁（可后置）
-- [ ] 0.10 cargo check/test + SMS/eSIM/通知回归验证
+> **重排序说明（本次更新）**：按"已完成 → 部分完成 → 未开始"排序。勾选状态针对**当前 `SimAdmin`（1.1.3+vowifi+voice）工作树**的真实代码。`[x]`=已完成、`[~]`=部分完成、`[ ]`=未开始。
+>
+> ⚠️ 标注差异：实际实现与原规划有偏差处以 `→ 实际:` 标出。
 
-### 阶段 A — 抽离共享 IMS 核心（前置，建议紧接阶段 0）
-> 依据对 `live.rs`（6585 行真实 SIP 客户端）的核对，VoWiFi 与 VoLTE 在 REGISTER/MESSAGE/RP-ACK/AKA 上高度重合，差异仅在"受保护通道"。因此**先建共享层再写 VoLTE**，避免重复实现。模块划分见 §4.2。
-- [ ] A1 新建 `ims/` 模块（`mod.rs` + clean-room 声明），加入 `main.rs` 的 `mod ims;`
-- [ ] A2 `ims/context.rs`：定义中立 `ImsRegisterParams`/`ImsIdentity`/`ImsRoute`（取代对 `CarrierProfile`/`ImsClientTcpRoute` 的直接依赖）
-- [ ] A3 `ims/sip_message.rs`：从 `live.rs` 抽出 `build_*_request`，入参改吃 `ImsRegisterParams`（不再吃 `&CarrierProfile`）
-- [ ] A4 `ims/sip_parse.rs`：抽出 `parse_sip_status`/`sip_body`/`sip_complete_frame_len`/`sip_header_values` 等（**保留真实 nonce/realm/qop/opaque**，不脱敏）
-- [ ] A5 `ims/digest_aka.rs`：抽出 `aka_digest_password`/`hmac_md5`/nonce 解码（AKAv1/v2-MD5，含 live.rs 已有单测）
-- [ ] A6 `ims/register.rs`：REGISTER 事务骨架（initial→401→auth→200）
-- [ ] A7 `ims/access.rs`：`trait ImsChannel`（`send_sip`/`recv_sip`/`route`/`security_verify`）+ `enum AccessLeg`（见 §4.3）
-- [ ] A8 `ims/sms_codec.rs`：重导出 `sms.rs` 的 pub 编解码（或整体上移）；提升私有 GSM7/UCS2/BCD/UDH 为 pub
-- [ ] A9 `vowifi/` 改造：新增 `vowifi/channel.rs` 实现 `ImsChannel`（ESP over ePDG）；`live.rs` 瘦身，改调 `ims::`；**VoWiFi 全回归**
-- [ ] A10 `cargo test`：ims 层纯逻辑单测（无 IO）全绿 + VoWiFi 回归全绿
+---
 
-### 阶段 B — VoLTE SMS 腿（复用 `ims/` 共享层）
-- [ ] B1 `volte/mod.rs` + `volte/config.rs`（`VolteConfig`，仿 `VowifiConfig` 门禁）加入 `main.rs`
-- [ ] B2 `volte/identity.rs` IMSI + USIM AID 发现（复用 `vowifi::qmi_uim`，见 §4.2.3）
-- [ ] B3 `volte/bearer.rs` ModemManager IMS bearer 建立/删除陈旧/重建
-- [ ] B4 `volte/pcscf.rs` P-CSCF 发现（data path probe）
-- [ ] B5 `volte/ipsec.rs` `ip xfrm` SA/策略/清理 + 依赖检查 ⚠️
-- [ ] B6 `volte/channel.rs` 实现 `ImsChannel`（内核 xfrm 保护的 socket）
-- [ ] B7 `volte/runtime.rs` REGISTER 事务：调 `ims::register`，IPsec 优先/降级 UDP
-- [ ] B8 `volte/sms.rs` MT：`ims::sip_parse` → `parse_mt_rp_data`(复用) → RP-ACK(`ims::build_*`) → 多段拼接 → 去重落库
-- [ ] B8 `volte/sms.rs` MO：`build_single_part_mo_submission`(复用) → `ims::build_message_request` + 长短信分段
-- [ ] B9 `handlers.rs` 两个 handler + `main.rs` 两条路由（`/api/volte/control` `/api/volte/feature`）
-- [ ] B SIP/TPDU/xfrm 离线单测 + Windows 编译 + 真机验证清单
+### ✅ 已完成 — 目录/架构重构（原文档无此阶段，实施中新增）
+- [x] R1 领域化分层：22 个平铺文件 → 2 根文件 + 11 领域目录（api/cellular/messaging/notify/network/system/sim/infra + automation）
+- [x] R2 接入腿分组：vowifi/volte 收进 `access/` 伞下（→ 实际比规划的"顶层平级"更进一步，归到 access/ 下）
+- [x] R3 共享核心 `ims/` 抽出并被两腿复用
+- [x] R4 每领域一个 git commit 检查点；全程 378 单测回归全绿；已建 git 基线
+- [x] R5 `backend/src/README.md` 源码结构说明文档
 
-### 阶段 C — 三层 SMS 编排器 ⚠️
-- [ ] C1 `config.rs` SmsPathPolicy + serde 默认值 + 门禁
-- [ ] C2 `orchestrator/sms_router.rs` 优先级发送 + 回退（持有 `Vec<AccessLeg>`）
-- [ ] C3 `orchestrator/listener_election.rs` 活跃监听者选举
-- [ ] C4 DB 去重：指纹列/唯一索引 + 插入前查重 + 跨传输去重
-- [ ] C5 改造 `sms_listener.rs` IMS 活跃时暂停/去重 CS
-- [ ] C6 API 策略读写 + 前端策略 UI（严格对齐 volteStatus.js 契约）
-- [ ] C 编排选路/回退/去重单测
+### 🟢 部分完成 — 阶段 A：共享 IMS 核心
+> → 实际：采用了**轻量抽离**（先抽最高价值、字节级重复的部分），而非一次性完成规划中的完整 `ImsChannel`/`context` 抽象。
+- [x] A1 新建 `ims/` 模块（`mod.rs` + clean-room 声明 + 中立 `ImsError`），加入 `mod ims;`
+- [x] A5 `ims/digest_aka.rs`：`aka_digest_password`/`hmac_md5`/nonce 解码（AKAv1/v2-MD5，**RFC 2617/2104/3310 测试向量单测**）
+- [x] A4' `ims/sip_frame.rs`：`parse_status`/`body`/`complete_frame_len`/`header_values`/`header_uri`/`sip_host`/`quote_param`（组帧/解析原语，含粘包处理）
+- [x] A9' volte 与 vowifi/live.rs **均已改调 `ims::`**（消除 AKA/HMAC/SIP 组帧的重复实现）；**VoWiFi 10 voice 单测 + 全量回归全绿**
+- [ ] A2 `ims/context.rs`：中立 `ImsRegisterParams`/`ImsIdentity`/`ImsRoute`（**未做**；volte/vowifi 目前仍各自持有参数）
+- [ ] A3 `ims/sip_message.rs`：从 `live.rs` 抽出 `build_*_request` 到共享层（**未做**；volte 的 SIP 报文构造目前在 `access/volte/sip.rs` 自有一份）
+- [ ] A6 `ims/register.rs`：REGISTER 事务骨架（**未做**）
+- [ ] A7 `ims/access.rs`：`trait ImsChannel` + `enum AccessLeg`（**未做**；这是把两腿通道差异真正收敛的关键，目前尚未抽象）
+- [ ] A8 `ims/sms_codec.rs`：短信编解码上移/重导出（**未做**；仍在 `access/vowifi/sms.rs`，volte 通过 `crate::access::vowifi::sms` 复用）
 
-### 阶段 D — SIP Trunk 网关
+### 🟢 部分完成 — 阶段 B：VoLTE SMS 腿
+> → 实际：离线信令层全部就位并单测通过；真机 IO 与 `ImsChannel` 抽象未做。
+- [x] B1 `access/volte/mod.rs` + `config.rs`（`VolteConfig`：feature/sms/voice/connection + auto-restore 三元组）加入接线
+- [x] B2 `access/volte/identity.rs` IMSI + USIM AID（复用 `access::vowifi::qmi_uim`）
+- [x] B3 `access/volte/bearer.rs` ModemManager IMS bearer 建立/重建/探测
+- [x] B4 `access/volte/pcscf.rs` P-CSCF 发现
+- [x] B5 `access/volte/ipsec.rs` `ip xfrm` SA/策略/清理 + 依赖检查 ⚠️
+- [x] B7 `access/volte/runtime.rs` VoLTE 状态机（stage 对齐前端契约）
+- [x] B8 `access/volte/sms.rs` MT/MO 链路（复用 `parse_mt_rp_data`/`build_single_part_mo_submission`）+ 单测
+- [x] B9 `handlers.rs` handler + `main.rs` 路由（`/api/volte/control` `/api/volte/feature` `/api/ims/status` 等）
+- [x] B' `access/volte/sip.rs` 真实 SIP 报文构造（REGISTER/MESSAGE/RP-ACK/INVITE/ACK/BYE/CANCEL）+ 单测
+- [x] B'' `access/volte/digest_aka.rs` 适配器（复用 `ims::digest_aka`，映射 `VolteError`）
+- [ ] B6 `access/volte/channel.rs` 实现 `ImsChannel`（**未做**；依赖阶段 A7 的 trait）
+- [ ] B-live `access/volte/live.rs` `#[cfg(unix)]` 真机 IO 装配（**未做**）
+- [ ] B-mo-seg MO 长短信分段（>160 GSM7 / >70 UCS2）自写 UDH（**未做/待确认**）
+- [ ] B-真机 真机验证：真实 VoLTE 注册 + 收发短信 + 抓包比对（**未做**）
+
+### 🟢 部分完成 — 阶段 E：语音（信令 + 编排骨架）
+> → 实际：本轮提前做了语音的信令层与编排骨架（原计划 E 在 C/D 之后）。
+- [x] E-voice-param `voice.rs` 参数化：抽出中立 `VoiceParams`，解开对 `CarrierProfile` 的耦合；vowifi 10 单测回归全绿
+- [x] E-volte-voice `access/volte/voice.rs` VoLTE 语音编排（呼叫状态机驱动 + SDP offer/answer + 腿就绪）+ 单测
+- [x] E-sip-invite `access/volte/sip.rs` INVITE/ACK/BYE/CANCEL/200OK 报文构造 + 单测
+- [x] E-rtp-relay `access/volte/rtp_relay.rs` RTP 双向转发骨架（对称 RTP 学习 + 计数器 + `#[cfg(unix)]` UDP relay 循环）+ 单测
+- [x] E-media-switch **活跃通话媒体重协商**：语音↔视频（re-INVITE），`VolteVoiceCall::upgrade_to_video/downgrade_to_audio/confirm_media_switch` + `CallMediaMode` + 单测（见第十六章）
+- [x] E-state-accessor `VoiceCallStateMachine` 只读访问器 `call_state()`/`negotiated_codec()`（共享机零行为改动，供 VoLTE 腿守卫在途切换）
+- [ ] E1 `config.rs` `VoicePathPolicy`（独立优先级 + gateway_mode）（**未做**，仅有 `voice_enabled` 开关）
+- [ ] E2 呼叫状态机/SDP 移植到共享层 `ims/`（**未做**；目前在 `access/vowifi/voice.rs`）
+- [ ] E3 VoLTE 语音腿真正 INVITE over IMS（**未做**；依赖 channel + 真机会话）
+- [ ] E4 `orchestrator/voice_router.rs` 语音选路（**未做**）
+- [ ] E5 relay 接入真实呼叫流程 + Trunk 桥接外部软电话 + 真机通话（**未做**）
+
+---
+
+### 🟢 部分完成 — 阶段 C：三层 SMS 编排器 ⚠️
+> → 实际：离线决策层全部就位并单测（406→417 全绿）。真机 IO 与前端 UI 未做（依赖真机会话与 UI 工时）。
+- [x] C1 `config.rs` `SmsPathPolicy` + `PathLayerConfig` + `AccessPathKind` + `MidFlightDisablePolicy` + serde 默认值 + `normalized()` 归一化 + ConfigManager get/set + 单测
+- [x] C2 `orchestrator/sms_router.rs` 优先级发送 + 回退状态机（`SendRouter`，enum 分发，无 dyn）+ 中途关线路策略（默认自动切换/可选反馈失败）+ 单测
+- [x] C3 `orchestrator/listener_election.rs` 活跃监听者选举（同一时刻仅一条 IMS 腿收信；CS 暂停 or 保留+去重两模式）+ 单测
+- [x] C4 DB 去重：独立 `sms_dedup` 指纹表 + `claim_sms_dedup`（`INSERT OR IGNORE` 竞态安全）+ `cleanup_sms_dedup` + `orchestrator/dedup.rs` 无明文指纹 + 单测；`normalized_sms_transport` 识别 `volte_ims`
+- [x] C4b 指纹表定期释放：`main.rs` 每日清理任务（启动延迟 60s + 每 24h），保留天数走 `SmsPathPolicy.dedup_retention_days`（默认 30 天）
+- [x] C6a API 策略读写 `GET/POST /api/sms/path-policy`
+- [ ] C5 改造 `sms_listener.rs` IMS 活跃时暂停/去重 CS（→ 现状：`modem_sms_paused_for_ims` 已覆盖 VoLTE 门控；活跃信令路径的实时去重接入待真机 IO）
+- [ ] C6b 前端策略 UI（严格对齐 volteStatus.js 契约）（**未做**）
+- [ ] C-真机 真机验证：多腿选路/回退/跨传输去重（**未做**）
+
+### 🔴 未开始 — 阶段 D：SIP Trunk 网关
 - [ ] D1 `trunk/sip_endpoint.rs` UAS/UAC
-- [ ] D2 `trunk/rtp_relay.rs` RTP 转发（复用 RtpPacket）
-- [ ] D3 `trunk/bridge.rs` 内外腿桥接
-- [ ] D4 强制鉴权 + 内网默认绑定
-- [ ] D API + UI Trunk 配置页 + Linphone/Asterisk 联调
+- [ ] D2 `trunk/rtp_relay.rs` RTP 转发（可复用 `access/volte/rtp_relay.rs` 的 relay 核心）
+- [ ] D3 `trunk/bridge.rs` 内外腿桥接（预留 `TrunkVideoSeam` 已在 `access/volte/vilte.rs` 定义，见第十七章）
+- [ ] D4 强制鉴权 + 内网默认绑定 ⚠️安全
+- [ ] D5 API + UI Trunk 配置页 + Linphone/Asterisk 联调
 
-### 阶段 E — 语音编排（网关模式）
-- [ ] E1 `config.rs` VoicePathPolicy（独立优先级 + gateway_mode）
-- [ ] E2 移植呼叫状态机/SDP 到共享层 `ims/`（依赖阶段 A；voice.rs 的 INVITE/SDP/RTP 进 ims 或 ims/voice）
-- [ ] E3 VoLTE 语音腿 INVITE over IMS（复用阶段 A 的 `ims::sip_message` + 阶段 B 的 `volte/channel.rs`）
-- [ ] E4 `orchestrator/voice_router.rs` 语音选路（低延迟）
-- [ ] E5 Trunk 桥接外部软电话 + API/UI + 呼叫状态机单测
+### 🟢 部分完成 — 阶段 F：ViLTE 视频
+> → 实际：离线层 + 预留 Trunk 接口已就位并单测（417→424 全绿）。真机联调依赖 Trunk（阶段 D）。详见第十六、十七章。
+- [x] F1 SDP video m-line（H.264）构造 + 解析 + 协商（`access/volte/vilte.rs`）+ 单测
+- [x] F2 视频 RTP 转发（`VideoRelay` 复用媒体无关的 `RtpRelayCore`，纯转发不转码）+ 单测
+- [x] F3 `VilteConfig`（门禁链 volte.feature→volte.voice→vilte.feature）+ API（`/api/vilte/control` `/api/vilte/config`）+ SDP video 单测
+- [x] F4 **活跃通话 VoLTE↔ViLTE 切换**（re-INVITE 媒体重协商）：`sip::build_reinvite` + `VolteVoiceCall::upgrade_to_video/downgrade_to_audio/confirm_media_switch` + 单测（见第十六章）
+- [x] F5 预留 Trunk 对接接口 `TrunkVideoSeam` + `UnwiredTrunkVideoSeam`（见第十七章）
+- [ ] F6 前端 ViLTE UI（视频开关按钮）（**未做**）
+- [ ] F-真机 真机联调：真实 ViLTE 会话 + 视频 RTP relay + 抓包（**未做**，依赖阶段 D）
 
-### 阶段 F — ViLTE 视频
-- [ ] F1 SDP video m-line（H.264）协商
-- [ ] F2 视频 RTP 转发（纯转发不转码）
-- [ ] F3 VilteConfig + API + UI + SDP video 单测 + 真机联调
+### 🔴 未开始 — 迁移到 1.1.5 上游底座
+> 当前工作树是 1.1.3 基线。若要合入最新上游，需做三方合并（见第五章手册），把 Email/ServerChan3、OTA 模板治理、eSIM 字段扩展等 1.1.5 新功能与本 fork 的 volte/ims/access 成果合并。
+- [ ] U1 以 1.1.5 为底座，迁入 `ims/` + `access/` + 领域重构成果
+- [ ] U2 合并 1.1.5 独立演进（Email/ServerChan3、`NotificationRule.title_template`、OTA 模板治理、`/api/sim/details/refresh`）
+- [ ] U3 db.rs transport 列索引三方合并核对
+- [ ] U4 全量回归 + 真机验证
 
 ### 贯穿性任务
-- [ ] 文档：每阶段更新开发/API 文档
-- [ ] 合规：clean-room，基于公开规范，标注修改内容与日期（GPLv3）
-- [ ] 安全：所有对外网络端点审查鉴权
+- [x] X-重构安全：每步编译 + 单测 + git 检查点（重构阶段已贯彻）
+- [~] 文档：每阶段更新开发/API 文档（本文档 + `backend/src/README.md` 已更新；其余待补）
+- [~] 合规：clean-room，基于公开规范，标注修改内容与日期（GPLv3）（代码注释已标注，待系统化核对）
+- [ ] 安全：所有对外网络端点审查鉴权（阶段 D 前必做）
 - [ ] 提交上游：分阶段 PR，附单测与验证说明
 
 ---
@@ -1024,6 +1124,187 @@ pub struct RtpRelay { ims_side: UdpSocket, trunk_side: UdpSocket }
 - [ ] 是否可能读到/记录敏感值（IMSI/nonce/密钥）——需脱敏
 - [ ] 新功能是否默认关闭、可运行时回滚
 - [ ] `clippy`/`fmt` 是否通过
+
+---
+
+## 十五、无音频/视频硬件下的网关可行性（关键澄清）
+
+> 本章回答一个反复出现的核心问题：**目标设备（高通 410 随身 WiFi）基带芯片不提供音频/视频接口，能不能实现正常的接打电话（VoLTE/ViLTE）？**
+
+### 15.1 结论
+
+**架构上完全可行，无音频/视频硬件不是障碍。** 设备扮演的是**媒体网关（relay）**，而不是**话机（endpoint）**。真正采集/播放音视频的是外部软电话（Linphone）或 PBX 后的话机；设备只在两个 RTP 端点之间转发 UDP 包。
+
+### 15.2 为什么无音视频硬件不影响 VoLTE/ViLTE
+
+VoLTE/ViLTE 的通话媒体走的是 **IP 包（RTP over UDP）**，而**不是**基带内部的 PCM/模拟音频通路：
+
+- 设备无 mic/speaker/camera/codec，但拥有完整的 IP 协议栈。
+- 因此设备可以完成：建立 IMS 注册 → 收发 SIP INVITE/re-INVITE → 协商 SDP → **在两个 RTP 端点间转发 UDP 包**（`access/volte/rtp_relay.rs::RtpRelayCore`），全程**不解码任何一帧音视频**。
+- 视频（H.264）同理：`VideoRelay` 复用同一套媒体无关的 relay 核心，H.264 RTP 包原样透传。
+
+```
+外部软电话(Linphone)  ←RTP→  SimAdmin 设备(纯转发,不解码)  ←RTP→  运营商 IMS
+   真正放音/显示画面              只搬运 UDP 包(RtpRelayCore)        蜂窝网络
+```
+
+### 15.3 对比：为什么 CS 电路交换语音无法网关化
+
+CS 通话的音频走**基带内部 PCM/模拟通路**，没有 IP 包可供软件转发。因此在无音频接口的设备上，CS 语音这一层**对语音网关无效**（仅在带 USB-Audio/PCM 的设备上可用）。这正是项目定位为 **SIP Trunk 网关**、且 CS 语音不纳入网关模式的根本原因。
+
+### 15.4 "真机 IO"是什么，为什么现在还不能端到端打电话
+
+代码分两层：
+
+| 层 | 内容 | 运行环境 | 现状 |
+|----|------|---------|------|
+| **离线纯逻辑层** | SIP/re-INVITE 报文字节构造、SDP 组装/解析、AKA 摘要、`ip xfrm` 命令拼装、状态机流转、编排选路/去重 | Windows CI 单测可全量验证 | 🟢 已完成（424 单测全绿） |
+| **真机 IO 层** | 真实 socket 收发 SIP 包、`qmi-proxy` 驱动 USIM 做 AKA、内核 `ip xfrm` 装 SA、ModemManager D-Bus 建 bearer、RTP relay 的真实 UDP 循环 | 仅目标 aarch64 设备（`#[cfg(unix)]`） | 🔴 未做 |
+
+"真机 IO"即**把离线层算好的字节真正发出去/收回来**的那部分——依赖 Linux 内核、真实基带、真实 SIM，只能在设备上跑，Windows 上编译跳过。
+
+**因此当前状态**：离线信令层齐全，但要真正接打电话还差两块（均在 TodoList）：
+1. `access/volte/live.rs` 真机 IO 装配（B-live）。
+2. **Trunk 网关（阶段 D）**——外部软电话如何接入（决定 relay 的"内部 UA"腿的对端）。没有它，`TrunkVideoSeam` 返回 `None`，ViLTE 保持惰性。
+
+> 一句话：**离线正确 ≠ 真机跑通**。真机阶段务必抓包（SIP/RTP tcpdump）比对运营商实际行为。
+
+---
+
+## 十六、活跃通话中的 VoLTE ↔ ViLTE 切换（已实现，离线层）
+
+> 本章说明如何在**已接通的通话**中，从纯语音（VoLTE）升级到视频（ViLTE），以及从视频降回纯语音——即安卓手机上"通话中开/关视频"按钮背后的机制。
+
+### 16.1 原理：对话内 re-INVITE 媒体重协商
+
+在一条已建立的 SIP 对话（dialog）内，通过**重发 INVITE（re-INVITE）**改变 SDP 媒体描述来增删媒体流：
+
+- **升级到视频（VoLTE → ViLTE）**：re-INVITE 的 SDP 在原有 `m=audio` 之外新增一条 `m=video`（H.264）。
+- **降回语音（ViLTE → VoLTE）**：re-INVITE 发送纯 `m=audio` 的 SDP（视频流被撤除）。
+
+re-INVITE 与初始 INVITE 的关键区别（RFC 3261 §14）：
+- 复用**已建立**的 Call-ID + 本地 tag + 从 200 OK 学到的**远端 tag**（in-dialog）。
+- **CSeq 必须在对话内递增**（不是从 1 重新开始）。
+- SDP 体承载新的媒体组合。
+
+### 16.2 代码落点
+
+| 能力 | 位置 | 说明 |
+|------|------|------|
+| re-INVITE 报文构造 | `access/volte/sip.rs::build_reinvite` | 对话内 INVITE，复用 Call-ID + 双 tag，CSeq 递增，SDP 体逐字节承载（音频 or 音频+视频） |
+| 媒体模式模型 | `access/volte/voice.rs::CallMediaMode` | `AudioOnly`（VoLTE）/ `AudioVideo`（ViLTE） |
+| 升级到视频 | `VolteVoiceCall::upgrade_to_video()` | 活跃通话上产出带 `m=audio`+`m=video`(H.264) 的 `MediaReoffer`（供 re-INVITE 发送） |
+| 降回语音 | `VolteVoiceCall::downgrade_to_audio()` | 产出纯 `m=audio` 的 `MediaReoffer` |
+| 确认切换 | `VolteVoiceCall::confirm_media_switch(sip_status)` | 对端 2xx 才切换生效；非 2xx 拒绝时**保持原模式、通话不掉** |
+| 视频 SDP 组装 | `access/volte/vilte.rs::build_av_sdp` / `build_video_offer` | 音频 SDP（唯一真相源）+ 追加 H.264 视频段 |
+
+### 16.3 切换时序（升级到视频为例）
+
+```
+通话已接通 (CallState::Active, media_mode = AudioOnly)
+        │
+用户/软电话请求开视频
+        │
+VolteVoiceCall::upgrade_to_video()
+   ├─ 守卫: 通话必须 Active + ViLTE 已启用 + 配了本地视频 relay 端点 + 当前非视频态
+   ├─ 组装 SDP: m=audio(原) + m=video(H.264, build_video_offer)
+   ├─ 标记 pending_switch = AudioVideo
+   └─ 返回 MediaReoffer { sdp, target_mode = AudioVideo }
+        │
+调用方: DialogIds.cseq += 1; sip::build_reinvite(...) → 发送 re-INVITE
+        │
+   ┌────┴─────────────────────────┐
+   │ 对端 2xx (200 OK)            │  对端非 2xx (如 488 Not Acceptable Here)
+   ▼                              ▼
+confirm_media_switch(200)     confirm_media_switch(488)
+   ├─ media_mode = AudioVideo     ├─ 返回 Err(Rejected(488))
+   └─ 建立/启用 VideoRelay        └─ media_mode 保持 AudioOnly（语音继续，不掉话）
+```
+
+降回语音（`downgrade_to_audio` → re-INVITE 纯音频 → `confirm_media_switch`）对称。
+
+### 16.4 守卫与失败语义（重要）
+
+- **只能在 `Active` 通话上切**（`CallNotActive` 否则）。
+- **升级视频要求 ViLTE 已启用**（门禁链 `volte.feature → volte.voice → vilte.feature`）且配了本地视频 relay 端点（`VideoNotEnabled` 否则）。
+- **幂等保护**：已在目标模式时返回 `AlreadyInMode`，避免多余 re-INVITE。
+- **拒绝不掉话**：视频升级被对端拒绝（非 2xx）时，`confirm_media_switch` 返回 `Rejected(code)`，**通话保持在原有语音模式继续**——符合"开视频失败不应挂断语音"的用户预期。
+
+### 16.5 对共享层的改动（最小化，低回归风险）
+
+仅在共享状态机 `access/vowifi/voice.rs::VoiceCallStateMachine` 上新增两个**只读访问器**（`call_state()` / `negotiated_codec()`），无任何行为改动。媒体模式（音频/音频+视频）的状态完全收敛在 VoLTE 专属的 `VolteVoiceCall` 里，不污染 VoWiFi 腿。
+
+### 16.6 测试与验证边界
+
+- **离线单测（已过）**：re-INVITE 报文构造、音视频 SDP 组装/往返、升级/降级/拒绝路径、守卫条件（424 单测全绿）。
+- **真机待验证**：真实 re-INVITE 被运营商 IMS 接受、视频 RTP relay 实际流通、切换时延——依赖阶段 D（Trunk）与 live IO，需抓包比对。
+
+---
+
+## 十七、Trunk 对接与 Linphone 视频切换预留
+
+> 本章说明当前为"注册 Trunk 后对接 Asterisk / 或后期自研类 Asterisk 语音网关 / 再对接 Linphone 并在 Linphone 上切换语音视频"预留的接口设计。
+
+### 17.1 目标形态
+
+```
+Linphone 软电话 ──SIP/RTP──► [Asterisk/FreePBX 或 自研语音网关] ──SIP/RTP──► SimAdmin(Trunk)
+   在此开/关视频                        (阶段 D 决定形态)                        │
+                                                                     内部编排: VoLTE/ViLTE 腿
+                                                                                │
+                                                                    运营商 IMS (真实收发)
+```
+
+用户在 **Linphone 上按下"开视频"**，其请求经 PBX/网关传到 SimAdmin，SimAdmin 据此在**运营商侧**发起第十六章的 VoLTE→ViLTE re-INVITE；反向亦然。SimAdmin 全程只转发 RTP，不解码。
+
+### 17.2 三种对接形态（阶段 D 决策项，尚未选定）
+
+1. **外部 PBX 模式（建议先做）**：SimAdmin 实现 SIP UAS/UAC，注册为 FreePBX/Asterisk 的一条 trunk；RTP 在 SimAdmin 与 PBX 间转发。复杂度最低。
+2. **内嵌 Asterisk 模式**：设备内运行精简 Asterisk，SimAdmin 作 channel driver 后端。复杂度高。
+3. **自研类 Asterisk 语音网关**：后期自主开发轻量 SIP endpoint，直接对接 Linphone。灵活度最高、工作量最大。
+
+> 三种可并存，最终选型作为阶段 D 的独立决策，本文档不预先锁定。
+
+### 17.3 已预留的代码接口（seam）
+
+为让上述任一形态后期都能无痛接入，已在 `access/volte/vilte.rs` 预留**视频侧对接点**：
+
+```rust
+/// Trunk 桥接实现的视频侧对接点（阶段 D 决定 SIP-endpoint/Asterisk 策略后实现）。
+pub trait TrunkVideoSeam {
+    /// 内部 SIP UA（Linphone/Asterisk 侧）协商出的视频媒体端点(addr:port)，
+    /// 若该 UA 本次通话未启用视频则为 None。
+    fn internal_video_endpoint(&self) -> Option<std::net::SocketAddr>;
+}
+
+/// 占位实现：在真实 Trunk 桥接落地前，始终报告"无内部视频端点"，
+/// 使 ViLTE 保持惰性（不建视频 relay）——符合"宿主机永不接电话"的约束。
+pub struct UnwiredTrunkVideoSeam;
+```
+
+预留的意图流程：
+1. ViLTE 通话建立/升级时，Trunk 桥接通过 `internal_video_endpoint()` 提供内部 UA（Linphone 经 PBX）协商出的视频 RTP 端点。
+2. 编排器据此构建 `VideoRelay`，把该端点与运营商侧视频端点配对，双向转发 H.264 RTP。
+3. 当前 `UnwiredTrunkVideoSeam` 返回 `None`，ViLTE 视频腿保持惰性；接上真实 Trunk 后替换为实际实现即可，无需改动本模块其余部分。
+
+### 17.4 Linphone 侧切换语音/视频如何映射到本项目
+
+| Linphone 动作 | 经 PBX/网关 到 SimAdmin | SimAdmin 在运营商侧的动作 |
+|--------------|------------------------|--------------------------|
+| 通话中"开视频" | 内部 UA 发 re-INVITE（加 `m=video`） | `upgrade_to_video()` → 向运营商发 VoLTE→ViLTE re-INVITE |
+| 通话中"关视频" | 内部 UA 发 re-INVITE（撤 `m=video`） | `downgrade_to_audio()` → 向运营商发 ViLTE→VoLTE re-INVITE |
+| 运营商侧对端开视频 | SimAdmin 收到运营商 re-INVITE | 向内部 UA 转发 re-INVITE，建立视频 relay |
+
+即 SimAdmin 作为**双向的媒体/信令中继**：把内部软电话的媒体变更翻译成运营商侧的 re-INVITE，反之亦然。第十六章的 `upgrade/downgrade/confirm_media_switch` 即为运营商侧那一半，内部 UA 侧那一半属于阶段 D 的 Trunk 桥接（`trunk/bridge.rs` + `TrunkVideoSeam` 实现）。
+
+### 17.5 阶段 D 待办（与本章相关的部分）
+
+- [ ] `trunk/sip_endpoint.rs` 对内 SIP UAS/UAC（接受 Linphone/PBX 的 INVITE/re-INVITE）
+- [ ] `trunk/bridge.rs` 实现 `TrunkVideoSeam`：把内部 UA 的视频端点喂给 `VideoRelay`
+- [ ] 双向 re-INVITE 桥接：内部 UA 的媒体变更 ↔ 运营商侧 `upgrade_to_video/downgrade_to_audio`
+- [ ] 音频 relay + 视频 relay 两路独立转发（各一个 `RtpRelayCore` 实例）
+- [ ] ⚠️安全：对外 SIP endpoint 强制鉴权 + 默认内网绑定
+- [ ] 与本地 Linphone/Asterisk 联调 + 抓包验证
 
 ---
 

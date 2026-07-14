@@ -472,6 +472,12 @@ impl MediaDirection {
             _ => None,
         }
     }
+
+    /// Public wrapper over [`from_token`](Self::from_token) so other access
+    /// modules (e.g. the ViLTE video SDP parser) can reuse direction parsing.
+    pub fn from_token_pub(token: &str) -> Option<Self> {
+        Self::from_token(token)
+    }
 }
 
 /// Whether the connection address is IPv4 or IPv6 (drives the SDP `c=` line).
@@ -1225,6 +1231,18 @@ impl VoiceCallStateMachine {
     /// Mark that the IMS registration used for voice signaling is ready.
     pub fn mark_registration_ready(&mut self) {
         self.reg_ready = true;
+    }
+
+    /// Read-only accessor for the current aggregate call state. Used by callers
+    /// (e.g. the VoLTE leg's mid-call media switch) to guard in-dialog actions
+    /// that are only valid on an active call.
+    pub fn call_state(&self) -> CallState {
+        self.call.call_state
+    }
+
+    /// Read-only accessor for the negotiated audio codec, if the call is active.
+    pub fn negotiated_codec(&self) -> Option<AudioCodec> {
+        self.call.negotiated_codec
     }
 
     /// Queue an MO call, recording the leg that will carry it.

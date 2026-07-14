@@ -1338,6 +1338,105 @@ mod tests {
     }
 
     #[test]
+    fn sms_path_policy_default_order_is_vowifi_volte_cs() {
+        let policy = SmsPathPolicy::default();
+        let order: Vec<AccessPathKind> = policy.enabled_layers().collect();
+        assert_eq!(
+            order,
+            vec![
+                AccessPathKind::Vowifi,
+                AccessPathKind::Volte,
+                AccessPathKind::Cs
+            ]
+        );
+        assert!(policy.dedupe_enabled);
+        assert_eq!(
+            policy.mid_flight_disable,
+            MidFlightDisablePolicy::AutoSwitch
+        );
+        assert_eq!(policy.dedup_retention_days, 30);
+    }
+
+    #[test]
+    fn sms_path_policy_enabled_ims_layers_skips_cs_and_disabled() {
+        let policy = SmsPathPolicy {
+            priority: vec![
+                PathLayerConfig {
+                    kind: AccessPathKind::Cs,
+                    enabled: true,
+                },
+                PathLayerConfig {
+                    kind: AccessPathKind::Volte,
+                    enabled: false,
+                },
+                PathLayerConfig {
+                    kind: AccessPathKind::Vowifi,
+                    enabled: true,
+                },
+            ],
+            ..SmsPathPolicy::default()
+        };
+        let ims: Vec<AccessPathKind> = policy.enabled_ims_layers().collect();
+        assert_eq!(ims, vec![AccessPathKind::Vowifi]);
+    }
+
+    #[test]
+    fn sms_path_policy_normalized_appends_missing_kinds_once() {
+        // Only VoLTE supplied; VoWiFi/CS must be appended (enabled) in canonical order.
+        let policy = SmsPathPolicy {
+            priority: vec![
+                PathLayerConfig {
+                    kind: AccessPathKind::Volte,
+                    enabled: false,
+                },
+                // duplicate should be dropped
+                PathLayerConfig {
+                    kind: AccessPathKind::Volte,
+                    enabled: true,
+                },
+            ],
+            ..SmsPathPolicy::default()
+        }
+        .normalized();
+        let kinds: Vec<AccessPathKind> = policy.priority.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AccessPathKind::Volte,
+                AccessPathKind::Vowifi,
+                AccessPathKind::Cs
+            ]
+        );
+        // First VoLTE occurrence (disabled) is kept.
+        assert!(!policy.is_enabled(AccessPathKind::Volte));
+        assert!(policy.is_enabled(AccessPathKind::Vowifi));
+    }
+
+    #[test]
+    fn sms_path_policy_deserializes_from_partial_json() {
+        // Old config with no sms_path at all → default.
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.sms_path, SmsPathPolicy::default());
+
+        // Partial sms_path: only priority given, other fields defaulted.
+        let json = r#"{"sms_path":{"priority":[{"kind":"cs","enabled":true}]}}"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.sms_path.dedupe_enabled);
+        assert_eq!(cfg.sms_path.priority.len(), 1);
+        assert_eq!(cfg.sms_path.priority[0].kind, AccessPathKind::Cs);
+    }
+
+    #[test]
+    fn access_path_kind_transport_tags_match_db_contract() {
+        assert_eq!(AccessPathKind::Vowifi.transport_tag(), "vowifi_ims");
+        assert_eq!(AccessPathKind::Volte.transport_tag(), "volte_ims");
+        assert_eq!(AccessPathKind::Cs.transport_tag(), "modem");
+        assert!(AccessPathKind::Vowifi.is_ims());
+        assert!(AccessPathKind::Volte.is_ims());
+        assert!(!AccessPathKind::Cs.is_ims());
+    }
+
+    #[test]
     fn legacy_notification_config_migrates_channels_and_rules() {
         let mut legacy = LegacyNotificationConfig::default();
         legacy.webhook.enabled = true;
@@ -1410,6 +1509,47 @@ mod tests {
         let disabled = manager.set_vowifi_feature_enabled(false).unwrap();
         assert!(!disabled.feature_enabled);
         assert!(!disabled.connection_enabled);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vilte_feature_requires_volte_voice() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin_vilte_gate_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let manager = ConfigManager::new(path.clone());
+
+        // Without VoLTE voice, enabling ViLTE is rejected.
+        assert_eq!(
+            manager.set_vilte_feature_enabled(true).unwrap_err(),
+            "volte_voice_disabled"
+        );
+
+        // Turn on VoLTE feature then voice, then ViLTE is allowed.
+        manager.set_volte_feature_enabled(true).unwrap();
+        manager.set_volte_voice_enabled(true).unwrap();
+        let vilte = manager.set_vilte_feature_enabled(true).unwrap();
+        assert!(vilte.feature_enabled);
+        assert_eq!(vilte.codec, "h264");
+
+        // set_vilte_config forces feature off when voice is off.
+        manager.set_volte_voice_enabled(false).unwrap();
+        let forced = manager
+            .set_vilte_config(VilteConfig {
+                feature_enabled: true,
+                ..VilteConfig::default()
+            })
+            .unwrap();
+        assert!(
+            !forced.feature_enabled,
+            "ViLTE must be forced off when VoLTE voice is disabled"
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -1632,6 +1772,242 @@ impl Default for VolteConfig {
     }
 }
 
+// ===================== Phase F: ViLTE (video telephony over LTE) =====================
+
+fn default_vilte_codec() -> String {
+    "h264".to_string()
+}
+
+fn default_vilte_video_payload_type() -> u8 {
+    // Dynamic payload type; 99 is a common ViLTE choice for H.264.
+    99
+}
+
+fn default_vilte_h264_fmtp() -> String {
+    // Baseline profile, packetization-mode 1 (non-interleaved). profile-level-id
+    // 42e01f = Constrained Baseline, level 3.1 — a widely interoperable ViLTE
+    // default. The relay never transcodes, so this is purely what we advertise
+    // to the far end on the offer/answer; the negotiated value is carried
+    // through verbatim.
+    "profile-level-id=42e01f;packetization-mode=1".to_string()
+}
+
+/// ViLTE (video telephony over LTE) configuration.
+///
+/// Video rides the *same* IMS voice session as VoLTE voice (one INVITE, an
+/// audio `m=` line plus a video `m=` line), so `feature_enabled` here is gated
+/// on the VoLTE voice feature at the `ConfigManager` layer. On the target
+/// hardware class (no audio/video capture) the device is a pure media relay: it
+/// forwards RTP between the operator IMS leg and an internal SIP UA and never
+/// encodes/decodes video. Therefore only pass-through codecs are meaningful —
+/// `codec` is what we advertise, not something we transcode to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VilteConfig {
+    #[serde(default)]
+    pub feature_enabled: bool,
+    /// Advertised video codec name (relay is pass-through; H.264 is the ViLTE
+    /// baseline mandated by GSMA IR.94).
+    #[serde(default = "default_vilte_codec")]
+    pub codec: String,
+    /// Dynamic RTP payload type to advertise for the video stream.
+    #[serde(default = "default_vilte_video_payload_type")]
+    pub video_payload_type: u8,
+    /// `a=fmtp` parameters advertised for the video codec.
+    #[serde(default = "default_vilte_h264_fmtp")]
+    pub h264_fmtp: String,
+}
+
+impl Default for VilteConfig {
+    fn default() -> Self {
+        Self {
+            feature_enabled: false,
+            codec: default_vilte_codec(),
+            video_payload_type: default_vilte_video_payload_type(),
+            h264_fmtp: default_vilte_h264_fmtp(),
+        }
+    }
+}
+
+// ===================== Phase C: multi-path SMS orchestrator =====================
+
+/// One access path the orchestrator can route SMS/voice through.
+///
+/// The set is closed (VoWiFi / VoLTE / CS), matching the `AccessLeg` enum
+/// discussed in the design doc §4.3. Kept as a config-level enum so the priority
+/// order can be persisted and reordered by the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessPathKind {
+    /// VoWiFi (IMS over WiFi / ePDG).
+    Vowifi,
+    /// VoLTE (IMS over LTE / kernel xfrm).
+    Volte,
+    /// Circuit-switched (ModemManager baseband).
+    Cs,
+}
+
+impl AccessPathKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessPathKind::Vowifi => "vowifi",
+            AccessPathKind::Volte => "volte",
+            AccessPathKind::Cs => "cs",
+        }
+    }
+
+    /// Transport tag used in `db::SmsMessage.transport`.
+    pub fn transport_tag(self) -> &'static str {
+        match self {
+            AccessPathKind::Vowifi => "vowifi_ims",
+            AccessPathKind::Volte => "volte_ims",
+            AccessPathKind::Cs => "modem",
+        }
+    }
+
+    /// Whether this path is an IMS leg (needs registration / listener election).
+    pub fn is_ims(self) -> bool {
+        matches!(self, AccessPathKind::Vowifi | AccessPathKind::Volte)
+    }
+}
+
+/// Behavior when the leg currently sending a message is disabled mid-flight
+/// (user turns off the line while a send is still in progress and not yet
+/// confirmed on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MidFlightDisablePolicy {
+    /// Automatically fall through to the next enabled leg (default).
+    #[default]
+    AutoSwitch,
+    /// Report failure to the caller; do not auto-switch.
+    Fail,
+}
+
+impl MidFlightDisablePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MidFlightDisablePolicy::AutoSwitch => "auto_switch",
+            MidFlightDisablePolicy::Fail => "fail",
+        }
+    }
+}
+
+/// One layer in a priority-ordered path policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathLayerConfig {
+    pub kind: AccessPathKind,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_sms_path_order() -> Vec<PathLayerConfig> {
+    vec![
+        PathLayerConfig {
+            kind: AccessPathKind::Vowifi,
+            enabled: true,
+        },
+        PathLayerConfig {
+            kind: AccessPathKind::Volte,
+            enabled: true,
+        },
+        PathLayerConfig {
+            kind: AccessPathKind::Cs,
+            enabled: true,
+        },
+    ]
+}
+
+/// SMS multi-path routing policy. The `priority` vector's order *is* the
+/// priority (index 0 highest). All fields are `#[serde(default)]` so existing
+/// config files upgrade transparently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmsPathPolicy {
+    /// Priority-ordered layers. Order = preference; each layer independently
+    /// enable-able.
+    #[serde(default = "default_sms_path_order")]
+    pub priority: Vec<PathLayerConfig>,
+    /// Cross-transport dedup on receive.
+    #[serde(default = "default_true")]
+    pub dedupe_enabled: bool,
+    /// Keep the CS listener as a fallback receiver even while an IMS leg is the
+    /// active listener (with dedup enforced) instead of pausing it entirely.
+    #[serde(default)]
+    pub cs_fallback_receiver: bool,
+    /// What to do when the sending leg is disabled mid-flight.
+    #[serde(default)]
+    pub mid_flight_disable: MidFlightDisablePolicy,
+    /// Retention window (days) for dedup fingerprint rows before cleanup.
+    #[serde(default = "default_sms_dedup_retention_days")]
+    pub dedup_retention_days: u32,
+}
+
+fn default_sms_dedup_retention_days() -> u32 {
+    30
+}
+
+impl Default for SmsPathPolicy {
+    fn default() -> Self {
+        Self {
+            priority: default_sms_path_order(),
+            dedupe_enabled: true,
+            cs_fallback_receiver: false,
+            mid_flight_disable: MidFlightDisablePolicy::AutoSwitch,
+            dedup_retention_days: default_sms_dedup_retention_days(),
+        }
+    }
+}
+
+impl SmsPathPolicy {
+    /// Enabled layers in priority order.
+    pub fn enabled_layers(&self) -> impl Iterator<Item = AccessPathKind> + '_ {
+        self.priority
+            .iter()
+            .filter(|layer| layer.enabled)
+            .map(|layer| layer.kind)
+    }
+
+    /// Enabled IMS layers in priority order (for listener election).
+    pub fn enabled_ims_layers(&self) -> impl Iterator<Item = AccessPathKind> + '_ {
+        self.enabled_layers().filter(|kind| kind.is_ims())
+    }
+
+    /// Whether a given path kind is enabled in the policy.
+    pub fn is_enabled(&self, kind: AccessPathKind) -> bool {
+        self.priority
+            .iter()
+            .any(|layer| layer.kind == kind && layer.enabled)
+    }
+
+    /// Normalize the priority list so every path kind appears exactly once.
+    /// Missing kinds are appended (enabled) in the canonical VoWiFi/VoLTE/CS
+    /// order; duplicates keep their first occurrence. This keeps a
+    /// user-supplied partial list valid.
+    pub fn normalized(mut self) -> Self {
+        let mut seen: Vec<AccessPathKind> = Vec::new();
+        let mut deduped: Vec<PathLayerConfig> = Vec::new();
+        for layer in self.priority.into_iter() {
+            if !seen.contains(&layer.kind) {
+                seen.push(layer.kind);
+                deduped.push(layer);
+            }
+        }
+        for kind in [
+            AccessPathKind::Vowifi,
+            AccessPathKind::Volte,
+            AccessPathKind::Cs,
+        ] {
+            if !seen.contains(&kind) {
+                deduped.push(PathLayerConfig {
+                    kind,
+                    enabled: true,
+                });
+            }
+        }
+        self.priority = deduped;
+        self
+    }
+}
+
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -1662,6 +2038,10 @@ pub struct AppConfig {
     pub vowifi: VowifiConfig,
     #[serde(default)]
     pub volte: VolteConfig,
+    #[serde(default)]
+    pub vilte: VilteConfig,
+    #[serde(default)]
+    pub sms_path: SmsPathPolicy,
 }
 
 impl Default for AppConfig {
@@ -1680,6 +2060,8 @@ impl Default for AppConfig {
             automation: AutomationConfig::default(),
             vowifi: VowifiConfig::default(),
             volte: VolteConfig::default(),
+            vilte: VilteConfig::default(),
+            sms_path: SmsPathPolicy::default(),
         }
     }
 }
@@ -1958,6 +2340,64 @@ impl ConfigManager {
             }
             c.volte.voice_enabled = enabled;
             c.volte.clone()
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    /// Current SMS multi-path routing policy (normalized so every path kind is
+    /// present exactly once).
+    pub fn get_sms_path_policy(&self) -> SmsPathPolicy {
+        self.config.read().unwrap().sms_path.clone().normalized()
+    }
+
+    /// Replace the SMS multi-path routing policy. The incoming policy is
+    /// normalized before persisting so a partial/duplicated priority list from
+    /// the UI can never leave the config in an invalid state.
+    pub fn set_sms_path_policy(&self, policy: SmsPathPolicy) -> Result<SmsPathPolicy, String> {
+        let next = policy.normalized();
+        {
+            let mut c = self.config.write().unwrap();
+            c.sms_path = next.clone();
+        }
+        self.save()?;
+        Ok(next)
+    }
+
+    pub fn get_vilte_config(&self) -> VilteConfig {
+        self.config.read().unwrap().vilte.clone()
+    }
+
+    /// Toggle the ViLTE video feature. Video rides the VoLTE voice session, so
+    /// enabling ViLTE requires the VoLTE voice feature to be on (which in turn
+    /// requires the VoLTE feature). This keeps the gating chain
+    /// `volte.feature_enabled -> volte.voice_enabled -> vilte.feature_enabled`
+    /// consistent with the "video is an add-on to the voice call" model.
+    pub fn set_vilte_feature_enabled(&self, enabled: bool) -> Result<VilteConfig, String> {
+        let next = {
+            let mut c = self.config.write().unwrap();
+            if enabled && !(c.volte.feature_enabled && c.volte.voice_enabled) {
+                return Err("volte_voice_disabled".to_string());
+            }
+            c.vilte.feature_enabled = enabled;
+            c.vilte.clone()
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    /// Replace the full ViLTE config (codec / payload type / fmtp). Does not
+    /// change the gating; `feature_enabled` in the incoming value is honored
+    /// only if VoLTE voice is enabled, otherwise it is forced off.
+    pub fn set_vilte_config(&self, vilte: VilteConfig) -> Result<VilteConfig, String> {
+        let next = {
+            let mut c = self.config.write().unwrap();
+            let mut incoming = vilte;
+            if incoming.feature_enabled && !(c.volte.feature_enabled && c.volte.voice_enabled) {
+                incoming.feature_enabled = false;
+            }
+            c.vilte = incoming;
+            c.vilte.clone()
         };
         self.save()?;
         Ok(next)
