@@ -19,6 +19,7 @@ import {
   DeviceInfoCard,
 } from './components'
 import { useDashboardData, type DashboardData } from './hooks/useDashboardData'
+import type { VowifiStatusResponse } from '@/api/types'
 
 function getNetworkTech(data: DashboardData) {
   if (data.cellsInfo?.serving_cell?.tech) return data.cellsInfo.serving_cell.tech.toUpperCase()
@@ -38,6 +39,25 @@ function latencyLabel(value?: number) {
   return typeof value === 'number' ? `${value.toFixed(0)}ms` : '-'
 }
 
+function getReadyCount(status: VowifiStatusResponse) {
+  const readiness = status.readiness
+  const simPresent = status.profile.sim?.present
+
+  const step1 = readiness.identity_ready || simPresent
+  const step2 = step1 && (readiness.profile_matched || status.profile.matched)
+  const step3 = step2 && readiness.esp_ready
+  const step4 = step3 && readiness.ims_registered
+  const step5 = step4 && readiness.sms_ready
+
+  let count = 0
+  if (step1) count++
+  if (step2) count++
+  if (step3) count++
+  if (step4) count++
+  if (step5) count++
+  return count
+}
+
 function StatusBar({ data }: { data: DashboardData }) {
   const signal = data.networkInfo?.signal_strength ?? 0
   const networkTech = getNetworkTech(data)
@@ -51,6 +71,38 @@ function StatusBar({ data }: { data: DashboardData }) {
     fontSize: '0.75rem',
   } as const
   const ipLabelSx = { ...ipValueSx, flexShrink: 0 } as const
+
+  const vowifiControl = data.vowifiControl
+  const vowifiStatus = data.vowifiStatus
+  const showVowifiChip = vowifiControl?.feature_enabled && vowifiControl?.connection_enabled && vowifiStatus
+
+  let vowifiChip = null
+  if (showVowifiChip) {
+    const phase = vowifiStatus.phase
+    const readyCount = getReadyCount(vowifiStatus)
+    let label = `WiFi Calling：正在连接 (${readyCount}/5)`
+    let bgColor = '#ed6c02'
+
+    if (phase === 'sms_ready') {
+      label = 'WiFi Calling：已就绪'
+      bgColor = '#2aae67'
+    } else if (phase === 'failed') {
+      label = 'WiFi Calling：连接失败'
+      bgColor = '#ef4444'
+    }
+
+    vowifiChip = (
+      <Chip
+        label={label}
+        size="small"
+        sx={{
+          bgcolor: bgColor,
+          color: '#ffffff',
+          fontWeight: 600,
+        }}
+      />
+    )
+  }
 
   return (
     <Paper
@@ -91,10 +143,12 @@ function StatusBar({ data }: { data: DashboardData }) {
               }}
             />
           </Box>
-          <Typography variant="subtitle2" fontWeight={800}>
+          <Typography variant="subtitle2" fontWeight={800} sx={{ fontSize: 16 }}>
             {data.deviceInfo?.online ? '系统在线' : '系统离线'}
           </Typography>
         </Box>
+
+        {vowifiChip}
 
         {!isAirplaneMode && (
           <>
@@ -183,9 +237,11 @@ export default function DashboardPage() {
               dataStatus={data.dataStatus}
               airplaneMode={data.airplaneMode}
               roaming={data.roaming}
+              vowifiControl={data.vowifiControl}
               onToggleData={() => void actions.toggleData()}
               onToggleAirplaneMode={() => void actions.toggleAirplaneMode()}
               onToggleRoaming={() => void actions.toggleRoaming()}
+              onToggleVowifiConnection={() => void actions.toggleVowifiConnection()}
             />
           </Grid>
 

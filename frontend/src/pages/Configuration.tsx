@@ -59,7 +59,7 @@ import {
   validatePasswordAgainstSecurity,
 } from '../lib/passwordPolicy'
 import { useWorkMode } from '../contexts/WorkModeContext'
-import type { AirplaneModeResponse, SecurityConfig, WorkMode } from '../api/types'
+import type { AirplaneModeResponse, SecurityConfig, VowifiConfig, WorkMode } from '../api/types'
 
 interface HealthStatus {
   status: string
@@ -162,6 +162,8 @@ export default function ConfigurationPage() {
   const [success, setSuccess] = useState<string | null>(null)
   const [dataStatus, setDataStatus] = useState(false)
   const [airplaneMode, setAirplaneMode] = useState<AirplaneModeResponse | null>(null)
+  const [vowifiConfig, setVowifiConfig] = useState<VowifiConfig | null>(null)
+  const [vowifiFeatureSwitching, setVowifiFeatureSwitching] = useState(false)
   const [airplaneSwitching, setAirplaneSwitching] = useState(false)
   const [healthStatus, setHealthStatus] = useState<HealthStatus | null>(null)
   const [healthLoading, setHealthLoading] = useState(false)
@@ -200,14 +202,16 @@ export default function ConfigurationPage() {
     setError(null)
 
     try {
-      const [dataRes, airplaneModeRes, authSettingsRes] = await Promise.all([
+      const [dataRes, airplaneModeRes, authSettingsRes, vowifiControlRes] = await Promise.all([
         api.getDataStatus(),
         api.getAirplaneMode(),
         api.getAuthSettings(),
+        api.getVowifiControl(),
       ])
 
       if (dataRes.data) setDataStatus(dataRes.data.active)
       if (airplaneModeRes.data) setAirplaneMode(airplaneModeRes.data)
+      if (vowifiControlRes.data) setVowifiConfig(vowifiControlRes.data)
       if (authSettingsRes.data) {
         const loadedSecurityConfig = mergeSecurityConfig(authSettingsRes.data.settings)
         setAuthConfigured(authSettingsRes.data.configured)
@@ -271,6 +275,29 @@ export default function ConfigurationPage() {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setAirplaneSwitching(false)
+    }
+  }
+
+  const toggleVowifiFeature = async () => {
+    const snapshot = vowifiConfig
+    const nextEnabled = !snapshot?.feature_enabled
+    if (snapshot) {
+      setVowifiConfig({
+        ...snapshot,
+        feature_enabled: nextEnabled,
+        connection_enabled: nextEnabled ? snapshot.connection_enabled : false,
+      })
+    }
+    setVowifiFeatureSwitching(true)
+    try {
+      const response = await api.setVowifiFeature(nextEnabled)
+      if (response.data) setVowifiConfig(response.data)
+      setSuccess(`WiFi Calling 功能模块已${nextEnabled ? '开启' : '关闭'}`)
+    } catch (err) {
+      if (snapshot) setVowifiConfig(snapshot)
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setVowifiFeatureSwitching(false)
     }
   }
 
@@ -472,13 +499,12 @@ export default function ConfigurationPage() {
                 sx={{
                   bgcolor: healthOk ? 'success.main' : healthKnown ? 'error.main' : 'warning.main',
                   borderRadius: '50%',
-                  boxShadow: (theme) => `0 0 0 5px ${
-                    healthOk
-                      ? theme.palette.mode === 'light' ? 'rgba(42, 174, 103, 0.12)' : 'rgba(102, 187, 106, 0.18)'
-                      : healthKnown
-                        ? theme.palette.mode === 'light' ? 'rgba(211, 47, 47, 0.12)' : 'rgba(244, 67, 54, 0.18)'
-                        : theme.palette.mode === 'light' ? 'rgba(237, 108, 2, 0.12)' : 'rgba(255, 167, 38, 0.18)'
-                  }`,
+                  boxShadow: (theme) => `0 0 0 5px ${healthOk
+                    ? theme.palette.mode === 'light' ? 'rgba(42, 174, 103, 0.12)' : 'rgba(102, 187, 106, 0.18)'
+                    : healthKnown
+                      ? theme.palette.mode === 'light' ? 'rgba(211, 47, 47, 0.12)' : 'rgba(244, 67, 54, 0.18)'
+                      : theme.palette.mode === 'light' ? 'rgba(237, 108, 2, 0.12)' : 'rgba(255, 167, 38, 0.18)'
+                    }`,
                   flex: '0 0 auto',
                   height: 10,
                   width: 10,
@@ -655,6 +681,8 @@ export default function ConfigurationPage() {
               </Stack>
             </CardContent>
           </Card>
+
+
 
           <Grid container spacing={3} alignItems="stretch">
             <Grid size={{ xs: 12, md: 6 }} sx={{ display: 'flex' }}>
@@ -978,6 +1006,52 @@ export default function ConfigurationPage() {
                   {renderModeOption('esim')}
                 </Grid>
               </Grid>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader
+              avatar={<Wifi color={vowifiConfig?.feature_enabled ? 'primary' : 'disabled'} />}
+              title="WiFi Calling 功能模块"
+              titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+              action={
+                <Chip
+                  label={vowifiConfig?.feature_enabled ? '已开启' : '已关闭'}
+                  color={vowifiConfig?.feature_enabled ? 'primary' : 'default'}
+                  variant={vowifiConfig?.feature_enabled ? 'outlined' : undefined}
+                  size="small"
+                  sx={vowifiConfig?.feature_enabled ? primaryStatusChipSx : undefined}
+                />
+              }
+            />
+            <CardContent>
+              <Typography variant="body2" color="text.secondary" paragraph>
+                本开关仅控制 WiFi Calling 模块的显示状态与相关能力开放，不会自动连接 WiFi 通话。
+              </Typography>
+              <Divider sx={{ my: 2 }} />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={vowifiConfig?.feature_enabled || false}
+                    onChange={() => void toggleVowifiFeature()}
+                    disabled={vowifiFeatureSwitching}
+                    color="primary"
+                  />
+                }
+                label={
+                  <Box display="flex" alignItems="center" gap={1}>
+                    {vowifiFeatureSwitching && <CircularProgress size={16} />}
+                    <Box>
+                      <Typography variant="body1" fontWeight={600}>
+                        {vowifiConfig?.feature_enabled ? 'WiFi Calling 功能模块已开启' : 'WiFi Calling 功能模块已关闭'}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {vowifiConfig?.feature_enabled ? '您可在「仪表盘 - 快捷控制」卡片，或「SIM 卡 - WiFi Calling」页签中，手动开启 WiFi Calling 连接。' : '系统将完全隐藏所有 WiFi Calling 相关入口，不加载任何对应进程，避免额外占用系统资源。'}
+                      </Typography>
+                    </Box>
+                  </Box>
+                }
+              />
             </CardContent>
           </Card>
 

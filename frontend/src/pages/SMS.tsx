@@ -41,8 +41,10 @@ import {
   SelectAll,
   Close,
   Search,
+  Settings,
 } from '@mui/icons-material'
 import { api, type SmsMessage, type SmsStats } from '../api/current'
+import SmsPathPolicyDialog from './sms/SmsPathPolicyDialog'
 
 interface ConversationGroup {
   phoneNumber: string
@@ -165,6 +167,7 @@ export default function SMSPage() {
   const [success, setSuccess] = useState<string | null>(null)
   const [newChatDialogOpen, setNewChatDialogOpen] = useState(false)
   const [newChatNumber, setNewChatNumber] = useState('')
+  const [pathPolicyOpen, setPathPolicyOpen] = useState(false)
 
   // 对话状态
   const [conversations, setConversations] = useState<ConversationGroup[]>([])
@@ -1015,16 +1018,53 @@ export default function SMSPage() {
                   <Typography variant="body2" sx={{ wordBreak: 'break-word', whiteSpace: 'pre-wrap' }}>
                     {renderHighlightedText(msg.content, searchTerm)}
                   </Typography>
-                  <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} mt={0.5}>
+                  <Box
+                    display="flex"
+                    alignItems="center"
+                    justifyContent="flex-end"
+                    gap={0.5}
+                    mt={0.5}
+                  >
                     <Typography
                       variant="caption"
                       sx={{ opacity: 0.7 }}
                     >
                       {formatTime(msg.timestamp)}
                     </Typography>
+                    {msg.direction === 'incoming' && msg.transport === 'vowifi_ims' && (
+                      <Chip
+                        label="WiFi Calling"
+                        size="small"
+                        sx={{
+                          height: 16,
+                          fontSize: '0.65rem',
+                          bgcolor: '#2aae67',
+                          color: 'white',
+                          borderRadius: 0.5,
+                          px: 0.5,
+                          ml: 0.5,
+                        }}
+                      />
+                    )}
                     {msg.direction === 'outgoing' && (
                       msg.status === 'sent' ? (
-                        <Chip label="已发送" size="small" sx={{ height: 16, fontSize: '0.65rem', bgcolor: 'rgba(255,255,255,0.2)' }} />
+                        <>
+                          <Chip label="已发送" size="small" sx={{ height: 16, fontSize: '0.65rem', bgcolor: 'rgba(255,255,255,0.2)', color: '#ffffff', mr: msg.transport === 'vowifi_ims' ? 0.5 : 0 }} />
+                          {msg.transport === 'vowifi_ims' && (
+                            <Chip
+                              label="WiFi Calling"
+                              size="small"
+                              sx={{
+                                height: 16,
+                                fontSize: '0.65rem',
+                                bgcolor: '#2aae67',
+                                color: 'white',
+                                borderRadius: 0.5,
+                                px: 0.5,
+                              }}
+                            />
+                          )}
+                        </>
                       ) : msg.status === 'failed' ? (
                         <Chip label="失败" size="small" color="error" sx={{ height: 16, fontSize: '0.65rem' }} />
                       ) : null
@@ -1125,6 +1165,11 @@ export default function SMSPage() {
         <Typography variant="h5" fontWeight={700}>
           短信管理
         </Typography>
+        <Tooltip title="短信路径策略">
+          <IconButton sx={{ ml: 'auto' }} onClick={() => setPathPolicyOpen(true)}>
+            <Settings />
+          </IconButton>
+        </Tooltip>
       </Box>
 
       <Snackbar open={!!error} autoHideDuration={4000} resumeHideDuration={3000} onClose={() => setError(null)} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
@@ -1199,6 +1244,7 @@ export default function SMSPage() {
           <Button onClick={handleStartNewChat} variant="contained">开始对话</Button>
         </DialogActions>
       </Dialog>
+      <SmsPathPolicyDialog open={pathPolicyOpen} onClose={() => setPathPolicyOpen(false)} />
     </Box>
   )
 }

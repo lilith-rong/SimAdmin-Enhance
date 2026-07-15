@@ -118,8 +118,6 @@ export const DEVICE_STATUS_TEMPLATE_VARIABLES = [
   { label: '状态分类', token: '{{状态分类}}' },
   { label: '状态内容', token: '{{状态内容}}' },
   { label: '时间', token: '{{时间}}' },
-  { label: '本机号码', token: '{{本机号码}}' },
-  { label: '运营商', token: '{{运营商}}' },
 ]
 
 export const DEFAULT_DEVICE_STATUS_TEMPLATE = '设备状态报告\n【{{状态分类}}】\n{{状态内容}}\n\n时间: {{时间}}'

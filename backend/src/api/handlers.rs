@@ -19,10 +19,14 @@ use zbus::Connection;
 
 use crate::{
     cellular::modem_manager,
-    infra::config::{ApnConfig, SmsPathPolicy, VilteConfig, VolteConfig, VowifiConfig},
+    infra::config::{
+        AccessPathKind, ApnConfig, MidFlightDisablePolicy, SmsPathPolicy, VilteConfig,
+        VoicePathPolicy, VoiceServicesConfig, VolteConfig, VolteIpFamilyPreference, VowifiConfig,
+    },
     infra::db::{
-        NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
-        VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
+        NewVoiceInboxEntry, NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage,
+        VowifiEsimRestoreEntry, VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse,
+        VowifiSoakRunsResponse,
     },
     sim::esim::EsimApiError,
     api::models::*,
@@ -59,6 +63,10 @@ use crate::{
             verify_live_sim_auth_access,
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
+    },
+    voice_services::{
+        screening::{decide_call, CallCategory},
+        MediaIngressCapabilities,
     },
 };
 
@@ -2487,6 +2495,207 @@ pub async fn send_sms_handler(
     State(app): State<AppState>,
     Json(payload): Json<SendSmsRequest>,
 ) -> impl IntoResponse {
+    let policy = app.config_manager.get_sms_path_policy().normalized();
+    let stop_on_failure = policy.mid_flight_disable == MidFlightDisablePolicy::Fail;
+    let mut failures = Vec::new();
+    for path in policy.enabled_layers() {
+        let result = match path {
+            AccessPathKind::Vowifi => send_sms_over_vowifi_path(&app, &payload).await,
+            AccessPathKind::Volte => send_sms_over_volte_path(&app, &payload).await,
+            AccessPathKind::Cs => send_sms_over_cs_path(&app, &payload).await,
+        };
+        match result {
+            Ok(data) => {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message("SMS sent", data)),
+                );
+            }
+            Err(reason) => {
+                failures.push(format!("{}:{reason}", path.as_str()));
+                if stop_on_failure {
+                    break;
+                }
+                warn!(path = path.as_str(), reason = %reason, "SMS path failed; trying next path");
+            }
+        }
+    }
+    let detail = if failures.is_empty() {
+        "no enabled SMS path".to_string()
+    } else {
+        failures.join("; ")
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::<serde_json::Value>::error(format!(
+            "Failed to send SMS: {}",
+            detail
+        ))),
+    )
+}
+
+async fn send_sms_over_vowifi_path(
+    app: &AppState,
+    payload: &SendSmsRequest,
+) -> Result<serde_json::Value, String> {
+    let control = app.config_manager.get_vowifi_config();
+    if !control.feature_enabled || !control.connection_enabled {
+        return Err("disabled".to_string());
+    }
+    let mut ready = app.vowifi_runtime.snapshot().await.readiness().sms_ready;
+    if !ready {
+        let airplane_enabled = get_airplane_mode(&app.dbus_conn)
+            .await
+            .map(|state| state.enabled)
+            .unwrap_or(false);
+        if airplane_enabled {
+            app.vowifi_runtime
+                .refresh_identity_with_timeout(
+                    &app.dbus_conn,
+                    std::time::Duration::from_secs(VOWIFI_SIM_IDENTITY_TIMEOUT_SECS),
+                )
+                .await;
+            ready = app
+                .vowifi_runtime
+                .connect_live_with_stage_timeout(
+                    Some(&app.database),
+                    std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
+                )
+                .await
+                .readiness()
+                .sms_ready;
+        } else {
+            ready = connect_vowifi_with_attempts(
+                app,
+                VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+                std::time::Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+                false,
+            )
+            .await
+            .readiness
+            .sms_ready;
+        }
+    }
+    if !ready {
+        return Err("sms_ready_not_reached".to_string());
+    }
+    let send_result = send_live_sms_over_ims(&payload.phone_number, &payload.content)
+        .await
+        .map_err(|error| error.reason)?;
+    let outcome = send_result.outcome;
+    let api_sms_id = app
+        .database
+        .insert_sms_with_transport(
+            "outgoing",
+            &payload.phone_number,
+            &payload.content,
+            outcome.api_status(),
+            None,
+            "vowifi_ims",
+        )
+        .ok();
+    let _ = app.database.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
+        message_id: &outcome.message_id,
+        trace_id: &outcome.trace_id,
+        direction: "mobile_originated",
+        state: outcome.delivery_state.as_str(),
+        sip_state: if (200..300).contains(&outcome.sip_status) {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        rpdu_ack: outcome.rpdu_ack.as_str(),
+        delivery_reported: false,
+        failure_cause: outcome.failure_cause.as_deref(),
+        retry_count: 0,
+        api_sms_id,
+    });
+    spawn_vowifi_sms_followup_persist(app.clone(), send_result.followup);
+    Ok(json!({
+        "path": "vowifi_ims",
+        "transport": "vowifi_ims",
+        "message_id": outcome.message_id,
+        "trace_id": outcome.trace_id,
+        "delivery_state": outcome.delivery_state.as_str(),
+        "rpdu_ack": outcome.rpdu_ack.as_str(),
+        "mt_followup": "background",
+    }))
+}
+
+async fn send_sms_over_volte_path(
+    app: &AppState,
+    payload: &SendSmsRequest,
+) -> Result<serde_json::Value, String> {
+    let config = app.config_manager.get_volte_config();
+    if !config.feature_enabled || !config.sms_enabled || !config.connection_enabled {
+        return Err("disabled".to_string());
+    }
+    if !app.volte_runtime.status().await.registered {
+        crate::access::volte::live::connect_live(
+            &app.volte_runtime,
+            &config,
+            app.config_manager.get_sms_path_policy().dedupe_enabled,
+            Arc::clone(&app.database),
+            Arc::clone(&app.notification_sender),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    let sim = get_sim_info_data_with_cache(&app.dbus_conn, Some(&app.database))
+        .await
+        .map_err(|error| error.to_string())?;
+    let result = crate::access::volte::live::send_live_sms(
+        &app.volte_runtime,
+        &payload.phone_number,
+        &payload.content,
+        &sim.sms_center,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    app.database
+        .insert_sms_with_transport(
+            "outgoing",
+            &payload.phone_number,
+            &payload.content,
+            "sent",
+            None,
+            "volte_ims",
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "path": "volte_ims",
+        "transport": "volte_ims",
+        "message_id": result.message_id,
+        "trace_id": result.trace_id,
+        "part_count": result.part_count,
+        "sip_statuses": result.sip_statuses,
+    }))
+}
+
+async fn send_sms_over_cs_path(
+    app: &AppState,
+    payload: &SendSmsRequest,
+) -> Result<serde_json::Value, String> {
+    let path = send_sms(&app.dbus_conn, &payload.phone_number, &payload.content)
+        .await
+        .map_err(|error| error.to_string())?;
+    app.database
+        .insert_sms(
+            "outgoing",
+            &payload.phone_number,
+            &payload.content,
+            "sent",
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({ "path": path, "transport": "modem" }))
+}
+
+#[allow(dead_code)]
+pub async fn send_sms_handler_legacy(
+    State(app): State<AppState>,
+    Json(payload): Json<SendSmsRequest>,
+) -> impl IntoResponse {
     let vowifi_control = app.config_manager.get_vowifi_config();
     let vowifi_allowed = vowifi_control.feature_enabled && vowifi_control.connection_enabled;
     let mut vowifi_ready =
@@ -2952,7 +3161,7 @@ pub async fn delete_sms_batch_handler(
 
 // ============ 系统信息 ============
 
-/// 读取温度传感器数据
+// 读取温度传感器数据
 // ============ 电话功能 ============
 
 async fn track_call_start(
@@ -3992,6 +4201,11 @@ pub struct VolteControlToggleRequest {
     pub enabled: bool,
 }
 
+#[derive(Deserialize)]
+pub struct VolteIpFamilyPreferenceRequest {
+    pub preference: VolteIpFamilyPreference,
+}
+
 /// Combined VoLTE control response: persisted config + live runtime snapshot.
 /// The `runtime` field carries the `volteStatus.js`-contract fields; `enabled`
 /// mirrors the frontend `m()` helper (`feature_enabled && sms_enabled`).
@@ -4001,6 +4215,7 @@ pub struct VolteControlResponse {
     pub feature_enabled: bool,
     pub sms_enabled: bool,
     pub connection_enabled: bool,
+    pub ip_family_preference: VolteIpFamilyPreference,
     pub runtime: crate::access::volte::VolteRuntimeStatus,
 }
 
@@ -4011,6 +4226,7 @@ impl VolteControlResponse {
             feature_enabled: config.feature_enabled,
             sms_enabled: config.sms_enabled,
             connection_enabled: config.connection_enabled,
+            ip_family_preference: config.ip_family_preference,
             runtime,
         }
     }
@@ -4037,7 +4253,8 @@ pub async fn set_volte_feature_handler(
     match app.config_manager.set_volte_feature_enabled(payload.enabled) {
         Ok(config) => {
             if !payload.enabled {
-                app.volte_runtime.reset_runtime("volte_disabled").await;
+                crate::access::volte::live::disconnect_live(&app.volte_runtime, "volte_disabled")
+                    .await;
             }
             let runtime = app.volte_runtime.status().await;
             (
@@ -4052,6 +4269,111 @@ pub async fn set_volte_feature_handler(
             StatusCode::OK,
             Json(ApiResponse::<VolteControlResponse>::error(format!(
                 "Failed: {err}"
+            ))),
+        ),
+    }
+}
+
+/// Start/stop the live VoLTE IMS bearer and REGISTER session. The feature gate
+/// must be enabled first; disabling performs scoped xfrm and bearer cleanup.
+pub async fn set_volte_connection_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VolteControlToggleRequest>,
+) -> (StatusCode, Json<ApiResponse<VolteControlResponse>>) {
+    let _guard = app.volte_connect_lock.lock().await;
+    match app
+        .config_manager
+        .set_volte_connection_enabled(payload.enabled)
+    {
+        Ok(config) => {
+            let result = if payload.enabled {
+                crate::access::volte::live::connect_live(
+                    &app.volte_runtime,
+                    &config,
+                    app.config_manager.get_sms_path_policy().dedupe_enabled,
+                    Arc::clone(&app.database),
+                    Arc::clone(&app.notification_sender),
+                )
+                .await
+            } else {
+                Ok(crate::access::volte::live::disconnect_live(
+                    &app.volte_runtime,
+                    "volte_connection_disabled",
+                )
+                .await)
+            };
+            let runtime = app.volte_runtime.status().await;
+            let response = VolteControlResponse::build(&config, runtime);
+            match result {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message("Success", response)),
+                ),
+                Err(error) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::<VolteControlResponse>::error(format!(
+                        "Failed: {error}"
+                    ))),
+                ),
+            }
+        }
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::<VolteControlResponse>::error(format!(
+                "Failed: {error}"
+            ))),
+        ),
+    }
+}
+
+/// Change the preferred IMS address family. If a live connection is enabled,
+/// reconnect it so the new ordered family policy takes effect immediately.
+pub async fn set_volte_ip_family_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VolteIpFamilyPreferenceRequest>,
+) -> (StatusCode, Json<ApiResponse<VolteControlResponse>>) {
+    let _guard = app.volte_connect_lock.lock().await;
+    match app
+        .config_manager
+        .set_volte_ip_family_preference(payload.preference)
+    {
+        Ok(config) => {
+            let result = if config.connection_enabled {
+                crate::access::volte::live::disconnect_live(
+                    &app.volte_runtime,
+                    "volte_ip_family_changed",
+                )
+                .await;
+                crate::access::volte::live::connect_live(
+                    &app.volte_runtime,
+                    &config,
+                    app.config_manager.get_sms_path_policy().dedupe_enabled,
+                    Arc::clone(&app.database),
+                    Arc::clone(&app.notification_sender),
+                )
+                .await
+            } else {
+                Ok(app.volte_runtime.status().await)
+            };
+            let runtime = app.volte_runtime.status().await;
+            let response = VolteControlResponse::build(&config, runtime);
+            match result {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message("Success", response)),
+                ),
+                Err(error) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::<VolteControlResponse>::error(format!(
+                        "Failed: {error}"
+                    ))),
+                ),
+            }
+        }
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::<VolteControlResponse>::error(format!(
+                "Failed: {error}"
             ))),
         ),
     }
@@ -4392,6 +4714,57 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
     });
 }
 
+/// Keep an explicitly enabled VoLTE connection alive across service restarts,
+/// bearer/socket faults, and the controlled pre-expiry session rebuild.
+pub fn spawn_volte_auto_restore(app: AppState) {
+    tokio::spawn(async move {
+        let initial = app.config_manager.get_volte_config();
+        tokio::time::sleep(Duration::from_secs(
+            initial.auto_restore_initial_delay_secs.clamp(5, 300),
+        ))
+        .await;
+        loop {
+            let config = app.config_manager.get_volte_config();
+            if config.feature_enabled
+                && config.sms_enabled
+                && config.connection_enabled
+                && !app.volte_runtime.status().await.registered
+            {
+                let _guard = app.volte_connect_lock.lock().await;
+                if !app.volte_runtime.status().await.registered {
+                    let attempts = config.auto_restore_attempts.clamp(1, 5);
+                    for attempt in 1..=attempts {
+                        match crate::access::volte::live::connect_live(
+                            &app.volte_runtime,
+                            &config,
+                            app.config_manager.get_sms_path_policy().dedupe_enabled,
+                            Arc::clone(&app.database),
+                            Arc::clone(&app.notification_sender),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                info!(attempt, "VoLTE IMS auto-restore registered");
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(attempt, error = %error, "VoLTE IMS auto-restore failed");
+                                if attempt < attempts {
+                                    tokio::time::sleep(Duration::from_secs(
+                                        config.auto_restore_retry_delay_secs.clamp(5, 180),
+                                    ))
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+}
+
 pub async fn connect_vowifi_handler(
     State(app): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<VowifiStatusResponse>>) {
@@ -4632,11 +5005,370 @@ pub async fn get_vowifi_esim_restore_handler(
     }
 }
 
-pub async fn get_voicemail_status_handler() -> impl IntoResponse {
+pub async fn get_voicemail_status_handler(State(app): State<AppState>) -> impl IntoResponse {
+    match app.database.get_voice_inbox_stats() {
+        Ok(stats) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                VoicemailStatusResponse {
+                    waiting: stats.waiting > 0,
+                    message_count: stats.waiting.min(u8::MAX as i64) as u8,
+                    mailbox_number: "simadmin_voice_inbox".to_string(),
+                },
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<VoicemailStatusResponse>::error(format!(
+                "Failed: {err}"
+            ))),
+        ),
+    }
+}
+
+pub async fn get_voice_services_status_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<VoiceServicesStatusResponse>>) {
     (
         StatusCode::OK,
-        Json(ApiResponse::<VoicemailStatusResponse>::error(
-            "Voicemail status is not exposed by ModemManager on this backend",
+        Json(ApiResponse::success_with_message(
+            "Success",
+            VoiceServicesStatusResponse {
+                config: app.config_manager.get_voice_services_config(),
+                voice_path: app.config_manager.get_voice_path_policy(),
+                media_ingress: MediaIngressCapabilities::unwired(),
+            },
+        )),
+    )
+}
+
+pub async fn set_voice_services_config_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VoiceServicesConfig>,
+) -> (StatusCode, Json<ApiResponse<VoiceServicesConfig>>) {
+    match app.config_manager.set_voice_services_config(payload) {
+        Ok(config) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Saved", config)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn get_voice_path_policy_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<VoicePathPolicy>>) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            app.config_manager.get_voice_path_policy(),
+        )),
+    )
+}
+
+pub async fn set_voice_path_policy_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VoicePathPolicy>,
+) -> (StatusCode, Json<ApiResponse<VoicePathPolicy>>) {
+    match app.config_manager.set_voice_path_policy(payload) {
+        Ok(policy) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Saved", policy)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn screen_voice_call_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VoiceScreenRequest>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<crate::voice_services::screening::CallScreeningDecision>>,
+) {
+    if payload.phone_number.trim().is_empty() || payload.phone_number.chars().count() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid phone number")),
+        );
+    }
+    if payload
+        .transcript
+        .as_ref()
+        .is_some_and(|text| text.chars().count() > 10_000)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Transcript is too long")),
+        );
+    }
+    let config = app.config_manager.get_voice_services_config();
+    let decision = decide_call(
+        &config,
+        &payload.phone_number,
+        payload.transcript.as_deref(),
+    );
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", decision)),
+    )
+}
+
+fn valid_recording_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+}
+
+fn compact_voice_transcript(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let head: String = chars.by_ref().take(500).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+pub async fn ingest_voice_transcript_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VoiceTranscriptIngestRequest>,
+) -> (StatusCode, Json<ApiResponse<VoiceTranscriptIngestResponse>>) {
+    let session_id = payload.session_id.trim();
+    let phone_number = payload.phone_number.trim();
+    let transcript = payload.transcript.trim();
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid session id")),
+        );
+    }
+    if phone_number.is_empty() || phone_number.chars().count() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid phone number")),
+        );
+    }
+    if transcript.is_empty() || transcript.chars().count() > 10_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid transcript length")),
+        );
+    }
+    if payload
+        .recording_ref
+        .as_deref()
+        .is_some_and(|value| !valid_recording_ref(value))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid recording reference")),
+        );
+    }
+    if payload
+        .confidence
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Confidence must be between 0 and 1")),
+        );
+    }
+
+    let config = app.config_manager.get_voice_services_config();
+    if !config.feature_enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("Voice services are disabled")),
+        );
+    }
+    let decision = decide_call(&config, phone_number, Some(transcript));
+
+    // Ordinary calls configured for immediate forwarding are intentionally not
+    // retained: screening audio is transient unless policy diverts the call.
+    if decision.action == crate::infra::config::CallHandlingAction::Forward {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Forward without retention",
+                VoiceTranscriptIngestResponse {
+                    entry_id: 0,
+                    decision,
+                },
+            )),
+        );
+    }
+
+    let entry_id = match app.database.upsert_voice_inbox(NewVoiceInboxEntry {
+        session_id,
+        phone_number,
+        category: decision.category.as_str(),
+        action: decision.action.as_str(),
+        transcript,
+        verification_code: decision.verification_code.as_deref(),
+        recording_ref: payload.recording_ref.as_deref(),
+        duration_seconds: payload.duration_seconds.min(24 * 60 * 60),
+        confidence: payload.confidence,
+    }) {
+        Ok(id) => id,
+        Err(err) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {err}"))),
+            )
+        }
+    };
+    if let Err(err) = app
+        .database
+        .cleanup_voice_inbox(config.inbox_retention_days, config.inbox_max_entries)
+    {
+        warn!(error = %err, "Voice inbox cleanup failed");
+    }
+
+    let compact = compact_voice_transcript(transcript);
+    let (code, message) = match decision.category {
+        CallCategory::Verification => (
+            system_event_codes::VOICE_VERIFICATION_CAPTURED,
+            format!(
+                "来电 {phone_number} 的语音验证码：{}；转写：{compact}",
+                decision
+                    .verification_code
+                    .as_deref()
+                    .unwrap_or("未提取到数字")
+            ),
+        ),
+        CallCategory::Marketing => (
+            system_event_codes::VOICE_MARKETING_FILTERED,
+            format!("疑似营销来电 {phone_number} 已过滤；转写：{compact}"),
+        ),
+        _ => (
+            system_event_codes::VOICE_VOICEMAIL_RECEIVED,
+            format!("来自 {phone_number} 的语音留言：{compact}"),
+        ),
+    };
+    app.system_event_emitter
+        .emit_code(
+            code,
+            system_event_severity::INFO,
+            system_event_status::TRIGGERED,
+            phone_number,
+            message,
+        )
+        .await;
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Stored",
+            VoiceTranscriptIngestResponse { entry_id, decision },
+        )),
+    )
+}
+
+pub async fn get_voice_inbox_handler(
+    State(app): State<AppState>,
+    Query(query): Query<VoiceInboxQuery>,
+) -> (StatusCode, Json<ApiResponse<VoiceInboxListResponse>>) {
+    match (
+        app.database.get_voice_inbox(query.limit, query.offset),
+        app.database.get_voice_inbox_stats(),
+    ) {
+        (Ok(messages), Ok(stats)) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                VoiceInboxListResponse { messages, stats },
+            )),
+        ),
+        (Err(err), _) | (_, Err(err)) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn set_voice_inbox_read_handler(
+    State(app): State<AppState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<VoiceInboxReadRequest>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    match app.database.mark_voice_inbox_read(id, payload.read) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Updated",
+                json!({ "updated": 1 }),
+            )),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Voice inbox message not found")),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn delete_voice_inbox_handler(
+    State(app): State<AppState>,
+    Path(id): Path<i64>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    match app.database.delete_voice_inbox(id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Deleted",
+                json!({ "deleted": 1 }),
+            )),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Voice inbox message not found")),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn get_web_call_capabilities_handler(
+) -> (StatusCode, Json<ApiResponse<WebCallCapabilitiesResponse>>) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            WebCallCapabilitiesResponse {
+                available: false,
+                control_plane_ready: true,
+                ingress: MediaIngressCapabilities::unwired(),
+                recommended_adapter: "browser_webrtc_gateway".to_string(),
+                required_media_security: vec![
+                    "wss".to_string(),
+                    "webrtc_dtls_srtp".to_string(),
+                    "ice".to_string(),
+                    "short_lived_session_token".to_string(),
+                ],
+                note: "网页可作为独立内部话机，但浏览器不能直接收发 IMS SIP/RTP；需先接入可插拔 WebRTC 媒体网关。".to_string(),
+            },
         )),
     )
 }

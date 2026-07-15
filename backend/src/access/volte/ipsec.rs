@@ -31,6 +31,60 @@ pub struct SecAgree {
     pub port_s: u16,
 }
 
+impl SecAgree {
+    pub fn security_client_value(self) -> String {
+        format!(
+            "ipsec-3gpp;alg=hmac-md5-96;ealg=null;prot=esp;mod=trans;spi-c={};spi-s={};port-c={};port-s={}",
+            self.spi_c, self.spi_s, self.port_c, self.port_s
+        )
+    }
+}
+
+/// Parse the selected `Security-Server: ipsec-3gpp;...` value. Unknown
+/// extensions are ignored; all four port/SPI bindings are mandatory.
+pub fn parse_security_server(value: &str) -> Result<SecAgree, VolteError> {
+    let mut mechanism = None;
+    let mut spi_c = None;
+    let mut spi_s = None;
+    let mut port_c = None;
+    let mut port_s = None;
+    for (index, part) in value.split(';').enumerate() {
+        let part = part.trim();
+        if index == 0 {
+            mechanism = Some(part.to_ascii_lowercase());
+            continue;
+        }
+        let Some((name, raw)) = part.split_once('=') else {
+            continue;
+        };
+        let raw = raw.trim().trim_matches('"');
+        match name.trim().to_ascii_lowercase().as_str() {
+            "spi-c" => spi_c = parse_u32(raw),
+            "spi-s" => spi_s = parse_u32(raw),
+            "port-c" => port_c = raw.parse().ok(),
+            "port-s" => port_s = raw.parse().ok(),
+            _ => {}
+        }
+    }
+    if mechanism.as_deref() != Some("ipsec-3gpp") {
+        return Err(VolteError::new(code::SECURITY_SERVER_MISSING));
+    }
+    Ok(SecAgree {
+        spi_c: spi_c.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+        spi_s: spi_s.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+        port_c: port_c.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+        port_s: port_s.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+    })
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map(|hex| u32::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| value.parse().ok())
+}
+
 /// Integrity + encryption algorithm tokens for the SA. IMS signaling protection
 /// is integrity-only, so `ealg` is null by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +135,7 @@ fn ip_str(ip: IpAddr) -> String {
 /// Build `ip xfrm state add ...` for one SA direction (transport mode,
 /// integrity-only). Returns the argv (without the leading `ip`).
 pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
-    let mut v = vec![
+    vec![
         "xfrm".into(),
         "state".into(),
         "add".into(),
@@ -101,19 +155,8 @@ pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
         sa.algs.auth_trunc_bits.to_string(),
         "enc".into(),
         sa.algs.enc.into(),
-        "0x".into(),
-        "sel".into(),
-        "src".into(),
-        ip_str(sa.src),
-        "dst".into(),
-        ip_str(sa.dst),
-    ];
-    // Port selectors bind the SA to the negotiated sec-agree ports.
-    v.push("sport".into());
-    v.push(sa.sport.to_string());
-    v.push("dport".into());
-    v.push(sa.dport.to_string());
-    v
+        String::new(),
+    ]
 }
 
 /// Direction for a policy entry.
@@ -140,7 +183,6 @@ pub fn build_xfrm_policy_add(
     sport: u16,
     dport: u16,
     dir: PolicyDir,
-    spi: u32,
 ) -> Vec<String> {
     vec![
         "xfrm".into(),
@@ -150,6 +192,8 @@ pub fn build_xfrm_policy_add(
         ip_str(src),
         "dst".into(),
         ip_str(dst),
+        "proto".into(),
+        "udp".into(),
         "sport".into(),
         sport.to_string(),
         "dport".into(),
@@ -163,8 +207,6 @@ pub fn build_xfrm_policy_add(
         ip_str(dst),
         "proto".into(),
         "esp".into(),
-        "spi".into(),
-        format!("0x{:08x}", spi),
         "mode".into(),
         "transport".into(),
     ]
@@ -193,7 +235,8 @@ pub struct XfrmInstallPlan {
 pub fn build_install_plan(
     ue: IpAddr,
     pcscf: IpAddr,
-    sec: &SecAgree,
+    ue_sec: &SecAgree,
+    pcscf_sec: &SecAgree,
     auth_key: &[u8],
 ) -> Result<XfrmInstallPlan, VolteError> {
     // IMS IPsec requires IPv6 in most deployments (observed
@@ -206,29 +249,44 @@ pub fn build_install_plan(
         return Err(VolteError::new(code::IPSEC_IK_INVALID));
     }
     let algs = XfrmAlgs::default();
-    // Outbound: UE:port_c -> P-CSCF:port_s, protected by spi_s (server SA).
+    // `-c` identifies packets sent by the client; `-s` identifies packets
+    // sent by the server. Each endpoint advertises its own ports/SPIs, so the
+    // two directions deliberately use values from different headers.
+    // Outbound: UE client/send port -> P-CSCF server/send port.
     let out_sa = XfrmSa {
         src: ue,
         dst: pcscf,
-        spi: sec.spi_s,
+        spi: pcscf_sec.spi_s,
         auth_key: auth_key.to_vec(),
         algs,
-        sport: sec.port_c,
-        dport: sec.port_s,
+        sport: ue_sec.port_c,
+        dport: pcscf_sec.port_s,
     };
-    // Inbound: P-CSCF:port_s -> UE:port_c, protected by spi_c (client SA).
+    // Inbound: P-CSCF client port -> UE server/receive port.
     let in_sa = XfrmSa {
         src: pcscf,
         dst: ue,
-        spi: sec.spi_c,
+        spi: ue_sec.spi_s,
         auth_key: auth_key.to_vec(),
         algs,
-        sport: sec.port_s,
-        dport: sec.port_c,
+        sport: pcscf_sec.port_c,
+        dport: ue_sec.port_s,
     };
     let policies = vec![
-        build_xfrm_policy_add(ue, pcscf, sec.port_c, sec.port_s, PolicyDir::Out, sec.spi_s),
-        build_xfrm_policy_add(pcscf, ue, sec.port_s, sec.port_c, PolicyDir::In, sec.spi_c),
+        build_xfrm_policy_add(
+            ue,
+            pcscf,
+            ue_sec.port_c,
+            pcscf_sec.port_s,
+            PolicyDir::Out,
+        ),
+        build_xfrm_policy_add(
+            pcscf,
+            ue,
+            pcscf_sec.port_c,
+            ue_sec.port_s,
+            PolicyDir::In,
+        ),
     ];
     Ok(XfrmInstallPlan {
         states: vec![out_sa, in_sa],
@@ -296,6 +354,37 @@ pub fn install_plan(plan: &XfrmInstallPlan) -> Result<(), VolteError> {
     Ok(())
 }
 
+/// Remove only the SAs/policies installed for this IMS session. This avoids a
+/// global xfrm flush, which could tear down an unrelated VPN on the host.
+pub fn uninstall_plan(plan: &XfrmInstallPlan) {
+    for policy in plan.policies.iter().rev() {
+        let mut delete = policy.clone();
+        if let Some(action) = delete.get_mut(2) {
+            *action = "delete".to_string();
+        }
+        if let Some(template) = delete.iter().position(|part| part == "tmpl") {
+            delete.truncate(template);
+        }
+        let _ = run_ip(&delete);
+    }
+    for state in plan.states.iter().rev() {
+        let delete = vec![
+            "xfrm".to_string(),
+            "state".to_string(),
+            "delete".to_string(),
+            "src".to_string(),
+            state.src.to_string(),
+            "dst".to_string(),
+            state.dst.to_string(),
+            "proto".to_string(),
+            "esp".to_string(),
+            "spi".to_string(),
+            format!("0x{:08x}", state.spi),
+        ];
+        let _ = run_ip(&delete);
+    }
+}
+
 /// Best-effort teardown of all VoLTE xfrm state/policy.
 pub fn teardown() {
     for cmd in build_xfrm_flush() {
@@ -329,20 +418,20 @@ mod tests {
         assert!(joined.contains("proto esp spi 0x00001234"));
         assert!(joined.contains("mode transport"));
         assert!(joined.contains("auth-trunc hmac(md5) 0xaabbcc 96"));
-        assert!(joined.contains("enc cipher_null 0x"));
-        assert!(joined.contains("sport 6000"));
-        assert!(joined.contains("dport 6001"));
+        assert!(joined.contains("enc cipher_null"));
+        assert!(!joined.contains(" sel "));
+        assert!(!joined.contains(" sport "));
     }
 
     #[test]
     fn policy_add_binds_ports_and_direction() {
-        let argv = build_xfrm_policy_add(v6(2), v6(1), 6000, 6001, PolicyDir::Out, 0xdead_beef);
+        let argv = build_xfrm_policy_add(v6(2), v6(1), 6000, 6001, PolicyDir::Out);
         let joined = argv.join(" ");
         assert!(joined.contains("xfrm policy add"));
         assert!(joined.contains("dir out"));
         assert!(joined.contains("sport 6000"));
         assert!(joined.contains("dport 6001"));
-        assert!(joined.contains("proto esp spi 0xdeadbeef"));
+        assert!(joined.contains("tmpl src 2001:db8::2 dst 2001:db8::1 proto esp mode transport"));
         assert!(joined.contains("mode transport"));
     }
 
@@ -355,22 +444,29 @@ mod tests {
 
     #[test]
     fn install_plan_builds_two_sas_and_two_policies() {
-        let sec = SecAgree {
+        let ue_sec = SecAgree {
             spi_c: 0x1111,
             spi_s: 0x2222,
             port_c: 6000,
             port_s: 6001,
         };
-        let plan = build_install_plan(v6(2), v6(1), &sec, &[0x01; 16]).unwrap();
+        let pcscf_sec = SecAgree {
+            spi_c: 0x3333,
+            spi_s: 0x4444,
+            port_c: 7000,
+            port_s: 7001,
+        };
+        let plan = build_install_plan(v6(2), v6(1), &ue_sec, &pcscf_sec, &[0x01; 16]).unwrap();
         assert_eq!(plan.states.len(), 2);
         assert_eq!(plan.policies.len(), 2);
-        // Outbound SA uses server SPI; inbound uses client SPI.
-        assert_eq!(plan.states[0].spi, 0x2222);
+        // Outbound uses P-CSCF spi-s/port-s; inbound uses UE spi-s and
+        // P-CSCF port-c, matching the target kernel's successful runtime plan.
+        assert_eq!(plan.states[0].spi, 0x4444);
         assert_eq!(plan.states[0].sport, 6000);
-        assert_eq!(plan.states[0].dport, 6001);
-        assert_eq!(plan.states[1].spi, 0x1111);
-        assert_eq!(plan.states[1].sport, 6001);
-        assert_eq!(plan.states[1].dport, 6000);
+        assert_eq!(plan.states[0].dport, 7001);
+        assert_eq!(plan.states[1].spi, 0x2222);
+        assert_eq!(plan.states[1].sport, 7000);
+        assert_eq!(plan.states[1].dport, 6001);
     }
 
     #[test]
@@ -382,7 +478,7 @@ mod tests {
             port_s: 6001,
         };
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let err = build_install_plan(v4, v6(1), &sec, &[0x01; 16]).unwrap_err();
+        let err = build_install_plan(v4, v6(1), &sec, &sec, &[0x01; 16]).unwrap_err();
         assert_eq!(err.code(), code::PCSCF_FAMILY_MISMATCH);
     }
 
@@ -394,12 +490,51 @@ mod tests {
             port_c: 6000,
             port_s: 6001,
         };
-        let err = build_install_plan(v6(2), v6(1), &sec, &[]).unwrap_err();
+        let err = build_install_plan(v6(2), v6(1), &sec, &sec, &[]).unwrap_err();
         assert_eq!(err.code(), code::IPSEC_IK_INVALID);
     }
 
     #[test]
     fn hex_key_prefixes_0x() {
         assert_eq!(hex_key(&[0x0a, 0xff]), "0x0aff");
+    }
+
+    #[test]
+    fn security_server_round_trips_required_port_and_spi_values() {
+        let offered = SecAgree {
+            spi_c: 0x1020_3040,
+            spi_s: 0x5060_7080,
+            port_c: 5062,
+            port_s: 5064,
+        };
+        let parsed = parse_security_server(&offered.security_client_value()).unwrap();
+        assert_eq!(parsed, offered);
+        let hex = parse_security_server(
+            "ipsec-3gpp;alg=hmac-md5-96;spi-c=0x10203040;spi-s=0x50607080;port-c=5062;port-s=5064",
+        )
+        .unwrap();
+        assert_eq!(hex, offered);
+    }
+
+    #[test]
+    fn scoped_uninstall_arguments_do_not_flush_global_xfrm_state() {
+        let sec = SecAgree {
+            spi_c: 1,
+            spi_s: 2,
+            port_c: 5062,
+            port_s: 5064,
+        };
+        let plan = build_install_plan(v6(2), v6(1), &sec, &sec, &[1; 16]).unwrap();
+        for policy in &plan.policies {
+            assert!(policy.contains(&"add".to_string()));
+            assert!(!policy.contains(&"flush".to_string()));
+        }
+        for state in &plan.states {
+            let delete = format!(
+                "xfrm state delete src {} dst {} proto esp spi 0x{:08x}",
+                state.src, state.dst, state.spi
+            );
+            assert!(!delete.contains("flush"));
+        }
     }
 }

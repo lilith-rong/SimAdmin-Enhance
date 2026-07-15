@@ -16,8 +16,14 @@
 
 #![allow(dead_code)]
 
+pub mod access;
+pub mod context;
 pub mod digest_aka;
+pub mod register;
 pub mod sip_frame;
+pub mod sip_message;
+pub mod sms_codec;
+pub mod voice;
 
 use std::fmt;
 

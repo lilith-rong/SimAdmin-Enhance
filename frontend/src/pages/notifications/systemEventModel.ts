@@ -99,6 +99,15 @@ export const SYSTEM_EVENT_GROUPS: SystemEventGroup[] = [
       { code: 'resource.ipv6_connectivity_recovered', label: 'IPv6 连通性恢复（连续 2 次）', defaultEnabled: false },
     ],
   },
+  {
+    key: 'voice_services',
+    label: '语音服务',
+    events: [
+      { code: 'voice_services.verification_code_captured', label: '提取到语音验证码', defaultEnabled: true },
+      { code: 'voice_services.voicemail_received', label: '收到语音留言', defaultEnabled: true },
+      { code: 'voice_services.marketing_filtered', label: '疑似营销来电已过滤', defaultEnabled: false },
+    ],
+  },
 ]
 
 export const SYSTEM_EVENT_TEMPLATE_VARIABLES = [
@@ -109,8 +118,6 @@ export const SYSTEM_EVENT_TEMPLATE_VARIABLES = [
   { label: '对象', token: '{{对象}}' },
   { label: '消息', token: '{{消息}}' },
   { label: '时间', token: '{{时间}}' },
-  { label: '本机号码', token: '{{本机号码}}' },
-  { label: '运营商', token: '{{运营商}}' },
 ]
 
 export const DEFAULT_SYSTEM_EVENT_TEMPLATE = '系统事件通知\n分类: {{分类}}\n事件: {{事件}}\n等级: {{等级}}\n状态: {{状态}}\n对象: {{对象}}\n消息: {{消息}}\n时间: {{时间}}'

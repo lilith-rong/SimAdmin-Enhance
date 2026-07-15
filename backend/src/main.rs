@@ -37,6 +37,7 @@ mod orchestrator;
 mod sim;
 mod state;
 mod system;
+mod voice_services;
 
 use api::handlers::*;
 use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
@@ -139,7 +140,10 @@ async fn spa_fallback(uri: Uri) -> Response {
 /// 这完美绕过了 Modem.Command 的 Unauthorized 限制，同时保持系统纯净。
 fn ensure_modemmanager_debug_override() {
     let override_dir = "/etc/systemd/system/ModemManager.service.d";
-    let override_file = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
+    // `zz-` must sort after vendor drop-ins such as `mobile-tweaks.conf`, which
+    // also reset ExecStart on the Qualcomm image.
+    let override_file = "/etc/systemd/system/ModemManager.service.d/zz-simadmin-debug.conf";
+    let legacy_override = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
 
     let desired_content = "\
 # SimAdmin: enable ModemManager debug mode so that Modem.Command D-Bus
@@ -163,6 +167,7 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
             tracing::warn!("Failed to write MM debug override: {}", e);
             return;
         }
+        let _ = std::fs::remove_file(legacy_override);
 
         // Reload systemd & restart ModemManager silently
         let _ = std::process::Command::new("systemctl")
@@ -529,6 +534,7 @@ async fn main() -> Result<()> {
 
     // Build protected routes - 使用统一的 AppState
     spawn_vowifi_auto_restore(app_state.clone());
+    spawn_volte_auto_restore(app_state.clone());
 
     let protected_routes = Router::new()
         // ========== 设备信息接口 ==========
@@ -853,6 +859,14 @@ async fn main() -> Result<()> {
             post(set_volte_feature_handler).options(options_handler),
         )
         .route(
+            "/api/volte/connection",
+            post(set_volte_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/ip-family",
+            post(set_volte_ip_family_handler).options(options_handler),
+        )
+        .route(
             "/api/volte/call/status",
             get(get_volte_call_status_handler).options(options_handler),
         )
@@ -863,6 +877,44 @@ async fn main() -> Result<()> {
         .route(
             "/api/voicemail/status",
             get(get_voicemail_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/voice-services/status",
+            get(get_voice_services_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/voice-services/config",
+            post(set_voice_services_config_handler).options(options_handler),
+        )
+        .route(
+            "/api/voice-services/path-policy",
+            get(get_voice_path_policy_handler)
+                .post(set_voice_path_policy_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/voice-services/screen",
+            post(screen_voice_call_handler).options(options_handler),
+        )
+        .route(
+            "/api/voice-services/transcripts",
+            post(ingest_voice_transcript_handler).options(options_handler),
+        )
+        .route(
+            "/api/voice-services/inbox",
+            get(get_voice_inbox_handler).options(options_handler),
+        )
+        .route(
+            "/api/voice-services/inbox/{id}/read",
+            post(set_voice_inbox_read_handler).options(options_handler),
+        )
+        .route(
+            "/api/voice-services/inbox/{id}",
+            delete(delete_voice_inbox_handler).options(options_handler),
+        )
+        .route(
+            "/api/web-call/capabilities",
+            get(get_web_call_capabilities_handler).options(options_handler),
         )
         .route(
             "/api/sms/path-policy",

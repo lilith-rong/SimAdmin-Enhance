@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Box,
   Typography,
@@ -24,7 +24,6 @@ import {
   Edit,
   Check,
   Close,
-  Refresh,
   Language as LanguageIcon,
   Lock as LockIcon,
   Storage as StorageIcon,
@@ -34,6 +33,7 @@ import { api } from '../api/current'
 import type { SimInfo } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import EsimManagerPage from './EsimManager'
+import VowifiDiagnosticsPage from './VowifiDiagnostics'
 import { useWorkMode } from '../contexts/WorkModeContext'
 
 function getSensitiveStyle(show: boolean) {
@@ -188,8 +188,6 @@ function SimBasicInfo() {
   const [smscInput, setSmscInput] = useState('')
   const [savingPhone, setSavingPhone] = useState(false)
   const [savingSmsc, setSavingSmsc] = useState(false)
-  const [detailsRefreshing, setDetailsRefreshing] = useState(false)
-  const autoDetailsRefreshIccidRef = useRef<string | null>(null)
 
   const isPhoneEmpty = !simInfo?.phone_numbers?.length
   const isSmscEmpty = !simInfo?.sms_center
@@ -206,49 +204,16 @@ function SimBasicInfo() {
 
   const validatePhoneStr = (val: string) => /^\+?\d+$/.test(val.trim())
 
-  const scheduleDetailsRefetch = () => {
-    window.setTimeout(() => {
-      void loadData(false)
-    }, 2500)
-  }
-
-  const loadData = async (showLoading = true) => {
-    if (showLoading) setLoading(true)
+  const loadData = async () => {
+    setLoading(true)
     setError(null)
     try {
       const simRes = await api.getSimInfo()
-      if (simRes.data) {
-        setSimInfo(simRes.data)
-        const data = simRes.data
-        const missingSlowFields =
-          data.present && (!data.phone_numbers?.length || !data.sms_center || data.sms_total === undefined)
-        if (missingSlowFields && data.iccid && autoDetailsRefreshIccidRef.current !== data.iccid) {
-          autoDetailsRefreshIccidRef.current = data.iccid
-          setDetailsRefreshing(true)
-          void api.refreshSimDetails()
-            .then(scheduleDetailsRefetch)
-            .catch(() => {})
-            .finally(() => setDetailsRefreshing(false))
-        }
-      }
+      if (simRes.data) setSimInfo(simRes.data)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      if (showLoading) setLoading(false)
-    }
-  }
-
-  const handleRefreshDetails = async () => {
-    autoDetailsRefreshIccidRef.current = null
-    setDetailsRefreshing(true)
-    try {
-      await api.refreshSimDetails()
-      showMsg('SIM 慢字段刷新已开始', 'success')
-      scheduleDetailsRefetch()
-    } catch (err) {
-      showMsg(err instanceof Error ? err.message : String(err), 'error')
-    } finally {
-      setDetailsRefreshing(false)
+      setLoading(false)
     }
   }
 
@@ -298,7 +263,7 @@ function SimBasicInfo() {
 
   useEffect(() => {
     void loadData()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
   if (loading) {
     return (
@@ -322,28 +287,15 @@ function SimBasicInfo() {
                 title="SIM 卡基本标识"
                 titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
                 action={
-                  <Box display="flex" alignItems="center" gap={0.5}>
-                    <Tooltip title="刷新 SIM 详细信息">
-                      <span>
-                        <IconButton
-                          size="small"
-                          onClick={() => void handleRefreshDetails()}
-                          disabled={detailsRefreshing || !simInfo?.present}
-                        >
-                          {detailsRefreshing ? <CircularProgress size={16} /> : <Refresh fontSize="small" />}
-                        </IconButton>
-                      </span>
-                    </Tooltip>
-                    <Tooltip title={showSensitive ? '隐藏敏感信息' : '显示完整信息'}>
-                      <IconButton
-                        size="small"
-                        onClick={() => setShowSensitive((value) => !value)}
-                        color="primary"
-                      >
-                        {showSensitive ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
-                      </IconButton>
-                    </Tooltip>
-                  </Box>
+                  <Tooltip title={showSensitive ? '隐藏敏感信息' : '显示完整信息'}>
+                    <IconButton
+                      size="small"
+                      onClick={() => setShowSensitive((value) => !value)}
+                      color="primary"
+                    >
+                      {showSensitive ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
+                    </IconButton>
+                  </Tooltip>
                 }
               />
               <CardContent sx={{ pt: 0 }}>
@@ -603,9 +555,37 @@ function SimBasicInfo() {
 export default function SimCardPage() {
   const { mode, loading } = useWorkMode()
   const [searchParams, setSearchParams] = useSearchParams()
+  const [vowifiEnabled, setVowifiEnabled] = useState(false)
+  const [configLoading, setConfigLoading] = useState(true)
+
+  useEffect(() => {
+    let active = true
+    api.getVowifiControl()
+      .then((res) => {
+        if (active && res.data) {
+          setVowifiEnabled(res.data.feature_enabled)
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to load VoWiFi control config:', err)
+      })
+      .finally(() => {
+        if (active) {
+          setConfigLoading(false)
+        }
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
   let activeTab = searchParams.get('tab') || 'basic'
 
   if (mode !== 'esim' && activeTab === 'esim') {
+    activeTab = 'basic'
+  }
+
+  if (!configLoading && !vowifiEnabled && activeTab === 'vowifi') {
     activeTab = 'basic'
   }
 
@@ -619,7 +599,7 @@ export default function SimCardPage() {
     setSearchParams(params)
   }
 
-  if (loading) {
+  if (loading || configLoading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="50vh">
         <CircularProgress size={32} />
@@ -639,12 +619,14 @@ export default function SimCardPage() {
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
           <Tab label="基本信息" value="basic" />
           {mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
+          {vowifiEnabled && <Tab label="WiFi Calling" value="vowifi" sx={{ textTransform: 'none' }} />}
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
         {activeTab === 'basic' && <SimBasicInfo />}
         {activeTab === 'esim' && mode === 'esim' && <EsimManagerPage />}
+        {activeTab === 'vowifi' && vowifiEnabled && <VowifiDiagnosticsPage />}
       </Box>
     </Box>
   )

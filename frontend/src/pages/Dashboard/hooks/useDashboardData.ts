@@ -10,6 +10,8 @@ import type {
   AirplaneModeResponse,
   RoamingResponse,
   ConnectionAddressesResponse,
+  VowifiConfig,
+  VowifiStatusResponse,
 } from '@/api/types'
 import { isTransientModemError, createThrottledWarner } from '@/utils/modemErrors'
 
@@ -60,12 +62,15 @@ export interface DashboardData {
   connectionAddresses: ConnectionAddresses
   speedHistory: Record<string, InterfaceSpeedHistory>
   roaming: RoamingResponse | null
+  vowifiControl: VowifiConfig | null
+  vowifiStatus: VowifiStatusResponse | null
 }
 
 export interface DashboardActions {
   toggleData: () => Promise<void>
   toggleAirplaneMode: () => Promise<void>
   toggleRoaming: () => Promise<void>
+  toggleVowifiConnection: () => Promise<void>
   loadData: () => Promise<void>
 }
 
@@ -85,6 +90,8 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
   const [connectivity, setConnectivity] = useState<ConnectivityResult | null>(null)
   const [connectionAddresses, setConnectionAddresses] = useState<ConnectionAddresses>({ ipv4: [], ipv6: [] })
   const [roaming, setRoaming] = useState<RoamingResponse | null>(null)
+  const [vowifiControl, setVowifiControl] = useState<VowifiConfig | null>(null)
+  const [vowifiStatus, setVowifiStatus] = useState<VowifiStatusResponse | null>(null)
   const [speedHistory, setSpeedHistory] = useState<Record<string, InterfaceSpeedHistory>>({})
   const speedHistoryRef = useRef<Record<string, InterfaceSpeedHistory>>({})
 
@@ -139,7 +146,9 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         requestOrNull(api.getAirplaneMode(), 'airplane-mode'),
         requestOrNull(api.getNetworkConnectionAddresses(), 'connection-addresses'),
         requestOrNull(api.getRoamingStatus(), 'roaming'),
+        requestOrNull(api.getVowifiControl(), 'vowifi-control'),
         requestOrNull(api.getCellsInfo(), 'cells'),
+        requestOrNull(api.getVowifiStatus(), 'vowifi-status'),
       ])
 
       // 慢速请求：不阻塞页面渲染，异步填充数据
@@ -155,7 +164,9 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         airplaneModeRes,
         addressesRes,
         roamingRes,
+        vowifiControlRes,
         cellsRes,
+        vowifiStatusRes,
       ] = await fastPromise
 
       if (deviceRes?.data) setDeviceInfo(deviceRes.data)
@@ -165,7 +176,9 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       if (airplaneModeRes?.data) setAirplaneMode(airplaneModeRes.data)
       if (addressesRes?.data) setConnectionAddresses(addressesRes.data)
       if (roamingRes?.data) setRoaming(roamingRes.data)
+      if (vowifiControlRes?.data) setVowifiControl(vowifiControlRes.data)
       if (cellsRes?.data) setCellsInfo(cellsRes.data)
+      if (vowifiStatusRes?.data) setVowifiStatus(vowifiStatusRes.data)
 
       // 快速数据就绪，立即解除 loading
       setInitialLoading(false)
@@ -242,6 +255,21 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     }
   }, [roaming])
 
+  const toggleVowifiConnection = useCallback(async () => {
+    if (!vowifiControl?.feature_enabled) return
+    const snapshot = vowifiControl
+    const nextEnabled = !snapshot.connection_enabled
+    setVowifiControl({ ...snapshot, connection_enabled: nextEnabled })
+    try {
+      await api.setVowifiConnection(nextEnabled)
+      const response = await api.getVowifiControl()
+      if (response.data) setVowifiControl(response.data)
+    } catch (err) {
+      setVowifiControl(snapshot)
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [vowifiControl])
+
   useEffect(() => {
     // 首次加载：background = false，错误会展示给用户
     const timeout = window.setTimeout(() => {
@@ -279,11 +307,14 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       connectionAddresses,
       speedHistory,
       roaming,
+      vowifiControl,
+      vowifiStatus,
     } as DashboardData,
     actions: {
       toggleData,
       toggleAirplaneMode,
       toggleRoaming,
+      toggleVowifiConnection,
       loadData,
     } as DashboardActions,
   }

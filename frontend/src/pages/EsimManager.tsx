@@ -589,6 +589,7 @@ export default function EsimManagerPage() {
   const [basebandRecoverySteps, setBasebandRecoverySteps] = useState<BasebandRestartStep[]>([])
   const [basebandRecoveryRegistration, setBasebandRecoveryRegistration] = useState<string | null>(null)
   const basebandRecoveryTimerRef = useRef<number | undefined>(undefined)
+  const [vowifiEnabled, setVowifiEnabled] = useState(false)
 
   const euiccCardRef = useRef<HTMLDivElement | null>(null)
   const [gridHeight, setGridHeight] = useState<string | number>('calc(100vh - 350px)')
@@ -801,9 +802,9 @@ export default function EsimManagerPage() {
   const selectedMatchingId = selectedProfile?.matching_id
   const selectedCountryCode = profileCountryCode(selectedProfile)
 
-  const loadData = async (forceLive = false) => {
-    if (forceLive) setRefreshing(true)
-    setStatusLoading(!lpacStatus)
+  const loadData = async (silent = false) => {
+    if (silent) setRefreshing(true)
+    setStatusLoading(true)
     setError(null)
     const failures: string[] = []
 
@@ -822,14 +823,17 @@ export default function EsimManagerPage() {
     }
 
     try {
-      let hasProfiles = profiles.length > 0
+      void api.getVowifiControl().then((res) => {
+        if (res.data) {
+          setVowifiEnabled(res.data.connection_enabled)
+        }
+      }).catch(() => { /* ignore */ })
 
-      if (!forceLive) {
+      if (profiles.length === 0) {
         setProfilesLoading(true)
         const cachedProfilesRes = await requestOrNull(api.getCachedEsimProfiles(), 'profiles-cache', false)
         const cachedProfiles = cachedProfilesRes?.data?.profiles ?? []
         if (cachedProfiles.length > 0) {
-          hasProfiles = true
           setProfiles(cachedProfiles)
           setSelectedIccid((current) => {
             const nextSelectedIccid = preferredProfileIccid(cachedProfiles, current)
@@ -865,27 +869,26 @@ export default function EsimManagerPage() {
         return
       }
 
-      const shouldLoadLiveProfiles = forceLive || !hasProfiles
-      if (shouldLoadLiveProfiles) {
-        setProfilesLoading(true)
-        const profilesRes = await requestOrNull(api.getEsimProfiles(), 'profiles')
-        setProfilesLoading(false)
-        if (profilesRes?.data) {
-          const nextProfiles = profilesRes.data.profiles ?? []
-          setProfiles(nextProfiles)
-          setSelectedIccid((current) => {
-            const nextSelectedIccid = preferredProfileIccid(nextProfiles, current)
-            updateEsimPageSnapshot({
-              profiles: nextProfiles,
-              selectedIccid: nextSelectedIccid,
-            })
-            return nextSelectedIccid
+      // Keep lpac calls sequential because they share the physical eUICC channel,
+      // but commit each result as soon as it arrives so the shell renders first.
+      setProfilesLoading(true)
+      const profilesRes = await requestOrNull(api.getEsimProfiles(), 'profiles')
+      setProfilesLoading(false)
+      if (profilesRes?.data) {
+        const nextProfiles = profilesRes.data.profiles ?? []
+        setProfiles(nextProfiles)
+        setSelectedIccid((current) => {
+          const nextSelectedIccid = preferredProfileIccid(nextProfiles, current)
+          updateEsimPageSnapshot({
+            profiles: nextProfiles,
+            selectedIccid: nextSelectedIccid,
           })
-        }
+          return nextSelectedIccid
+        })
       }
 
       setEuiccLoading(true)
-      const euiccRes = await requestOrNull(api.getEsimEuicc(forceLive), 'euicc')
+      const euiccRes = await requestOrNull(api.getEsimEuicc(), 'euicc')
       setEuiccLoading(false)
       if (euiccRes?.data) {
         setEuicc(euiccRes.data)
@@ -951,6 +954,12 @@ export default function EsimManagerPage() {
     setBasebandRecoverySteps([])
     setBasebandRecoveryRegistration(null)
 
+    void api.getVowifiControl().then((res) => {
+      if (res.data) {
+        setVowifiEnabled(res.data.connection_enabled)
+      }
+    }).catch(() => { /* ignore */ })
+
     // Poll every 1s until baseband recovery finishes
     const timer = window.setInterval(() => {
       void loadBasebandRecoveryStatus().then((finished) => {
@@ -979,7 +988,7 @@ export default function EsimManagerPage() {
     const errorStep = getRecoveryErrorStep()
     if (errorStep) return errorStep.detail || `${errorStep.step} 失败`
     if (!basebandRecoveryRunning && basebandRecoverySteps.length > 0) {
-      return '网络恢复成功！'
+      return vowifiEnabled ? '网络和 VoWiFi 恢复成功！' : '网络恢复成功！'
     }
     if (basebandRecoverySteps.length === 0) return '正在启动恢复程序...'
     const lastStep = basebandRecoverySteps[basebandRecoverySteps.length - 1]

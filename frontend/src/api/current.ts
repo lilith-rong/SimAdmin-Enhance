@@ -61,11 +61,30 @@ import type {
   SmsConversationRequest,
   SmsListRequest,
   SmsStats,
+  SmsPathPolicy,
   SystemStatsResponse,
+  VowifiConfig,
+  VowifiDiagnosticsResponse,
+  VowifiEsimRestoreEntry,
+  VowifiProfileMatchResponse,
+  VowifiProfilesResponse,
+  VowifiRuntimeEventsResponse,
+  VowifiSmsDeliveriesResponse,
+  VowifiSoakRunsResponse,
+  VowifiStatusResponse,
   WebhookTestResponse,
   WorkMode,
   WorkModeRequest,
   WorkModeResponse,
+  VoiceInboxListResponse,
+  VoicePathPolicy,
+  VoiceServicesConfig,
+  VoiceServicesStatusResponse,
+  CallScreeningDecision,
+  WebCallCapabilitiesResponse,
+  VilteConfig,
+  VilteStatusResponse,
+  VolteVoiceStatusResponse,
   WlanConnectRequest,
   WlanForgetRequest,
   WlanProfileRequest,
@@ -252,8 +271,8 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getEsimEuicc(live = false) {
-    return request<ApiResponse<EsimEuiccInfo>>(live ? '/esim/euicc?live=1' : '/esim/euicc', {
+  async getEsimEuicc() {
+    return request<ApiResponse<EsimEuiccInfo>>('/esim/euicc', {
       timeoutMs: 30000,
     })
   }
@@ -292,6 +311,7 @@ class SimAdminCurrentAPI {
     })
   }
 
+
   async renameEsimProfile(iccid: string, name: string) {
     return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/rename`, {
       method: 'POST',
@@ -320,17 +340,7 @@ class SimAdminCurrentAPI {
   }
 
   async getSimInfo() {
-    return request<ApiResponse<SimInfo>>('/sim', {
-      timeoutMs: 2500,
-    })
-  }
-
-  async refreshSimDetails() {
-    return request<ApiResponse<Record<string, never>>>('/sim/details/refresh', {
-      method: 'POST',
-      body: JSON.stringify({}),
-      timeoutMs: 2500,
-    })
+    return request<ApiResponse<SimInfo>>('/sim')
   }
 
   async updateSimCache(data: UpdateSimCacheRequest) {
@@ -424,9 +434,7 @@ class SimAdminCurrentAPI {
   }
 
   async getSystemStats() {
-    return request<ApiResponse<SystemStatsResponse>>('/stats', {
-      timeoutMs: 2500,
-    })
+    return request<ApiResponse<SystemStatsResponse>>('/stats')
   }
 
   async getNetworkInterfaces() {
@@ -633,6 +641,17 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<SmsStats>>('/sms/stats')
   }
 
+  async getSmsPathPolicy() {
+    return request<ApiResponse<SmsPathPolicy>>('/sms/path-policy')
+  }
+
+  async setSmsPathPolicy(policy: SmsPathPolicy) {
+    return request<ApiResponse<SmsPathPolicy>>('/sms/path-policy', {
+      method: 'POST',
+      body: JSON.stringify(policy),
+    })
+  }
+
   async clearAllSms() {
     return request<ApiResponse<Record<string, never>>>('/sms/clear', {
       method: 'POST',
@@ -710,6 +729,85 @@ class SimAdminCurrentAPI {
   async clearCallHistory() {
     return request<ApiResponse<Record<string, never>>>('/call/history/clear', {
       method: 'POST',
+    })
+  }
+
+  async getVoiceServicesStatus() {
+    return request<ApiResponse<VoiceServicesStatusResponse>>('/voice-services/status')
+  }
+
+  async setVoiceServicesConfig(config: VoiceServicesConfig) {
+    return request<ApiResponse<VoiceServicesConfig>>('/voice-services/config', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async getVoicePathPolicy() {
+    return request<ApiResponse<VoicePathPolicy>>('/voice-services/path-policy')
+  }
+
+  async setVoicePathPolicy(policy: VoicePathPolicy) {
+    return request<ApiResponse<VoicePathPolicy>>('/voice-services/path-policy', {
+      method: 'POST',
+      body: JSON.stringify(policy),
+    })
+  }
+
+  async screenVoiceCall(phoneNumber: string, transcript?: string) {
+    return request<ApiResponse<CallScreeningDecision>>('/voice-services/screen', {
+      method: 'POST',
+      body: JSON.stringify({ phone_number: phoneNumber, transcript }),
+    })
+  }
+
+  async getVoiceInbox(limit = 100, offset = 0) {
+    return request<ApiResponse<VoiceInboxListResponse>>(`/voice-services/inbox?limit=${limit}&offset=${offset}`)
+  }
+
+  async setVoiceInboxRead(id: number, read = true) {
+    return request<ApiResponse<{ updated: number }>>(`/voice-services/inbox/${id}/read`, {
+      method: 'POST',
+      body: JSON.stringify({ read }),
+    })
+  }
+
+  async deleteVoiceInbox(id: number) {
+    return request<ApiResponse<{ deleted: number }>>(`/voice-services/inbox/${id}`, {
+      method: 'DELETE',
+    })
+  }
+
+  async getWebCallCapabilities() {
+    return request<ApiResponse<WebCallCapabilitiesResponse>>('/web-call/capabilities')
+  }
+
+  async getVolteVoiceStatus() {
+    return request<ApiResponse<VolteVoiceStatusResponse>>('/volte/call/status')
+  }
+
+  async setVolteVoice(enabled: boolean) {
+    return request<ApiResponse<VolteVoiceStatusResponse>>('/volte/voice', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async getVilteStatus() {
+    return request<ApiResponse<VilteStatusResponse>>('/vilte/control')
+  }
+
+  async setVilteFeature(enabled: boolean) {
+    return request<ApiResponse<VilteStatusResponse>>('/vilte/control', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async setVilteConfig(config: VilteConfig) {
+    return request<ApiResponse<VilteStatusResponse>>('/vilte/config', {
+      method: 'POST',
+      body: JSON.stringify(config),
     })
   }
 
@@ -827,6 +925,92 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<OtaLatestReleaseResponse>>('/ota/latest-release', {
       method: 'POST',
       body: JSON.stringify(config),
+    })
+  }
+
+  async getVowifiProfiles() {
+    return request<ApiResponse<VowifiProfilesResponse>>('/vowifi/profiles', {
+      timeoutMs: 10000,
+    })
+  }
+
+  async getVowifiProfile() {
+    return request<ApiResponse<VowifiProfileMatchResponse>>('/vowifi/profile', {
+      timeoutMs: 10000,
+    })
+  }
+
+  async getVowifiStatus() {
+    return request<ApiResponse<VowifiStatusResponse>>('/vowifi/status', {
+      timeoutMs: 30000,
+    })
+  }
+
+  async getVowifiControl() {
+    return request<ApiResponse<VowifiConfig>>('/vowifi/control', {
+      timeoutMs: 10000,
+    })
+  }
+
+  async setVowifiFeature(enabled: boolean) {
+    return request<ApiResponse<VowifiConfig>>('/vowifi/feature', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+      timeoutMs: 10000,
+    })
+  }
+
+  async setVowifiConnection(enabled: boolean) {
+    return request<ApiResponse<VowifiStatusResponse>>('/vowifi/connection', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+      timeoutMs: 120000,
+    })
+  }
+
+  async connectVowifi() {
+    return request<ApiResponse<VowifiStatusResponse>>('/vowifi/connect', {
+      method: 'POST',
+      timeoutMs: 120000,
+    })
+  }
+
+  async getVowifiDiagnostics(options: { limit?: number; traceId?: string } = {}) {
+    const query = new URLSearchParams()
+    query.set('limit', String(options.limit ?? 50))
+    const traceId = options.traceId?.trim()
+    if (traceId) query.set('trace_id', traceId)
+    const suffix = query.toString()
+    return request<ApiResponse<VowifiDiagnosticsResponse>>(`/vowifi/diagnostics${suffix ? `?${suffix}` : ''}`, {
+      timeoutMs: 30000,
+    })
+  }
+
+  async getVowifiEvents(limit = 50, traceId?: string) {
+    const query = new URLSearchParams()
+    query.set('limit', String(limit))
+    const filter = traceId?.trim()
+    if (filter) query.set('trace_id', filter)
+    return request<ApiResponse<VowifiRuntimeEventsResponse>>(`/vowifi/events?${query.toString()}`, {
+      timeoutMs: 10000,
+    })
+  }
+
+  async getVowifiSmsDeliveries(limit = 20) {
+    return request<ApiResponse<VowifiSmsDeliveriesResponse>>(`/vowifi/sms/delivery?limit=${limit}`, {
+      timeoutMs: 10000,
+    })
+  }
+
+  async getVowifiSoakRuns(limit = 20) {
+    return request<ApiResponse<VowifiSoakRunsResponse>>(`/vowifi/soak?limit=${limit}`, {
+      timeoutMs: 10000,
+    })
+  }
+
+  async getVowifiEsimRestore() {
+    return request<ApiResponse<VowifiEsimRestoreEntry | null>>('/vowifi/esim-restore/status', {
+      timeoutMs: 10000,
     })
   }
 

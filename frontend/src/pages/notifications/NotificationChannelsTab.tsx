@@ -33,35 +33,6 @@ import {
   textToHeaders,
 } from './notificationModel'
 
-const EMAIL_PROVIDER_PRESETS = [
-  { value: 'custom', label: '自定义', smtp_host: '', smtp_port: 465, smtp_security: 'implicit_tls' },
-  { value: 'qq', label: 'QQ / Foxmail', smtp_host: 'smtp.qq.com', smtp_port: 465, smtp_security: 'implicit_tls' },
-  { value: 'exmail_qq', label: '腾讯企业邮箱', smtp_host: 'smtp.exmail.qq.com', smtp_port: 465, smtp_security: 'implicit_tls' },
-  { value: 'gmail', label: 'Gmail', smtp_host: 'smtp.gmail.com', smtp_port: 465, smtp_security: 'implicit_tls' },
-  { value: 'netease_163', label: '163 邮箱', smtp_host: 'smtp.163.com', smtp_port: 465, smtp_security: 'implicit_tls' },
-  { value: 'netease_126', label: '126 邮箱', smtp_host: 'smtp.126.com', smtp_port: 465, smtp_security: 'implicit_tls' },
-  { value: 'icloud', label: 'iCloud', smtp_host: 'smtp.mail.me.com', smtp_port: 587, smtp_security: 'starttls' },
-  { value: 'outlook', label: 'Outlook / Office365', smtp_host: 'smtp.office365.com', smtp_port: 587, smtp_security: 'starttls' },
-] as const
-
-const channelTextFieldSx = {
-  '& .MuiInputBase-input': {
-    fontSize: '14px',
-  },
-  '& .MuiInputBase-input::placeholder': {
-    fontSize: '14px',
-  },
-  '& .MuiInputLabel-root': {
-    fontSize: '14px',
-  },
-  '& .MuiSelect-select': {
-    fontSize: '14px',
-  },
-  '& .MuiFormControlLabel-label': {
-    fontSize: '14px',
-  },
-} as const
-
 type NotificationChannelsTabProps = {
   config: NotificationConfig
   selectedChannel?: NotificationChannelInstance
@@ -126,7 +97,6 @@ export default function NotificationChannelsTab({
       multiline={extra?.multiline}
       minRows={extra?.multiline ? 3 : undefined}
       fullWidth
-      sx={channelTextFieldSx}
     >
       {extra?.select?.map((option) => (
         <MenuItem key={option} value={option}>{option || '默认'}</MenuItem>
@@ -145,48 +115,6 @@ export default function NotificationChannelsTab({
       label={label}
     />
   )
-
-  const renderNumberConfigField = (
-    channel: NotificationChannelInstance,
-    key: string,
-    label: string,
-    min = 0,
-  ) => (
-    <TextField
-      type="number"
-      label={label}
-      value={Number(channel.config[key]) || min}
-      onChange={(event: ChangeEvent<HTMLInputElement>) => {
-        const value = Math.max(min, Math.trunc(Number(event.target.value) || min))
-        onPatchChannelConfig(channel.id, { [key]: value })
-      }}
-      inputProps={{ min }}
-      fullWidth
-      sx={channelTextFieldSx}
-    />
-  )
-
-  const emailPresetValue = (channel: NotificationChannelInstance) => {
-    const smtpHost = getString(channel.config, 'smtp_host')
-    const smtpPort = Number(channel.config.smtp_port) || 0
-    const smtpSecurity = getString(channel.config, 'smtp_security')
-    return EMAIL_PROVIDER_PRESETS.find((preset) => (
-      preset.value !== 'custom'
-      && preset.smtp_host === smtpHost
-      && preset.smtp_port === smtpPort
-      && preset.smtp_security === smtpSecurity
-    ))?.value ?? 'custom'
-  }
-
-  const applyEmailPreset = (channel: NotificationChannelInstance, value: string) => {
-    const preset = EMAIL_PROVIDER_PRESETS.find((item) => item.value === value)
-    if (!preset || preset.value === 'custom') return
-    onPatchChannelConfig(channel.id, {
-      smtp_host: preset.smtp_host,
-      smtp_port: preset.smtp_port,
-      smtp_security: preset.smtp_security,
-    })
-  }
 
   const patchRateLimit = (channel: NotificationChannelInstance, patch: Partial<NotificationChannelInstance['rate_limit']>) => {
     onPatchChannel(channel.id, {
@@ -214,7 +142,6 @@ export default function NotificationChannelsTab({
       }}
       inputProps={{ min }}
       fullWidth
-      sx={channelTextFieldSx}
     />
   )
 
@@ -310,7 +237,6 @@ export default function NotificationChannelsTab({
               multiline
               minRows={4}
               fullWidth
-              sx={channelTextFieldSx}
             />
           </Box>
         )
@@ -319,6 +245,7 @@ export default function NotificationChannelsTab({
           <Box sx={fieldStackSx}>
             {renderStringField(channel, 'server_url', 'Server URL')}
             {renderStringField(channel, 'device_key', 'Device Key', { password: true })}
+            {renderStringField(channel, 'title_template', '标题模板')}
             {renderStringField(channel, 'group', '分组')}
             {renderStringField(channel, 'sound', '铃声')}
             {renderStringField(channel, 'level', '推送等级', { select: ['', 'active', 'timeSensitive', 'passive'] })}
@@ -333,6 +260,7 @@ export default function NotificationChannelsTab({
         return (
           <Box sx={fieldStackSx}>
             {renderStringField(channel, 'token', 'Token', { password: true })}
+            {renderStringField(channel, 'title_template', '标题模板')}
             {renderStringField(channel, 'topic', 'Topic')}
             {renderStringField(channel, 'template', 'Template', { select: ['', 'txt', 'html', 'markdown'] })}
             {renderStringField(channel, 'channel', 'Channel', { select: ['', 'wechat', 'webhook', 'cp', 'mail', 'sms', 'bark', 'gotify'] })}
@@ -396,53 +324,13 @@ export default function NotificationChannelsTab({
             {renderBoolField(channel, 'disable_web_page_preview', '禁用链接预览')}
           </Box>
         )
-      case 'email':
-        return (
-          <Box sx={fieldStackSx}>
-            <TextField
-              select
-              label="服务商预设"
-              value={emailPresetValue(channel)}
-              onChange={(event: ChangeEvent<HTMLInputElement>) => applyEmailPreset(channel, event.target.value)}
-              fullWidth
-              sx={channelTextFieldSx}
-            >
-              {EMAIL_PROVIDER_PRESETS.map((preset) => (
-                <MenuItem key={preset.value} value={preset.value}>{preset.label}</MenuItem>
-              ))}
-            </TextField>
-            <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'minmax(0, 1fr) 160px' }} gap={2}>
-              {renderStringField(channel, 'smtp_host', 'SMTP 服务器')}
-              {renderNumberConfigField(channel, 'smtp_port', 'SMTP 端口', 1)}
-            </Box>
-            {renderStringField(channel, 'smtp_security', '安全模式', { select: ['implicit_tls', 'starttls', 'none'] })}
-            <Box display="flex" gap={2} flexWrap="wrap">
-              {renderBoolField(channel, 'allow_insecure_tls', '允许不安全证书')}
-            </Box>
-            {renderStringField(channel, 'username', '用户名')}
-            {renderStringField(channel, 'password', '密码 / 授权码', { password: true })}
-            {renderStringField(channel, 'sender_address', '发件人邮箱')}
-            {renderStringField(channel, 'sender_name', '发件人名称')}
-            {renderStringField(channel, 'receiver_addresses', '收件人邮箱', { multiline: true })}
-            {renderStringField(channel, 'message_format', '消息格式', { select: ['plain', 'html'] })}
-          </Box>
-        )
-      case 'serverchan3':
-        return (
-          <Box sx={fieldStackSx}>
-            {renderStringField(channel, 'send_key', 'SendKey', { password: true })}
-            {renderStringField(channel, 'uid', 'UID（可选）')}
-            {renderStringField(channel, 'channel', '发送通道（可选）')}
-            {renderStringField(channel, 'openid', 'OpenID / Group（可选）')}
-          </Box>
-        )
       default:
         return null
     }
   }
 
   return (
-    <Card sx={{ height: 'calc(100vh - 220px)', minHeight: 520, ...channelTextFieldSx }}>
+    <Card sx={{ height: 'calc(100vh - 220px)', minHeight: 520 }}>
       <CardContent sx={{ height: '100%', p: 0, '&:last-child': { pb: 0 } }}>
         <Box display="flex" height="100%">
           {!isCompact && (
@@ -518,7 +406,7 @@ export default function NotificationChannelsTab({
                     label={`通知渠道 (${config.channels.length})`}
                     value={selectedChannel?.id ?? ''}
                     onChange={(event: ChangeEvent<HTMLInputElement>) => onSelectChannel(event.target.value)}
-                    sx={{ flex: 1, minWidth: 0, ...channelTextFieldSx }}
+                    sx={{ flex: 1, minWidth: 0 }}
                   >
                     {config.channels.length === 0 && <MenuItem value="">暂无通知渠道</MenuItem>}
                     {config.channels.map((channel) => {
@@ -584,7 +472,7 @@ export default function NotificationChannelsTab({
                   value={selectedChannel.name}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => onPatchChannel(selectedChannel.id, { name: event.target.value })}
                   fullWidth
-                  sx={{ mb: 2, ...channelTextFieldSx }}
+                  sx={{ mb: 2 }}
                 />
               )}
               {renderChannelFields()}

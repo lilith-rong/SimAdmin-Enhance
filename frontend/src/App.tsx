@@ -127,6 +127,7 @@ function App() {
               <Route path="esim" element={<Navigate to="/sim?tab=esim" replace />} />
               <Route path="network" element={<Suspense fallback={<PageLoading />}><Network /></Suspense>} />
               <Route path="device-network" element={<Suspense fallback={<PageLoading />}><DeviceNetwork /></Suspense>} />
+              <Route path="vowifi" element={<Navigate to="/sim?tab=vowifi" replace />} />
               {/* 旧路由重定向到网络状态页面 */}
               <Route path="network-interfaces" element={<Navigate to="/network" replace />} />
               <Route path="band-lock" element={<Navigate to="/network" replace />} />

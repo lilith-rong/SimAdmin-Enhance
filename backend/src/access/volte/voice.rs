@@ -2,12 +2,12 @@
 //!
 //! Clean-room extension (not reverse-engineered: the reference VoLTE binary
 //! only implements SMS-over-IMS, so voice on the LTE path is a forward-looking
-//! addition built from public 3GPP/RFC specs 鈥?TS 24.229 (IMS SIP), TS 26.114
+//! addition built from public 3GPP/RFC specs — TS 24.229 (IMS SIP), TS 26.114
 //! (IMS media / AMR), RFC 3261 (SIP), RFC 4566 (SDP), RFC 3550 (RTP),
 //! RFC 4867 (AMR RTP payload)).
 //!
 //! Hardware reality: the target device (Qualcomm 410 pocket-WiFi) has no
-//! mic/speaker/PCM, so voice is **gateway/relay-only** 鈥?the device carries the
+//! mic/speaker/PCM, so voice is **gateway/relay-only** — the device carries the
 //! IMS SIP dialog and relays RTP between the operator IMS leg and an internal
 //! SIP UA (Linphone/Asterisk). It never plays audio locally.
 //!
@@ -18,7 +18,7 @@
 //! IMS session established in `runtime`/`register`.
 
 use crate::access::volte::vilte::{build_av_sdp, build_video_offer, VideoMediaDescription};
-use crate::access::vowifi::voice::{
+use crate::ims::voice::{
     build_mo_audio_offer_with_params, build_sdp_answer_with_params, parse_audio_sdp, AudioCodec,
     CallEndReason, CallState, SdpAddrType, SdpAudioDescription, VoiceCallStateMachine,
     VoiceLegKind, VoiceParams, VoiceRuntimeError,
