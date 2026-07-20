@@ -28,6 +28,7 @@ pub const MMTEL_ICSI_REF: &str = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
 pub const PANI_EUTRAN: &str = "3GPP-E-UTRAN-FDD";
 pub const USER_AGENT: &str = "SimAdmin VoLTE";
 pub const SMS_CONTENT_TYPE: &str = "application/vnd.3gpp.sms";
+pub const DTMF_RELAY_CONTENT_TYPE: &str = "application/dtmf-relay";
 
 /// Format a host for a SIP URI: bare IPv4, bracketed IPv6 (RFC 3261 §19.1.2).
 /// Delegates to the shared IMS core.
@@ -211,6 +212,7 @@ pub fn build_register_with_security_policy(
 pub fn build_sms_message(
     identity: &ImsIdentity,
     route: &SipRoute,
+    service_route: Option<&str>,
     request_uri: &str,
     to_uri: &str,
     body: &[u8],
@@ -221,11 +223,11 @@ pub fn build_sms_message(
     let call_id = format!("{}@simadmin", hex_token(16));
     let from_tag = hex_token(8);
     let to_value = format!("<{to_uri}>");
+    let route_value = service_route
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()));
     let mut headers = vec![
-        SipHeader::new(
-            "Route",
-            format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()),
-        ),
+        SipHeader::new("Route", route_value),
         SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
         SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
         SipHeader::new("P-Preferred-Service", SMS_ICSI),
@@ -234,6 +236,7 @@ pub fn build_sms_message(
         headers.push(SipHeader::new("Security-Verify", sv));
     }
     headers.push(SipHeader::new("Accept-Contact", "*;+g.3gpp.smsip"));
+    headers.push(SipHeader::new("Accept", SMS_CONTENT_TYPE));
     headers.push(SipHeader::new("User-Agent", USER_AGENT));
     headers.push(SipHeader::new("Content-Type", SMS_CONTENT_TYPE));
     crate::ims::sip_message::build_message(&SipRequest {
@@ -257,6 +260,7 @@ pub fn build_sms_message(
 pub fn build_rp_ack(
     identity: &ImsIdentity,
     route: &SipRoute,
+    service_route: Option<&str>,
     inbound_frame: &[u8],
     body: &[u8],
     fallback_uri: &str,
@@ -267,6 +271,7 @@ pub fn build_rp_ack(
     build_sms_message(
         identity,
         route,
+        service_route,
         &request_uri,
         &request_uri,
         body,
@@ -332,11 +337,11 @@ pub fn build_invite(
             "Contact",
             format!(
                 "<sip:{}@{}:{};transport={}>;+g.3gpp.icsi-ref=\"{}\"",
-        identity.contact_user,
-        local_host,
-        local_port,
-        route.transport.as_param(),
-        MMTEL_ICSI_REF,
+                identity.contact_user,
+                local_host,
+                local_port,
+                route.transport.as_param(),
+                MMTEL_ICSI_REF,
             ),
         ),
         SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
@@ -416,11 +421,11 @@ pub fn build_reinvite(
             "Contact",
             format!(
                 "<sip:{}@{}:{};transport={}>;+g.3gpp.icsi-ref=\"{}\"",
-        identity.contact_user,
-        local_host,
-        local_port,
-        route.transport.as_param(),
-        MMTEL_ICSI_REF,
+                identity.contact_user,
+                local_host,
+                local_port,
+                route.transport.as_param(),
+                MMTEL_ICSI_REF,
             ),
         ),
         SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
@@ -493,6 +498,49 @@ pub fn build_ack(
     })
 }
 
+/// Build PRACK for a reliable provisional response (RFC 3262). The dialog must
+/// already contain the To-tag learned from the 18x response. `cseq` is the next
+/// local in-dialog sequence while `invite_cseq` remains the INVITE sequence
+/// referenced by RAck.
+#[allow(clippy::too_many_arguments)]
+pub fn build_prack(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    rseq: u32,
+    invite_cseq: u32,
+) -> Vec<u8> {
+    let branch = new_branch();
+    let route_host = sip_host(route.pcscf_addr.ip());
+    let to = match &dialog.remote_tag {
+        Some(tag) => format!("<{callee_uri}>;tag={tag}"),
+        None => format!("<{callee_uri}>"),
+    };
+    let headers = [
+        SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()),
+        ),
+        SipHeader::new("RAck", format!("{rseq} {invite_cseq} INVITE")),
+        SipHeader::new("User-Agent", USER_AGENT),
+    ];
+    crate::ims::sip_message::build_request(&SipRequest {
+        method: "PRACK",
+        request_uri: callee_uri,
+        route: *route,
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &dialog.local_tag,
+        to_value: &to,
+        call_id: &dialog.call_id,
+        cseq,
+        headers: &headers,
+        body: &[],
+    })
+}
+
 /// Build a BYE to tear down a confirmed dialog. CSeq must be incremented past
 /// the INVITE (the caller passes the next value).
 pub fn build_bye(
@@ -532,6 +580,62 @@ pub fn build_bye(
     h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
     h.push_str("Content-Length: 0\r\n\r\n");
     h.into_bytes()
+}
+
+/// Build an in-dialog SIP INFO carrying one DTMF digit. This is the signaling
+/// fallback when the operator dialog did not negotiate RFC 4733
+/// `telephone-event`, or when Asterisk explicitly delivered DTMF via INFO.
+/// RTP telephone-event remains preferred because it stays on the media path.
+pub fn build_dtmf_info(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    digit: char,
+    duration_ms: u16,
+) -> Result<Vec<u8>, VolteError> {
+    let digit = digit.to_ascii_uppercase();
+    if !matches!(digit, '0'..='9' | '*' | '#' | 'A'..='D') {
+        return Err(VolteError::new("volte_dtmf_digit_invalid"));
+    }
+    if !(40..=5000).contains(&duration_ms) {
+        return Err(VolteError::new("volte_dtmf_duration_invalid"));
+    }
+    let branch = new_branch();
+    let local_host = sip_host(route.local_addr.ip());
+    let local_port = route.local_addr.port();
+    let route_host = sip_host(route.pcscf_addr.ip());
+    let to = match &dialog.remote_tag {
+        Some(tag) => format!("<{callee_uri}>;tag={tag}"),
+        None => format!("<{callee_uri}>"),
+    };
+    let body = format!("Signal={digit}\r\nDuration={duration_ms}\r\n");
+    let mut h = String::new();
+    h.push_str(&format!("INFO {callee_uri} SIP/2.0\r\n"));
+    h.push_str(&format!(
+        "Via: {} {local_host}:{local_port};branch={branch};rport\r\n",
+        route.transport.as_via()
+    ));
+    h.push_str("Max-Forwards: 70\r\n");
+    h.push_str(&format!(
+        "Route: <sip:{route_host}:{};lr>\r\n",
+        route.pcscf_addr.port()
+    ));
+    h.push_str(&format!(
+        "From: <{}>;tag={}\r\n",
+        identity.public_uri, dialog.local_tag
+    ));
+    h.push_str(&format!("To: {to}\r\n"));
+    h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
+    h.push_str(&format!("CSeq: {cseq} INFO\r\n"));
+    h.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
+    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("Content-Type: {DTMF_RELAY_CONTENT_TYPE}\r\n"));
+    h.push_str("Content-Disposition: signal;handling=optional\r\n");
+    h.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    h.push_str(&body);
+    Ok(h.into_bytes())
 }
 
 /// Build a CANCEL for a not-yet-answered INVITE. Per RFC 3261 the CANCEL copies
@@ -736,8 +840,9 @@ mod tests {
         let frame = build_sms_message(
             &ident(),
             &route_udp(),
-            "sip:+8613800138000@ims.mnc000.mcc460.3gppnetwork.org",
-            "sip:+8613800138000@ims.mnc000.mcc460.3gppnetwork.org",
+            Some("<sip:service-route.example:9900;lr>"),
+            "sip:+8613800100500@ims.mnc000.mcc460.3gppnetwork.org",
+            "sip:+8619399144749@ims.mnc000.mcc460.3gppnetwork.org",
             &body,
             None,
         );
@@ -745,6 +850,12 @@ mod tests {
         assert_eq!(sip_body(&frame), &body[..]);
         let text = String::from_utf8_lossy(&frame);
         assert!(text.contains("Content-Type: application/vnd.3gpp.sms\r\n"));
+        assert!(text.contains("Accept: application/vnd.3gpp.sms\r\n"));
+        assert!(text.contains("Route: <sip:service-route.example:9900;lr>\r\n"));
+        assert!(text.starts_with(
+            "MESSAGE sip:+8613800100500@ims.mnc000.mcc460.3gppnetwork.org SIP/2.0\r\n"
+        ));
+        assert!(text.contains("To: <sip:+8619399144749@ims.mnc000.mcc460.3gppnetwork.org>\r\n"));
         assert!(text.contains("Content-Length: 4\r\n"));
         assert!(text.contains("Accept-Contact: *;+g.3gpp.smsip\r\n"));
     }
@@ -813,6 +924,7 @@ mod tests {
         let frame = build_rp_ack(
             &ident(),
             &route_udp(),
+            None,
             inbound,
             &[0x02, 0x00],
             "sip:fallback@h",
@@ -860,6 +972,26 @@ mod tests {
     }
 
     #[test]
+    fn prack_references_reliable_provisional_response() {
+        let mut dialog = DialogIds::fresh();
+        dialog.set_remote_tag("early-tag");
+        let frame = build_prack(
+            &ident(),
+            &route_udp(),
+            &dialog,
+            "sip:+8613800138000@h",
+            2,
+            77,
+            1,
+        );
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.starts_with("PRACK sip:+8613800138000@h SIP/2.0\r\n"));
+        assert!(text.contains("To: <sip:+8613800138000@h>;tag=early-tag\r\n"));
+        assert!(text.contains("RAck: 77 1 INVITE\r\n"));
+        assert!(text.contains("CSeq: 2 PRACK\r\n"));
+    }
+
+    #[test]
     fn bye_increments_cseq_and_targets_remote_tag() {
         let mut dialog = DialogIds::fresh();
         dialog.set_remote_tag("rt");
@@ -868,5 +1000,52 @@ mod tests {
         assert!(text.starts_with("BYE sip:+8613800138000@h SIP/2.0\r\n"));
         assert!(text.contains("CSeq: 2 BYE\r\n"));
         assert!(text.contains("To: <sip:+8613800138000@h>;tag=rt\r\n"));
+    }
+
+    #[test]
+    fn dtmf_info_uses_confirmed_dialog_and_dtmf_relay_body() {
+        let mut dialog = DialogIds::fresh();
+        dialog.set_remote_tag("remote-tag");
+        let frame = build_dtmf_info(
+            &ident(),
+            &route_udp(),
+            &dialog,
+            "sip:+8613800138000@h",
+            3,
+            '5',
+            240,
+        )
+        .unwrap();
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.starts_with("INFO sip:+8613800138000@h SIP/2.0\r\n"));
+        assert!(text.contains("To: <sip:+8613800138000@h>;tag=remote-tag\r\n"));
+        assert!(text.contains("CSeq: 3 INFO\r\n"));
+        assert!(text.contains("Content-Type: application/dtmf-relay\r\n"));
+        assert!(text.ends_with("Signal=5\r\nDuration=240\r\n"));
+    }
+
+    #[test]
+    fn dtmf_info_rejects_invalid_digit_and_duration() {
+        let dialog = DialogIds::fresh();
+        assert!(build_dtmf_info(
+            &ident(),
+            &route_udp(),
+            &dialog,
+            "sip:+8613800138000@h",
+            2,
+            'Z',
+            160,
+        )
+        .is_err());
+        assert!(build_dtmf_info(
+            &ident(),
+            &route_udp(),
+            &dialog,
+            "sip:+8613800138000@h",
+            2,
+            '1',
+            10,
+        )
+        .is_err());
     }
 }

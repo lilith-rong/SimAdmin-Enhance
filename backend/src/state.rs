@@ -9,15 +9,16 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
+use crate::access::line_registry::LineRuntimeRegistry;
 use crate::access::volte::runtime::VolteRuntime;
 use crate::access::vowifi::runtime::VowifiRuntime;
 use crate::cellular::cell_lock_store::CellLockStore;
 use crate::infra::config::ConfigManager;
 use crate::infra::db::Database;
-use crate::network::device_network::DdnsManager;
-use crate::sim::esim::EsimSupervisor;
-use crate::notify::notification::NotificationSender;
 use crate::messaging::sms_listener::SmsResyncHandle;
+use crate::network::device_network::DdnsManager;
+use crate::notify::notification::NotificationSender;
+use crate::sim::esim::EsimSupervisor;
 use crate::system::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
@@ -55,27 +56,50 @@ pub struct AppState {
     pub vowifi_connect_lock: Arc<Mutex<()>>,
     pub volte_runtime: Arc<VolteRuntime>,
     pub volte_connect_lock: Arc<Mutex<()>>,
+    /// Per physical-modem + active-SIM runtime registry. Legacy handlers still
+    /// use `volte_runtime`, which is also the seed runtime of the first line.
+    pub line_registry: Arc<LineRuntimeRegistry>,
     /// 小区/信号轮询是否已按需唤醒。
+    pub cell_monitoring_active: Arc<AtomicBool>,
+}
+
+/// Named startup dependencies prevent positional mix-ups as application state grows.
+pub struct AppStateDependencies {
+    pub dbus_conn: Arc<Connection>,
+    pub database: Arc<Database>,
+    pub config_manager: Arc<ConfigManager>,
+    pub notification_sender: Arc<NotificationSender>,
+    pub system_event_emitter: Arc<SystemEventEmitter>,
+    pub ddns_manager: Arc<DdnsManager>,
+    pub esim_supervisor: Arc<EsimSupervisor>,
+    pub sms_resync: SmsResyncHandle,
+    pub data_user_disabled: Arc<AtomicBool>,
+    pub airplane_mode_requested: Arc<AtomicBool>,
+    pub vowifi_runtime: Arc<VowifiRuntime>,
+    pub volte_runtime: Arc<VolteRuntime>,
+    pub line_registry: Arc<LineRuntimeRegistry>,
     pub cell_monitoring_active: Arc<AtomicBool>,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(
-        dbus_conn: Arc<Connection>,
-        database: Arc<Database>,
-        config_manager: Arc<ConfigManager>,
-        notification_sender: Arc<NotificationSender>,
-        system_event_emitter: Arc<SystemEventEmitter>,
-        ddns_manager: Arc<DdnsManager>,
-        esim_supervisor: Arc<EsimSupervisor>,
-        sms_resync: SmsResyncHandle,
-        data_user_disabled: Arc<AtomicBool>,
-        airplane_mode_requested: Arc<AtomicBool>,
-        vowifi_runtime: Arc<VowifiRuntime>,
-        volte_runtime: Arc<VolteRuntime>,
-        cell_monitoring_active: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(dependencies: AppStateDependencies) -> Self {
+        let AppStateDependencies {
+            dbus_conn,
+            database,
+            config_manager,
+            notification_sender,
+            system_event_emitter,
+            ddns_manager,
+            esim_supervisor,
+            sms_resync,
+            data_user_disabled,
+            airplane_mode_requested,
+            vowifi_runtime,
+            volte_runtime,
+            line_registry,
+            cell_monitoring_active,
+        } = dependencies;
         Self {
             dbus_conn,
             database,
@@ -94,6 +118,7 @@ impl AppState {
             vowifi_connect_lock: Arc::new(Mutex::new(())),
             volte_runtime,
             volte_connect_lock: Arc::new(Mutex::new(())),
+            line_registry,
             cell_monitoring_active,
         }
     }

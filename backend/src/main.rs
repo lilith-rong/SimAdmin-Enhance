@@ -37,17 +37,20 @@ mod orchestrator;
 mod sim;
 mod state;
 mod system;
-mod voice_services;
+mod trunk;
 
 use api::handlers::*;
-use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
+use cellular::modem_manager::{
+    connect_data_via_modem, data_interface_for_modem, disconnect_data_via_modem,
+    ensure_nm_modem_profile, init_data_connection, set_airplane_mode_for_modem,
+};
 use infra::config::{get_default_config_path, ConfigManager};
 use infra::db::Database;
 use network::device_network::DdnsManager;
 use notify::notification::NotificationSender;
 use notify::notification_queue::*;
 use sim::esim::EsimSupervisor;
-use state::AppState;
+use state::{AppState, AppStateDependencies};
 use system::system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,
     SystemEventEmitter,
@@ -251,6 +254,8 @@ enum CliCommand {
         /// 解压目标目录
         target: String,
     },
+    /// Read-only JSON inventory of every ModemManager modem/SIM line.
+    InspectModems,
 }
 
 #[derive(Subcommand, Debug)]
@@ -299,6 +304,15 @@ async fn main() -> Result<()> {
             AuthCommand::Clear => api::auth::clear_admin_auth(&db),
         };
     }
+    if matches!(&cli.command, Some(CliCommand::InspectModems)) {
+        let conn = Connection::system().await?;
+        let mut bindings = cellular::modem_manager::discover_modem_bindings(&conn).await?;
+        for binding in &mut bindings {
+            binding.sim_iccid = system::system_event::mask_identifier(&binding.sim_iccid);
+        }
+        println!("{}", serde_json::to_string_pretty(&bindings)?);
+        return Ok(());
+    }
 
     let args = match cli.command {
         Some(CliCommand::Serve(args)) => args,
@@ -326,6 +340,31 @@ async fn main() -> Result<()> {
     let cell_monitoring_active = Arc::new(AtomicBool::new(false));
     let vowifi_runtime = Arc::new(access::vowifi::runtime::VowifiRuntime::new());
     let volte_runtime = Arc::new(access::volte::runtime::VolteRuntime::new());
+    let line_registry = Arc::new(access::line_registry::LineRuntimeRegistry::with_config(
+        Arc::clone(&volte_runtime),
+        Arc::clone(&config_manager),
+    ));
+    match line_registry.refresh(dbus_conn.as_ref()).await {
+        Ok(count) => info!(count, "Discovered modem/SIM lines"),
+        Err(error) => warn!(error = %error, "Initial modem/SIM line discovery failed"),
+    }
+    line_registry
+        .sync_trunk_profiles(config_manager.as_ref())
+        .await;
+    if let Some(primary) = line_registry.primary().await {
+        let primary_profile = config_manager.get_line_profile(&primary.binding().line_id);
+        data_user_disabled.store(
+            !primary_profile.data_connection_enabled,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        airplane_mode_requested.store(
+            primary_profile.airplane_mode_enabled,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if config_manager.get_data_enabled() != primary_profile.data_connection_enabled {
+            let _ = config_manager.set_data_enabled(primary_profile.data_connection_enabled);
+        }
+    }
     let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
 
     let nm_result = ensure_nm_modem_profile().await;
@@ -407,6 +446,7 @@ async fn main() -> Result<()> {
         let db_clone = Arc::clone(&app_db);
         let notification_clone = Arc::clone(&notification_sender);
         let sms_config_clone = Arc::clone(&config_manager);
+        let sms_line_registry = Arc::clone(&line_registry);
         let resync_rx = sms_resync_rx;
         tokio::spawn(async move {
             let _ = messaging::sms_listener::start_sms_listener(
@@ -414,6 +454,7 @@ async fn main() -> Result<()> {
                 db_clone,
                 notification_clone,
                 sms_config_clone,
+                sms_line_registry,
                 resync_rx,
             )
             .await;
@@ -483,28 +524,120 @@ async fn main() -> Result<()> {
         .allow_headers(Any);
 
     // 创建统一的应用状态
-    let app_state = AppState::new(
+    let app_state = AppState::new(AppStateDependencies {
         dbus_conn,
-        app_db,
+        database: app_db,
         config_manager,
         notification_sender,
         system_event_emitter,
         ddns_manager,
-        Arc::clone(&esim_supervisor),
+        esim_supervisor: Arc::clone(&esim_supervisor),
         sms_resync,
         data_user_disabled,
         airplane_mode_requested,
         vowifi_runtime,
         volte_runtime,
+        line_registry,
         cell_monitoring_active,
-    );
+    });
+
+    // Restore only explicitly enabled per-line data/airplane intents. The
+    // legacy global data switch is kept in sync for compatibility, but it no
+    // longer causes an unselected modem to become an implicit proxy route.
+    {
+        let restore_app = app_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+            for line in restore_app.line_registry.all().await {
+                let binding = line.binding();
+                if !binding.present {
+                    continue;
+                }
+                let profile = restore_app
+                    .config_manager
+                    .get_line_profile(&binding.line_id);
+                if profile.airplane_mode_enabled {
+                    let _ = line.data_proxy.stop().await;
+                    let _ = disconnect_data_via_modem(
+                        restore_app.dbus_conn.as_ref(),
+                        &binding.modem_path,
+                    )
+                    .await;
+                    let _ = set_airplane_mode_for_modem(
+                        restore_app.dbus_conn.as_ref(),
+                        &binding.modem_path,
+                        true,
+                    )
+                    .await;
+                    continue;
+                }
+                if !profile.data_connection_enabled {
+                    continue;
+                }
+                let allow_roaming = profile.roaming_allowed;
+                let apn = restore_app.config_manager.get_apn_config();
+                if let Err(error) = connect_data_via_modem(
+                    restore_app.dbus_conn.as_ref(),
+                    &binding.modem_path,
+                    allow_roaming,
+                    Some(&apn),
+                )
+                .await
+                {
+                    let _ = line.data_proxy.record_error(error).await;
+                    continue;
+                }
+                for _ in 0..15 {
+                    if let Ok(Some(interface)) = data_interface_for_modem(
+                        restore_app.dbus_conn.as_ref(),
+                        &binding.modem_path,
+                    )
+                    .await
+                    {
+                        if let Err(error) =
+                            line.data_proxy.start(&interface, &profile.data_proxy).await
+                        {
+                            let _ = line.data_proxy.record_error(error).await;
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        });
+    }
+
+    // Keep the line inventory synchronized with ModemManager hotplug and SIM
+    // replacement events. Refresh preserves existing per-line runtime state.
+    {
+        let refresh_app = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(error) = refresh_app
+                    .line_registry
+                    .refresh(refresh_app.dbus_conn.as_ref())
+                    .await
+                {
+                    tracing::warn!(error = %error, "Modem/SIM line inventory refresh failed");
+                } else {
+                    refresh_app
+                        .line_registry
+                        .sync_trunk_profiles(refresh_app.config_manager.as_ref())
+                        .await;
+                }
+            }
+        });
+    }
 
     // 启动自动化中心后台调度引擎
     automation::spawn_automation_scheduler(app_state.clone());
 
-    // Phase C: prune the cross-transport SMS dedup fingerprint table daily so
-    // long-running installs don't accumulate unbounded dedup rows. The
-    // retention window is user-configurable via the SMS path policy.
+    // Phase C: prune both dedup fingerprints and user-visible SMS history each
+    // day so long-running installs remain bounded. Both limits are
+    // user-configurable via the SMS path policy.
     {
         let cleanup_app = app_state.clone();
         tokio::spawn(async move {
@@ -513,7 +646,8 @@ async fn main() -> Result<()> {
             // Small startup delay so the first sweep doesn't race with boot.
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             loop {
-                let retention_days = config_manager.get_sms_path_policy().dedup_retention_days;
+                let policy = config_manager.get_sms_path_policy();
+                let retention_days = policy.dedup_retention_days;
                 match db.cleanup_sms_dedup(retention_days) {
                     Ok(deleted) if deleted > 0 => {
                         tracing::info!(
@@ -525,6 +659,19 @@ async fn main() -> Result<()> {
                     Ok(_) => {}
                     Err(err) => {
                         tracing::warn!(error = %err, "Failed to prune SMS dedup fingerprints");
+                    }
+                }
+                match db.prune_sms_messages(policy.message_retention_limit) {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!(
+                            deleted,
+                            message_retention_limit = policy.message_retention_limit,
+                            "Pruned oldest SMS history rows"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to prune SMS history rows");
                     }
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(24 * 60 * 60)).await;
@@ -539,6 +686,12 @@ async fn main() -> Result<()> {
     let protected_routes = Router::new()
         // ========== 设备信息接口 ==========
         .route("/api/device", get(get_device_info).options(options_handler))
+        .route(
+            "/api/modems",
+            get(get_modem_lines_handler)
+                .post(get_modem_lines_handler)
+                .options(options_handler),
+        )
         // ========== SIM 卡接口 ==========
         .route("/api/sim", get(get_sim_info).options(options_handler))
         .route(
@@ -693,6 +846,26 @@ async fn main() -> Result<()> {
                 .options(options_handler),
         )
         .route(
+            "/api/modem/line-controls",
+            get(get_line_network_controls_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/data",
+            post(set_line_data_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/data/config",
+            post(set_line_data_proxy_config_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/roaming",
+            post(set_line_roaming_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/airplane-mode",
+            post(set_line_airplane_mode_handler).options(options_handler),
+        )
+        .route(
             "/api/baseband/restart",
             post(restart_baseband_handler).options(options_handler),
         )
@@ -831,6 +1004,24 @@ async fn main() -> Result<()> {
             get(get_vowifi_profiles_handler).options(options_handler),
         )
         .route(
+            "/api/vowifi/external-profiles",
+            get(get_external_vowifi_profiles_handler)
+                .post(set_external_vowifi_profile_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/vowifi/lines",
+            get(get_vowifi_lines_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/lines/{line_id}",
+            post(set_vowifi_line_config_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/lines/{line_id}/connection",
+            post(set_vowifi_line_connection_handler).options(options_handler),
+        )
+        .route(
             "/api/vowifi/events",
             get(get_vowifi_events_handler).options(options_handler),
         )
@@ -863,8 +1054,40 @@ async fn main() -> Result<()> {
             post(set_volte_connection_handler).options(options_handler),
         )
         .route(
-            "/api/volte/ip-family",
-            post(set_volte_ip_family_handler).options(options_handler),
+            "/api/volte/lines",
+            get(get_volte_lines_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines/{line_id}",
+            get(get_volte_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines/{line_id}/connection",
+            post(set_volte_line_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines/{line_id}/retry",
+            post(retry_volte_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/sim/slots",
+            get(get_standalone_sim_slots_handler)
+                .post(set_standalone_sim_slots_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/trunk/lines",
+            get(get_trunk_lines_handler).options(options_handler),
+        )
+        .route(
+            "/api/trunk/lines/{line_id}",
+            get(get_line_trunk_handler)
+                .post(set_line_trunk_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/trunk/lines/{line_id}/enabled",
+            post(set_line_trunk_enabled_handler).options(options_handler),
         )
         .route(
             "/api/volte/call/status",
@@ -875,42 +1098,10 @@ async fn main() -> Result<()> {
             post(set_volte_voice_handler).options(options_handler),
         )
         .route(
-            "/api/voicemail/status",
-            get(get_voicemail_status_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/status",
-            get(get_voice_services_status_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/config",
-            post(set_voice_services_config_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/path-policy",
+            "/api/voice/path-policy",
             get(get_voice_path_policy_handler)
                 .post(set_voice_path_policy_handler)
                 .options(options_handler),
-        )
-        .route(
-            "/api/voice-services/screen",
-            post(screen_voice_call_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/transcripts",
-            post(ingest_voice_transcript_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/inbox",
-            get(get_voice_inbox_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/inbox/{id}/read",
-            post(set_voice_inbox_read_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/inbox/{id}",
-            delete(delete_voice_inbox_handler).options(options_handler),
         )
         .route(
             "/api/web-call/capabilities",
@@ -936,6 +1127,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/sms/send",
             post(send_sms_handler).options(options_handler),
+        )
+        .route(
+            "/api/sms/channels",
+            get(get_sms_channels_handler).options(options_handler),
         )
         .route(
             "/api/sms/list",

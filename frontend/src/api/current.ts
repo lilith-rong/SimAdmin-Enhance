@@ -23,6 +23,8 @@ import type {
   ConnectivityCheckResponse,
   DataConnectionRequest,
   DataConnectionStatus,
+  LineNetworkControlsResponse,
+  LineDataProxyConfig,
   DdnsConfig,
   DdnsLogsResponse,
   DdnsStatusResponse,
@@ -36,8 +38,17 @@ import type {
   EsimLpacRepairResponse,
   EsimLpacStatusResponse,
   EsimProfilesResponse,
+  ExternalVowifiProfile,
   LoginRequest,
+  LineRuntimeStatus,
   ManualRegisterRequest,
+  TrunkProfileConfig,
+  VowifiLineConfigResponse,
+  LineVowifiConfig,
+  StandaloneSimSlotConfig,
+  TrunkProfileResponse,
+  VolteControlResponse,
+  VolteLineControlResponse,
   NetworkInfo,
   NetworkInterfacesResponse,
   NotificationConfig,
@@ -59,6 +70,7 @@ import type {
   UpdateSimCacheRequest,
   SmsMessage,
   SmsConversationRequest,
+  SmsChannelResponse,
   SmsListRequest,
   SmsStats,
   SmsPathPolicy,
@@ -76,11 +88,7 @@ import type {
   WorkMode,
   WorkModeRequest,
   WorkModeResponse,
-  VoiceInboxListResponse,
   VoicePathPolicy,
-  VoiceServicesConfig,
-  VoiceServicesStatusResponse,
-  CallScreeningDecision,
   WebCallCapabilitiesResponse,
   VilteConfig,
   VilteStatusResponse,
@@ -433,6 +441,38 @@ class SimAdminCurrentAPI {
     })
   }
 
+  async getLineNetworkControls() {
+    return request<ApiResponse<LineNetworkControlsResponse[]>>('/modem/line-controls')
+  }
+
+  async setLineDataConnection(lineId: string, enabled: boolean) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/data`,
+      { method: 'POST', body: JSON.stringify({ enabled }) },
+    )
+  }
+
+  async setLineDataProxyConfig(lineId: string, config: LineDataProxyConfig) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/data/config`,
+      { method: 'POST', body: JSON.stringify(config) },
+    )
+  }
+
+  async setLineRoaming(lineId: string, allowed: boolean) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/roaming`,
+      { method: 'POST', body: JSON.stringify({ allowed }) },
+    )
+  }
+
+  async setLineAirplaneMode(lineId: string, enabled: boolean) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/airplane-mode`,
+      { method: 'POST', body: JSON.stringify({ enabled }) },
+    )
+  }
+
   async getSystemStats() {
     return request<ApiResponse<SystemStatsResponse>>('/stats')
   }
@@ -614,10 +654,104 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async sendSms(phoneNumber: string, content: string) {
-    return request<ApiResponse<{ path: string }>>('/sms/send', {
+  async getModemLines() {
+    return request<ApiResponse<LineRuntimeStatus[]>>('/modems')
+  }
+
+  async getVolteControl() {
+    return request<ApiResponse<VolteControlResponse>>('/volte/control')
+  }
+
+  async setVolteFeature(enabled: boolean) {
+    return request<ApiResponse<VolteControlResponse>>('/volte/feature', {
       method: 'POST',
-      body: JSON.stringify({ phone_number: phoneNumber, content }),
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async getVolteLines() {
+    return request<ApiResponse<VolteLineControlResponse[]>>('/volte/lines')
+  }
+
+  async getVolteLine(lineId: string) {
+    return request<ApiResponse<VolteLineControlResponse>>(`/volte/lines/${encodeURIComponent(lineId)}`)
+  }
+
+  async setVolteLineConnection(lineId: string, enabled: boolean) {
+    return request<ApiResponse<VolteLineControlResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/connection`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      },
+    )
+  }
+
+  async retryVolteLine(lineId: string) {
+    return request<ApiResponse<VolteLineControlResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/retry`,
+      { method: 'POST', body: JSON.stringify({}) },
+    )
+  }
+
+  async getVowifiLines() {
+    return request<ApiResponse<VowifiLineConfigResponse[]>>('/vowifi/lines')
+  }
+
+  async setVowifiLineConnection(lineId: string, enabled: boolean) {
+    return request<ApiResponse<VowifiLineConfigResponse>>(
+      `/vowifi/lines/${encodeURIComponent(lineId)}/connection`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      },
+    )
+  }
+
+  async setVowifiLineConfig(lineId: string, config: LineVowifiConfig) {
+    return request<ApiResponse<VowifiLineConfigResponse>>(`/vowifi/lines/${encodeURIComponent(lineId)}`, {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async getStandaloneSimSlots() {
+    return request<ApiResponse<StandaloneSimSlotConfig[]>>('/sim/slots')
+  }
+
+  async setStandaloneSimSlots(slots: StandaloneSimSlotConfig[]) {
+    return request<ApiResponse<StandaloneSimSlotConfig[]>>('/sim/slots', {
+      method: 'POST',
+      body: JSON.stringify(slots),
+    })
+  }
+
+  async getTrunkLines() {
+    return request<ApiResponse<TrunkProfileResponse[]>>('/trunk/lines')
+  }
+
+  async getTrunkLine(lineId: string) {
+    return request<ApiResponse<TrunkProfileResponse>>(`/trunk/lines/${encodeURIComponent(lineId)}`)
+  }
+
+  async setTrunkLine(lineId: string, profile: TrunkProfileConfig) {
+    return request<ApiResponse<TrunkProfileResponse>>(`/trunk/lines/${encodeURIComponent(lineId)}`, {
+      method: 'POST',
+      body: JSON.stringify(profile),
+    })
+  }
+
+  async setTrunkLineEnabled(lineId: string, enabled: boolean) {
+    return request<ApiResponse<TrunkProfileResponse>>(`/trunk/lines/${encodeURIComponent(lineId)}/enabled`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async sendSms(phoneNumber: string, content: string, lineId?: string) {
+    return request<ApiResponse<{ path: string; transport?: string; line_id?: string }>>('/sms/send', {
+      method: 'POST',
+      body: JSON.stringify({ phone_number: phoneNumber, content, line_id: lineId || undefined }),
     })
   }
 
@@ -626,6 +760,7 @@ class SimAdminCurrentAPI {
     if (params?.limit) query.append('limit', params.limit.toString())
     if (params?.offset) query.append('offset', params.offset.toString())
     if (params?.direction) query.append('direction', params.direction)
+    if (params?.channel_id) query.append('channel_id', params.channel_id)
     const queryStr = query.toString() ? `?${query.toString()}` : ''
     return request<ApiResponse<SmsListResponse>>(`/sms/list${queryStr}`)
   }
@@ -634,11 +769,17 @@ class SimAdminCurrentAPI {
     const query = new URLSearchParams()
     query.append('phone_number', params.phone_number)
     if (params.limit) query.append('limit', params.limit.toString())
+    if (params.channel_id) query.append('channel_id', params.channel_id)
     return request<ApiResponse<SmsListResponse>>(`/sms/conversation?${query.toString()}`)
   }
 
-  async getSmsStats() {
-    return request<ApiResponse<SmsStats>>('/sms/stats')
+  async getSmsChannels() {
+    return request<ApiResponse<SmsChannelResponse[]>>('/sms/channels')
+  }
+
+  async getSmsStats(channelId?: string) {
+    const query = channelId ? `?channel_id=${encodeURIComponent(channelId)}` : ''
+    return request<ApiResponse<SmsStats>>(`/sms/stats${query}`)
   }
 
   async getSmsPathPolicy() {
@@ -664,16 +805,17 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async deleteSmsConversation(phoneNumber: string) {
+  async deleteSmsConversation(phoneNumber: string, channelId?: string) {
+    const query = channelId ? `?channel_id=${encodeURIComponent(channelId)}` : ''
     return request<ApiResponse<{ deleted: number }>>(
-      `/sms/conversation/${encodeURIComponent(phoneNumber)}`,
+      `/sms/conversation/${encodeURIComponent(phoneNumber)}${query}`,
       {
         method: 'DELETE',
       },
     )
   }
 
-  async deleteSmsBatch(payload: { ids?: number[]; phone_numbers?: string[] }) {
+  async deleteSmsBatch(payload: { ids?: number[]; phone_numbers?: string[]; channel_id?: string }) {
     return request<ApiResponse<{ deleted: number }>>('/sms/batch-delete', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -732,49 +874,14 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getVoiceServicesStatus() {
-    return request<ApiResponse<VoiceServicesStatusResponse>>('/voice-services/status')
-  }
-
-  async setVoiceServicesConfig(config: VoiceServicesConfig) {
-    return request<ApiResponse<VoiceServicesConfig>>('/voice-services/config', {
-      method: 'POST',
-      body: JSON.stringify(config),
-    })
-  }
-
   async getVoicePathPolicy() {
-    return request<ApiResponse<VoicePathPolicy>>('/voice-services/path-policy')
+    return request<ApiResponse<VoicePathPolicy>>('/voice/path-policy')
   }
 
   async setVoicePathPolicy(policy: VoicePathPolicy) {
-    return request<ApiResponse<VoicePathPolicy>>('/voice-services/path-policy', {
+    return request<ApiResponse<VoicePathPolicy>>('/voice/path-policy', {
       method: 'POST',
       body: JSON.stringify(policy),
-    })
-  }
-
-  async screenVoiceCall(phoneNumber: string, transcript?: string) {
-    return request<ApiResponse<CallScreeningDecision>>('/voice-services/screen', {
-      method: 'POST',
-      body: JSON.stringify({ phone_number: phoneNumber, transcript }),
-    })
-  }
-
-  async getVoiceInbox(limit = 100, offset = 0) {
-    return request<ApiResponse<VoiceInboxListResponse>>(`/voice-services/inbox?limit=${limit}&offset=${offset}`)
-  }
-
-  async setVoiceInboxRead(id: number, read = true) {
-    return request<ApiResponse<{ updated: number }>>(`/voice-services/inbox/${id}/read`, {
-      method: 'POST',
-      body: JSON.stringify({ read }),
-    })
-  }
-
-  async deleteVoiceInbox(id: number) {
-    return request<ApiResponse<{ deleted: number }>>(`/voice-services/inbox/${id}`, {
-      method: 'DELETE',
     })
   }
 
@@ -931,6 +1038,17 @@ class SimAdminCurrentAPI {
   async getVowifiProfiles() {
     return request<ApiResponse<VowifiProfilesResponse>>('/vowifi/profiles', {
       timeoutMs: 10000,
+    })
+  }
+
+  async getExternalVowifiProfiles() {
+    return request<ApiResponse<ExternalVowifiProfile[]>>('/vowifi/external-profiles')
+  }
+
+  async setExternalVowifiProfile(profile: ExternalVowifiProfile) {
+    return request<ApiResponse<ExternalVowifiProfile[]>>('/vowifi/external-profiles', {
+      method: 'POST',
+      body: JSON.stringify(profile),
     })
   }
 

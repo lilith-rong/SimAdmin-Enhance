@@ -31,6 +31,34 @@ const ENV_PCSCF: &str = "SIMADMIN_VOLTE_PCSCF";
 const ENV_IMS_CID: &str = "SIMADMIN_VOLTE_IMS_CID";
 const DEFAULT_IMS_CID: u8 = 2;
 const AT_CONTEXT_SETTLE: Duration = Duration::from_secs(3);
+const AT_DISCOVERY_ROUNDS: usize = 3;
+
+/// An IMS PDP context kept alive while the dedicated bearer is negotiated.
+///
+/// Qualcomm exposes P-CSCF PCO only while this context is active. The
+/// reference runtime retains CID 2 through WDS probing and bearer creation,
+/// then restores the original context during session teardown.
+#[derive(Debug, Clone)]
+pub struct ImsAtContextLease {
+    pub modem: String,
+    pub cid: u8,
+    restore_command: String,
+}
+
+impl ImsAtContextLease {
+    pub async fn cleanup(self) {
+        let _ = run_at(&self.modem, &format!("AT+CGACT=0,{}", self.cid)).await;
+        let _ = run_at(&self.modem, &format!("AT$QCPDPIMSCFGE={},0,0,0", self.cid)).await;
+        let _ = run_at(&self.modem, &self.restore_command).await;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AtPcscfDiscovery {
+    pub candidates: Vec<IpAddr>,
+    pub context: Option<ImsAtContextLease>,
+    pub cid: u8,
+}
 
 /// Parsed IP settings for the IMS bearer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -52,10 +80,7 @@ impl ImsIpSettings {
     }
 
     /// Available bearer addresses in the configured attempt order.
-    pub fn ordered_local_addrs(
-        &self,
-        preference: VolteIpFamilyPreference,
-    ) -> Vec<IpAddr> {
+    pub fn ordered_local_addrs(&self, preference: VolteIpFamilyPreference) -> Vec<IpAddr> {
         let mut addresses = Vec::with_capacity(2);
         match preference {
             VolteIpFamilyPreference::Ipv6First => {
@@ -94,11 +119,7 @@ impl ImsIpSettings {
     }
 
     /// Validate the family invariant: local addr and P-CSCF must share family.
-    pub fn ensure_family_match(
-        &self,
-        local: IpAddr,
-        pcscf: IpAddr,
-    ) -> Result<IpAddr, VolteError> {
+    pub fn ensure_family_match(&self, local: IpAddr, pcscf: IpAddr) -> Result<IpAddr, VolteError> {
         if !same_family(local, pcscf) {
             return Err(VolteError::new(code::PCSCF_FAMILY_MISMATCH));
         }
@@ -144,47 +165,91 @@ pub async fn discover_pcscf_via_at(
     modem: &str,
     preference: VolteIpFamilyPreference,
 ) -> Vec<IpAddr> {
+    match discover_pcscf_via_at_with_context(modem, preference).await {
+        Ok(discovery) => {
+            if let Some(context) = discovery.context {
+                context.cleanup().await;
+            }
+            discovery.candidates
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Discover P-CSCF candidates and retain the successful Qualcomm IMS context.
+///
+/// Keeping the context is intentional: on the 410 firmware, cleaning CID 2
+/// immediately after `+CGCONTRDP` makes the subsequent IPv6 WDS request fail
+/// with `prefix-unavailable` even though the same request succeeds in the
+/// reference runtime.
+pub async fn discover_pcscf_via_at_with_context(
+    modem: &str,
+    preference: VolteIpFamilyPreference,
+) -> Result<AtPcscfDiscovery, VolteError> {
     let cid = std::env::var(ENV_IMS_CID)
         .ok()
         .and_then(|value| value.trim().parse::<u8>().ok())
         .filter(|value| (1..=16).contains(value))
         .unwrap_or(DEFAULT_IMS_CID);
 
-    for pdp_type in ordered_pdp_types(preference) {
-        if let Ok(candidates) = probe_pcscf_context(modem, cid, pdp_type).await {
-            if !candidates.is_empty() {
-                return candidates;
+    let mut last_error = None;
+    for _ in 0..AT_DISCOVERY_ROUNDS {
+        for pdp_type in ordered_pdp_types(preference) {
+            match probe_pcscf_context(modem, cid, pdp_type).await {
+                Ok((candidates, context)) if !candidates.is_empty() => {
+                    return Ok(AtPcscfDiscovery {
+                        candidates,
+                        context: Some(context),
+                        cid,
+                    });
+                }
+                Ok((_, context)) => {
+                    context.cleanup().await;
+                    last_error = Some(VolteError::with_detail(
+                        code::RUNTIME_ALL_PCSCF_FAILED,
+                        format!("AT+CGCONTRDP={cid}:{pdp_type}:no-pcscf"),
+                    ));
+                }
+                Err(error) => last_error = Some(error),
             }
         }
     }
-    Vec::new()
+    Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
 }
 
 async fn probe_pcscf_context(
     modem: &str,
     cid: u8,
     pdp_type: &str,
-) -> Result<Vec<IpAddr>, VolteError> {
+) -> Result<(Vec<IpAddr>, ImsAtContextLease), VolteError> {
     let restore_context = run_at(modem, "AT+CGDCONT?")
         .await
         .ok()
         .and_then(|output| cgdccont_restore_command(&output, cid))
         .unwrap_or_else(|| format!("AT+CGDCONT={cid},\"IPV4V6\",\"\""));
     let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
-    run_at(
-        modem,
-        &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\""),
-    )
-    .await?;
+    run_at(modem, &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\"")).await?;
     run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},1,1,1")).await?;
     if let Err(error) = run_at(modem, &format!("AT+CGACT=1,{cid}")).await {
         cleanup_pcscf_context(modem, cid, &restore_context).await;
         return Err(error);
     }
     sleep(AT_CONTEXT_SETTLE).await;
-    let settings = run_at(modem, &format!("AT+CGCONTRDP={cid}")).await;
-    cleanup_pcscf_context(modem, cid, &restore_context).await;
-    settings.map(|output| parse_cgcontrdp_pcscf(&output, cid))
+    let settings = match run_at(modem, &format!("AT+CGCONTRDP={cid}")).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            cleanup_pcscf_context(modem, cid, &restore_context).await;
+            return Err(error);
+        }
+    };
+    Ok((
+        parse_cgcontrdp_pcscf(&settings, cid),
+        ImsAtContextLease {
+            modem: modem.to_string(),
+            cid,
+            restore_command: restore_context,
+        },
+    ))
 }
 
 async fn cleanup_pcscf_context(modem: &str, cid: u8, restore_context: &str) {
@@ -205,9 +270,15 @@ async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .replace('\n', " ");
         Err(VolteError::with_detail(
             code::COMMAND_FAILED,
-            format!("mmcli:{}", output.status.code().unwrap_or(-1)),
+            format!(
+                "mmcli:{}:-m {modem} {argument}:{stderr}",
+                output.status.code().unwrap_or(-1)
+            ),
         ))
     }
 }
@@ -330,9 +401,11 @@ pub async fn discover_pcscf(
         }
         let address_type = if local.is_ipv6() { 28 } else { 1 };
         if let Ok(records) = query_dns(local, *server, &pcscf_name, address_type).await {
-            if let Some(address) = records.addresses.into_iter().find(|item| {
-                item.is_ipv4() == local.is_ipv4()
-            }) {
+            if let Some(address) = records
+                .addresses
+                .into_iter()
+                .find(|item| item.is_ipv4() == local.is_ipv4())
+            {
                 return Ok(address);
             }
         }
@@ -343,9 +416,11 @@ pub async fn discover_pcscf(
             };
             for target in records.srv_targets {
                 if let Ok(target_records) = query_dns(local, *server, &target, address_type).await {
-                    if let Some(address) = target_records.addresses.into_iter().find(|item| {
-                        item.is_ipv4() == local.is_ipv4()
-                    }) {
+                    if let Some(address) = target_records
+                        .addresses
+                        .into_iter()
+                        .find(|item| item.is_ipv4() == local.is_ipv4())
+                    {
                         return Ok(address);
                     }
                 }
@@ -547,9 +622,7 @@ fn same_family(left: IpAddr, right: IpAddr) -> bool {
 
 fn parse_pcscf_override(value: &str) -> Vec<IpAddr> {
     value
-        .split(|character: char| {
-            character == ',' || character == ';' || character.is_whitespace()
-        })
+        .split(|character: char| character == ',' || character == ';' || character.is_whitespace())
         .filter_map(|candidate| candidate.trim().parse::<IpAddr>().ok())
         .fold(Vec::new(), |mut addresses, address| {
             if !addresses.contains(&address) {
@@ -585,10 +658,7 @@ IPv4 primary DNS: 10.0.0.53";
             Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
         );
         assert_eq!(s.ipv6_dns.len(), 2);
-        assert_eq!(
-            s.ipv4_address,
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
-        );
+        assert_eq!(s.ipv4_address, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
     }
 
     #[test]
@@ -610,9 +680,7 @@ IPv4 primary DNS: 10.0.0.53";
         );
         assert_eq!(
             s.ordered_local_addrs(VolteIpFamilyPreference::Ipv6Only),
-            vec![IpAddr::V6(
-                "2001:db8::2".parse::<Ipv6Addr>().unwrap()
-            )]
+            vec![IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap())]
         );
         assert_eq!(
             s.ordered_local_addrs(VolteIpFamilyPreference::Ipv4Only),
@@ -629,7 +697,8 @@ IPv4 primary DNS: 10.0.0.53";
                 .code(),
             code::RUNTIME_ALL_PCSCF_FAILED
         );
-        s.pcscf.push(IpAddr::V6("2001:db8::99".parse::<Ipv6Addr>().unwrap()));
+        s.pcscf
+            .push(IpAddr::V6("2001:db8::99".parse::<Ipv6Addr>().unwrap()));
         assert_eq!(
             s.resolve_pcscf_for(IpAddr::V6("2001:db8::2".parse().unwrap()))
                 .unwrap(),
@@ -659,7 +728,10 @@ IPv4 primary DNS: 10.0.0.53";
             code::PCSCF_FAMILY_MISMATCH
         );
         let v6 = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(s.ensure_family_match(s.local_addr().unwrap(), v6).unwrap(), v6);
+        assert_eq!(
+            s.ensure_family_match(s.local_addr().unwrap(), v6).unwrap(),
+            v6
+        );
     }
 
     #[test]
@@ -669,14 +741,8 @@ IPv4 primary DNS: 10.0.0.53";
         let v6 = IpAddr::V6("2001:db8::99".parse().unwrap());
         s.pcscf.extend([v6, v4]);
 
-        assert_eq!(
-            s.resolve_pcscf_for(s.ipv4_address.unwrap()).unwrap(),
-            v4
-        );
-        assert_eq!(
-            s.resolve_pcscf_for(s.ipv6_address.unwrap()).unwrap(),
-            v6
-        );
+        assert_eq!(s.resolve_pcscf_for(s.ipv4_address.unwrap()).unwrap(), v4);
+        assert_eq!(s.resolve_pcscf_for(s.ipv6_address.unwrap()).unwrap(), v6);
         assert_eq!(
             parse_pcscf_override("2001:db8::99, 192.0.2.10;invalid 192.0.2.10"),
             vec![v6, v4]

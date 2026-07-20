@@ -5,7 +5,7 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock as StdRwLock},
     time::{Duration, Instant},
 };
 
@@ -34,13 +34,14 @@ use super::{
         verify_usim_application_via_proxy_reason_with_retry, USIM_AID_PREFIX,
     },
     sms,
-    transport::{DnsResolver, ResolvedEpdgEndpoint, TransportError, UdpSocketDatagramTransport},
+    transport::{ResolvedEpdgEndpoint, TransportError, UdpSocketDatagramTransport},
     tun_gateway::{
         self, ImsEspFlowConfig, ImsEspPolicyConfig, TunGatewayConfig, TunGatewayRuntime,
     },
     voice,
 };
 use crate::cellular::modem_manager::{current_sim_identity, get_sim_info_data_with_cache};
+use crate::infra::config::{LineVowifiConfig, VowifiProxyMode};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
@@ -94,6 +95,65 @@ static LIVE_IMS_SECURITY_VERIFY: OnceLock<Mutex<Option<LiveImsSecurityVerify>>> 
 static LIVE_IMS_TCP_CHANNEL: OnceLock<Mutex<Option<LiveImsTcpChannel>>> = OnceLock::new();
 static LIVE_IMS_REGISTER_SUCCESS_VARIANT: OnceLock<Mutex<Option<LiveImsRegisterSuccessVariant>>> =
     OnceLock::new();
+static LIVE_NETWORK_OVERRIDES: OnceLock<StdRwLock<LiveNetworkOverrides>> = OnceLock::new();
+
+#[derive(Debug, Clone, Default)]
+struct LiveNetworkOverrides {
+    epdg_host: Option<String>,
+    epdg_port: Option<u16>,
+    dns_server: Option<IpAddr>,
+}
+
+pub fn configure_live_network_overrides(config: &LineVowifiConfig) -> Result<(), String> {
+    let next = build_live_network_overrides(config)?;
+    *LIVE_NETWORK_OVERRIDES
+        .get_or_init(|| StdRwLock::new(LiveNetworkOverrides::default()))
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    Ok(())
+}
+
+fn build_live_network_overrides(config: &LineVowifiConfig) -> Result<LiveNetworkOverrides, String> {
+    if config.proxy_mode != VowifiProxyMode::Direct {
+        return Err("vowifi_proxy_runtime_not_available".to_string());
+    }
+    Ok(LiveNetworkOverrides {
+        epdg_host: (!config.epdg_host.is_empty()).then(|| config.epdg_host.clone()),
+        epdg_port: (!config.epdg_host.is_empty()).then_some(config.epdg_port),
+        dns_server: if config.dns_server.is_empty() {
+            None
+        } else {
+            Some(
+                config
+                    .dns_server
+                    .parse::<IpAddr>()
+                    .map_err(|_| "vowifi_dns_server_invalid".to_string())?,
+            )
+        },
+    })
+}
+
+fn live_epdg_settings(profile: &'static CarrierProfile) -> (String, u16, Option<IpAddr>) {
+    let overrides = LIVE_NETWORK_OVERRIDES
+        .get_or_init(|| StdRwLock::new(LiveNetworkOverrides::default()))
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    (
+        overrides
+            .epdg_host
+            .unwrap_or_else(|| profile.epdg.host.to_string()),
+        overrides.epdg_port.unwrap_or(profile.epdg.port),
+        overrides.dns_server,
+    )
+}
+
+async fn resolve_live_epdg(
+    profile: &'static CarrierProfile,
+) -> Result<ResolvedEpdgEndpoint, TransportError> {
+    let (host, port, dns_server) = live_epdg_settings(profile);
+    epdg::resolve_epdg_with_dns_override(&profile.meta, &host, port, dns_server).await
+}
 
 #[derive(Debug, Clone)]
 struct LiveImsRegisterReady {
@@ -872,16 +932,7 @@ impl LiveEpdgAdapter for SystemLiveEpdgAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedEpdgEndpoint, LiveStageError>> + Send + 'a>>
     {
         Box::pin(async move {
-            match tokio::time::timeout(
-                LIVE_DNS_TIMEOUT,
-                epdg::SystemDnsResolver.resolve_epdg(
-                    &profile.meta,
-                    profile.epdg.host,
-                    profile.epdg.port,
-                ),
-            )
-            .await
-            {
+            match tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(profile)).await {
                 Ok(Ok(endpoint)) => Ok(endpoint),
                 Ok(Err(_err)) => Err(live_stage_error("epdg_dns_resolution_failed")),
                 Err(_) => Err(live_stage_error("epdg_dns_resolution_timeout")),
@@ -1022,7 +1073,7 @@ fn live_ike_proposal_groups(
             .map_err(|_| live_stage_error("ike_profile_proposal_parse_failed"))?;
         let dh_group = DhGroup::from_transform_id(dh_transform)
             .ok_or_else(|| live_stage_error("ike_dh_group_unsupported"))?;
-        
+
         if let Some(existing) = groups.iter_mut().find(|g| g.dh_group == dh_group) {
             existing.proposals.push(*proposal);
         } else {
@@ -1050,17 +1101,12 @@ async fn run_live_ike_until_depth(
     target: LiveIkeTarget,
     depth: LiveProbeDepth,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    info!(
-        "Resolving ePDG host: {} port: {}",
-        profile.epdg.host, profile.epdg.port
-    );
-    let endpoint = tokio::time::timeout(
-        LIVE_DNS_TIMEOUT,
-        epdg::SystemDnsResolver.resolve_epdg(&profile.meta, profile.epdg.host, profile.epdg.port),
-    )
-    .await
-    .map_err(|_| live_stage_error("epdg_dns_resolution_timeout"))?
-    .map_err(map_transport_error)?;
+    let (epdg_host, epdg_port, _) = live_epdg_settings(profile);
+    info!("Resolving ePDG host: {} port: {}", epdg_host, epdg_port);
+    let endpoint = tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(profile))
+        .await
+        .map_err(|_| live_stage_error("epdg_dns_resolution_timeout"))?
+        .map_err(map_transport_error)?;
     let addresses = endpoint.addresses;
     info!("Resolved ePDG endpoint addresses: {:?}", addresses);
     if addresses.is_empty() {
@@ -1398,36 +1444,34 @@ async fn run_live_ike_with_destination(
         return Err(live_stage_error("eap_aka_success_not_reached"));
     }
 
-    if target == LiveIkeTarget::ChildSaReady {
-        if !success_includes_child_sa {
-            info!("Child SA not included in EapSuccess. Building final IKE_AUTH request...");
-            let msk = eap_response
-                .msk_for_ike_auth()
-                .ok_or_else(|| live_stage_error("eap_aka_msk_unavailable"))?;
-            let expected_message_id = machine.next_message_id();
-            let final_auth_packet = machine
-                .build_encrypted_final_auth_packet(msk)
-                .map_err(|_| live_stage_error("ike_auth_final_request_build_failed"))?;
-            info!("Sending final IKE_AUTH request to {:?}", ike_destination);
-            auth_transport
-                .send_ike_message_metadata(use_nat_t, ike_destination, &final_auth_packet)
-                .await
-                .map_err(map_transport_error)?;
-            let child_sa_response = recv_ike_response_with_retransmit(
-                &auth_transport,
-                ike_destination,
-                &final_auth_packet,
-                use_nat_t,
-                "ike_child_sa_timeout",
-                LIVE_IKE_AUTH_ATTEMPTS,
-            )
-            .await?;
-            info!("Received final IKE_AUTH response, validating...");
-            validate_ike_auth_response(&child_sa_response, initiator_spi, expected_message_id)?;
-            machine
-                .accept_encrypted_child_sa_response_or_reason(&child_sa_response)
-                .map_err(|reason| LiveStageError { reason })?;
-        }
+    if target == LiveIkeTarget::ChildSaReady && !success_includes_child_sa {
+        info!("Child SA not included in EapSuccess. Building final IKE_AUTH request...");
+        let msk = eap_response
+            .msk_for_ike_auth()
+            .ok_or_else(|| live_stage_error("eap_aka_msk_unavailable"))?;
+        let expected_message_id = machine.next_message_id();
+        let final_auth_packet = machine
+            .build_encrypted_final_auth_packet(msk)
+            .map_err(|_| live_stage_error("ike_auth_final_request_build_failed"))?;
+        info!("Sending final IKE_AUTH request to {:?}", ike_destination);
+        auth_transport
+            .send_ike_message_metadata(use_nat_t, ike_destination, &final_auth_packet)
+            .await
+            .map_err(map_transport_error)?;
+        let child_sa_response = recv_ike_response_with_retransmit(
+            &auth_transport,
+            ike_destination,
+            &final_auth_packet,
+            use_nat_t,
+            "ike_child_sa_timeout",
+            LIVE_IKE_AUTH_ATTEMPTS,
+        )
+        .await?;
+        info!("Received final IKE_AUTH response, validating...");
+        validate_ike_auth_response(&child_sa_response, initiator_spi, expected_message_id)?;
+        machine
+            .accept_encrypted_child_sa_response_or_reason(&child_sa_response)
+            .map_err(|reason| LiveStageError { reason })?;
     }
 
     Ok(LiveIkeSession {
@@ -2099,7 +2143,7 @@ async fn record_live_ims_tcp_channel(
         profile_id: profile.meta.profile_id,
         expires_at: Instant::now() + live_ims_register_cache_ttl(expires_seconds),
         channel: super::channel::EpdgSipChannel::new(
-        stream,
+            stream,
             Vec::new(),
             crate::ims::context::ImsRoute {
                 local_addr,
@@ -2659,6 +2703,9 @@ async fn run_authenticated_register_after_challenge(
     }
 }
 
+// These protocol helpers keep security/session inputs explicit. Collapsing them
+// into broad context bags would hide which values cross an authentication step.
+#[allow(clippy::too_many_arguments)]
 async fn run_protected_authenticated_register_candidates(
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
@@ -2987,6 +3034,7 @@ async fn send_live_sms_message_on_cached_channel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_live_sms_message_on_stream(
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
@@ -3040,6 +3088,7 @@ async fn send_live_sms_message_on_stream(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_live_sms_followup_task(
     profile: &'static CarrierProfile,
     route: tun_gateway::ImsClientTcpRoute,
@@ -3082,8 +3131,8 @@ fn start_live_sms_followup_task(
                     profile_id: profile.meta.profile_id,
                     expires_at,
                     channel: super::channel::EpdgSipChannel::new(
-                    stream,
-                    pending,
+                        stream,
+                        pending,
                         shared_vowifi_route(profile, &route, local_addr),
                         security_verify,
                     ),
@@ -3106,6 +3155,7 @@ fn start_live_sms_followup_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_live_sms_followup_frames(
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
@@ -3319,6 +3369,7 @@ fn build_live_sms_message_request(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_live_sms_rp_ack_request(
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
@@ -3354,7 +3405,7 @@ fn build_live_sms_rp_ack_request(
         headers.push(crate::ims::sip_message::SipHeader::new(
             "Security-Verify",
             security_verify,
-    ));
+        ));
     }
     headers.push(crate::ims::sip_message::SipHeader::new(
         "Accept-Contact",
@@ -3417,7 +3468,7 @@ fn build_live_invite_request(
             "Contact",
             format!(
                 "<{}>;+g.3gpp.icsi-ref=\"{}\"",
-        identity.public_uri, LIVE_VOICE_MMTEL_ICSI
+                identity.public_uri, LIVE_VOICE_MMTEL_ICSI
             ),
         ),
         crate::ims::sip_message::SipHeader::new(
@@ -3433,7 +3484,7 @@ fn build_live_invite_request(
         headers.push(crate::ims::sip_message::SipHeader::new(
             "Security-Verify",
             security_verify,
-    ));
+        ));
     }
     headers.push(crate::ims::sip_message::SipHeader::new(
         "Accept-Contact",
@@ -3772,7 +3823,7 @@ fn append_sip_header_values(out: &mut String, headers: &str, name: &str) {
         };
         if header_name.eq_ignore_ascii_case(name) {
             out.push_str(name);
-            out.push_str(":");
+            out.push(':');
             out.push_str(value);
             if name.eq_ignore_ascii_case("To") && !value.to_ascii_lowercase().contains(";tag=") {
                 out.push_str(";tag=");
@@ -3943,7 +3994,7 @@ impl LiveRegisterRequestContext {
                     value.trim(),
                 ));
             }
-            }
+        }
         let contact = self.build_contact_header(&local_host, variant.header_profile);
         if let Some(value) = contact
             .trim_end_matches(['\r', '\n'])
@@ -3966,8 +4017,8 @@ impl LiveRegisterRequestContext {
                 "Route",
                 format!(
                     "<sip:{}:{};lr>",
-                sip_host(self.route_addr),
-                profile.ims.local_port
+                    sip_host(self.route_addr),
+                    profile.ims.local_port
                 ),
             ));
         }
@@ -3987,7 +4038,7 @@ impl LiveRegisterRequestContext {
             headers.push(crate::ims::sip_message::SipHeader::new(
                 "Proxy-Require",
                 "sec-agree",
-        ));
+            ));
         }
         headers.push(crate::ims::sip_message::SipHeader::new(
             "Allow",
@@ -4003,8 +4054,8 @@ impl LiveRegisterRequestContext {
             headers.push(crate::ims::sip_message::SipHeader::new(
                 "P-Visited-Network-ID",
                 visited_network,
-                ));
-            }
+            ));
+        }
         if let Some(pani) = &params.pani {
             headers.push(crate::ims::sip_message::SipHeader::new(
                 "P-Access-Network-Info",
@@ -4206,11 +4257,11 @@ async fn live_ims_register_identity(
     Ok(match format {
         LiveRegisterIdentityFormat::ImsiHomeDomain => LiveImsRegisterIdentity {
             shared: crate::ims::context::ImsIdentity {
-            private_user: format!("{imsi}@{}", profile.ims.realm),
-            public_uri: format!("sip:{imsi}@{}", profile.ims.domain),
-            contact_user: imsi.to_string(),
+                private_user: format!("{imsi}@{}", profile.ims.realm),
+                public_uri: format!("sip:{imsi}@{}", profile.ims.domain),
+                contact_user: imsi.to_string(),
                 home_domain: profile.ims.domain.to_string(),
-            contact_user_phone: false,
+                contact_user_phone: false,
             },
             shape: "imsi_home_domain",
         },
@@ -4218,22 +4269,22 @@ async fn live_ims_register_identity(
             let prefixed = format!("0{imsi}");
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: format!("{prefixed}@{}", profile.ims.realm),
-                public_uri: format!("sip:{prefixed}@{}", profile.ims.domain),
-                contact_user: prefixed,
+                    private_user: format!("{prefixed}@{}", profile.ims.realm),
+                    public_uri: format!("sip:{prefixed}@{}", profile.ims.domain),
+                    contact_user: prefixed,
                     home_domain: profile.ims.domain.to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "prefixed_imsi_home_domain",
             }
         }
         LiveRegisterIdentityFormat::ImsiPhoneUri => LiveImsRegisterIdentity {
             shared: crate::ims::context::ImsIdentity {
-            private_user: format!("{imsi}@{}", profile.ims.realm),
-            public_uri: format!("sip:{imsi}@{};user=phone", profile.ims.domain),
-            contact_user: imsi.to_string(),
+                private_user: format!("{imsi}@{}", profile.ims.realm),
+                public_uri: format!("sip:{imsi}@{};user=phone", profile.ims.domain),
+                contact_user: imsi.to_string(),
                 home_domain: profile.ims.domain.to_string(),
-            contact_user_phone: true,
+                contact_user_phone: true,
             },
             shape: "imsi_phone_uri",
         },
@@ -4241,11 +4292,11 @@ async fn live_ims_register_identity(
             let phone_number = read_live_msisdn_candidate(&conn).await?;
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: format!("{imsi}@{}", profile.ims.realm),
-                public_uri: format!("sip:{}@{};user=phone", phone_number, profile.ims.domain),
-                contact_user: phone_number,
+                    private_user: format!("{imsi}@{}", profile.ims.realm),
+                    public_uri: format!("sip:{}@{};user=phone", phone_number, profile.ims.domain),
+                    contact_user: phone_number,
                     home_domain: profile.ims.domain.to_string(),
-                contact_user_phone: true,
+                    contact_user_phone: true,
                 },
                 shape: "msisdn_phone_uri",
             }
@@ -4515,7 +4566,7 @@ fn parse_live_digest_challenge_value(
     header_kind: &'static str,
     value: &str,
 ) -> Result<LiveDigestChallenge, LiveStageError> {
-    let params = parse_live_digest_params(&value);
+    let params = parse_live_digest_params(value);
     let param = |name: &str| {
         params
             .iter()
@@ -4705,7 +4756,7 @@ fn select_live_security_server_offer(
         return Ok(None);
     }
     let mut offers = challenge.security_server_offers.clone();
-    offers.sort_by(|left, right| right.q_milli.cmp(&left.q_milli));
+    offers.sort_by_key(|offer| std::cmp::Reverse(offer.q_milli));
     for offer in offers {
         if live_security_offer_matches_profile(profile, &offer) {
             return Ok(Some(offer));
@@ -4967,7 +5018,7 @@ fn realm_plmn_matches_expected(realm: &str, expected_realm: &str) -> bool {
 
 fn decode_digest_nonce(value: &str) -> Result<Vec<u8>, LiveStageError> {
     let trimmed = value.trim();
-    if trimmed.len() % 2 == 0
+    if trimmed.len().is_multiple_of(2)
         && !trimmed.is_empty()
         && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
     {
@@ -4984,7 +5035,7 @@ fn decode_digest_nonce(value: &str) -> Result<Vec<u8>, LiveStageError> {
         .decode(value.as_bytes())
         .or_else(|_| {
             let mut padded = value.to_string();
-            while padded.len() % 4 != 0 {
+            while !padded.len().is_multiple_of(4) {
                 padded.push('=');
             }
             BASE64_STANDARD.decode(padded.as_bytes())
@@ -5010,7 +5061,7 @@ struct DigestNonceShape {
 
 fn digest_nonce_shape(value: &str) -> DigestNonceShape {
     let trimmed = value.trim();
-    let ascii_hex = trimmed.len() % 2 == 0
+    let ascii_hex = trimmed.len().is_multiple_of(2)
         && !trimmed.is_empty()
         && trimmed.bytes().all(|b| b.is_ascii_hexdigit());
     let base64_like = !trimmed.is_empty()
@@ -5024,6 +5075,7 @@ fn digest_nonce_shape(value: &str) -> DigestNonceShape {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_aka_md5_response(
     username: &str,
     realm: &str,
@@ -5597,10 +5649,6 @@ where
             match stage {
                 ExecutorStage::Epdg => {
                     let endpoint = self.epdg.resolve_epdg(profile).await?;
-                    let plan = epdg::build_connection_plan(profile, None);
-                    if endpoint.host != plan.host || endpoint.port != plan.port {
-                        return Err(live_stage_error("epdg_endpoint_mismatch"));
-                    }
                     Ok(LiveStageObservation {
                         stage: stage.as_str(),
                         ready: !endpoint.addresses.is_empty(),
@@ -5802,6 +5850,39 @@ fn stage_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_network_overrides_apply_custom_dns_and_epdg() {
+        let config = LineVowifiConfig {
+            dns_server: "2001:4860:4860::8888".to_string(),
+            epdg_host: "epdg.example.net".to_string(),
+            epdg_port: 4500,
+            ..LineVowifiConfig::default()
+        };
+
+        let overrides = build_live_network_overrides(&config).expect("valid network overrides");
+
+        assert_eq!(overrides.epdg_host.as_deref(), Some("epdg.example.net"));
+        assert_eq!(overrides.epdg_port, Some(4500));
+        assert_eq!(
+            overrides.dns_server,
+            Some("2001:4860:4860::8888".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn line_network_overrides_reject_unimplemented_proxy_transport() {
+        let config = LineVowifiConfig {
+            proxy_mode: VowifiProxyMode::UdpRelay,
+            proxy_endpoint: "udp://relay.example.net:4500".to_string(),
+            ..LineVowifiConfig::default()
+        };
+
+        assert_eq!(
+            build_live_network_overrides(&config).unwrap_err(),
+            "vowifi_proxy_runtime_not_available"
+        );
+    }
 
     fn register_variant(label: &str) -> LiveRegisterHeaderVariant {
         *LIVE_REGISTER_HEADER_VARIANTS
@@ -6233,11 +6314,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6287,11 +6368,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6324,11 +6405,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6354,11 +6435,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example;user=phone".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example;user=phone".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: true,
+                    contact_user_phone: true,
                 },
                 shape: "imsi_phone_uri",
             },
@@ -6387,11 +6468,11 @@ mod tests {
             &crate::access::vowifi::profiles::NL_VODAFONE_20404,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6416,11 +6497,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6451,11 +6532,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },

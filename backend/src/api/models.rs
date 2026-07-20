@@ -3,12 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::infra::config::{VoicePathPolicy, VoiceServicesConfig};
-use crate::infra::db::{
-    CallRecord, CallStats, SmsMessage, SmsStats, VoiceInboxEntry, VoiceInboxStats,
-};
-use crate::voice_services::screening::CallScreeningDecision;
-use crate::voice_services::MediaIngressCapabilities;
+use crate::infra::db::{CallRecord, CallStats, SmsMessage, SmsStats};
 
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T> {
@@ -246,7 +241,7 @@ pub struct RoamingRequest {
     pub allowed: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RoamingResponse {
     pub roaming_allowed: bool,
     pub is_roaming: bool,
@@ -257,11 +252,37 @@ pub struct AirplaneModeRequest {
     pub enabled: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AirplaneModeResponse {
     pub enabled: bool,
     pub powered: bool,
     pub online: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LineDataConnectionResponse {
+    pub enabled: bool,
+    pub connected: bool,
+    pub config: crate::infra::config::LineDataProxyConfig,
+    pub proxy: crate::cellular::data_proxy::DataProxyStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LineNetworkControlsResponse {
+    pub line_id: String,
+    pub modem_path: String,
+    pub present: bool,
+    pub data: LineDataConnectionResponse,
+    pub roaming: RoamingResponse,
+    pub airplane_mode: AirplaneModeResponse,
+    pub airplane_mode_requested: bool,
+    pub airplane_phase: String,
+    pub airplane_stage: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LineNetworkToggleRequest {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -902,61 +923,25 @@ pub struct ImsStatusResponse {
     pub sms_capable: bool,
 }
 
-#[derive(Debug, Serialize, Default)]
-pub struct VoicemailStatusResponse {
-    pub waiting: bool,
-    pub message_count: u8,
-    pub mailbox_number: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MediaIngressCapabilities {
+    pub adapter: String,
+    pub signaling_ready: bool,
+    pub audio_capture_ready: bool,
+    pub browser_webrtc_ready: bool,
+    pub reason: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct VoiceScreenRequest {
-    pub phone_number: String,
-    #[serde(default)]
-    pub transcript: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VoiceTranscriptIngestRequest {
-    pub session_id: String,
-    pub phone_number: String,
-    pub transcript: String,
-    #[serde(default)]
-    pub recording_ref: Option<String>,
-    #[serde(default)]
-    pub duration_seconds: u32,
-    #[serde(default)]
-    pub confidence: Option<f32>,
-}
-
-#[derive(Debug, Serialize, Default)]
-pub struct VoiceTranscriptIngestResponse {
-    pub entry_id: i64,
-    pub decision: CallScreeningDecision,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct VoiceInboxQuery {
-    #[serde(default = "default_page_size")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
-#[derive(Debug, Serialize, Default)]
-pub struct VoiceInboxListResponse {
-    pub messages: Vec<VoiceInboxEntry>,
-    pub stats: VoiceInboxStats,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VoiceInboxReadRequest {
-    #[serde(default = "default_true_value")]
-    pub read: bool,
-}
-
-fn default_true_value() -> bool {
-    true
+impl MediaIngressCapabilities {
+    pub fn unwired() -> Self {
+        Self {
+            adapter: "unwired".to_string(),
+            signaling_ready: false,
+            audio_capture_ready: false,
+            browser_webrtc_ready: false,
+            reason: "media_ingress_not_selected".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -969,17 +954,14 @@ pub struct WebCallCapabilitiesResponse {
     pub note: String,
 }
 
-#[derive(Debug, Serialize, Default)]
-pub struct VoiceServicesStatusResponse {
-    pub config: VoiceServicesConfig,
-    pub voice_path: VoicePathPolicy,
-    pub media_ingress: MediaIngressCapabilities,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct SendSmsRequest {
     pub phone_number: String,
     pub content: String,
+    /// Optional stable modem+SIM line. Omitted requests preserve the legacy
+    /// primary-line behavior.
+    #[serde(default)]
+    pub line_id: Option<String>,
 }
 
 /// Request body for placing a VoWiFi voice call.
@@ -995,6 +977,8 @@ pub struct SmsListRequest {
     #[serde(default)]
     pub offset: i64,
     pub direction: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1002,6 +986,8 @@ pub struct SmsConversationRequest {
     pub phone_number: String,
     #[serde(default = "default_page_size")]
     pub limit: i64,
+    #[serde(default)]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1010,6 +996,31 @@ pub struct SmsBatchDeleteRequest {
     pub ids: Vec<i64>,
     #[serde(default)]
     pub phone_numbers: Vec<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SmsStatsRequest {
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SmsChannelResponse {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub available: bool,
+    pub uim_slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iccid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_id: Option<String>,
 }
 
 fn default_page_size() -> i64 {

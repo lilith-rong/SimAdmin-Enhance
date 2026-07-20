@@ -4,7 +4,7 @@ use crate::infra::db::beijing_sms_now_string;
 use crate::notify::notification::AutomationEvent;
 use crate::state::AppState;
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -15,6 +15,39 @@ fn beijing_offset() -> FixedOffset {
 
 fn beijing_now() -> DateTime<FixedOffset> {
     Utc::now().with_timezone(&beijing_offset())
+}
+
+fn cron_field_matches(field: &str, value: u32, min: u32, max: u32) -> bool {
+    field.split(',').any(|part| {
+        let part = part.trim();
+        let (base, step) = part.split_once('/').map_or((part, 1), |(base, step)| {
+            (base, step.parse::<u32>().unwrap_or(0))
+        });
+        if step == 0 {
+            return false;
+        }
+        let (start, end) = if base == "*" {
+            (min, max)
+        } else if let Some((a, b)) = base.split_once('-') {
+            (a.parse().unwrap_or(max + 1), b.parse().unwrap_or(0))
+        } else {
+            let n = base.parse().unwrap_or(max + 1);
+            (n, n)
+        };
+        value >= start && value <= end && (value - start).is_multiple_of(step)
+    })
+}
+
+fn cron_matches(expression: &str, now: DateTime<FixedOffset>) -> bool {
+    let fields = expression.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 5 {
+        return false;
+    }
+    cron_field_matches(fields[0], now.minute(), 0, 59)
+        && cron_field_matches(fields[1], now.hour(), 0, 23)
+        && cron_field_matches(fields[2], now.day(), 1, 31)
+        && cron_field_matches(fields[3], now.month(), 1, 12)
+        && cron_field_matches(fields[4], now.weekday().number_from_sunday() - 1, 0, 6)
 }
 
 pub fn spawn_automation_scheduler(app: AppState) {
@@ -98,6 +131,20 @@ pub fn spawn_automation_scheduler(app: AppState) {
                             None => true, // 从无历史记录，触发首次运行
                         }
                     }
+                    AutomationTrigger::Cron { expression } => {
+                        let now = beijing_now();
+                        if !cron_matches(expression, now) {
+                            false
+                        } else {
+                            let minute = now.format("%Y-%m-%d %H:%M").to_string();
+                            if fixed_last_run.get(&task.id) == Some(&minute) {
+                                false
+                            } else {
+                                fixed_last_run.insert(task.id.clone(), minute);
+                                true
+                            }
+                        }
+                    }
                 };
 
                 if should_trigger {
@@ -147,6 +194,8 @@ async fn execute_task(
         AutomationAction::RestartBaseband => "restart_baseband",
         AutomationAction::RebootDevice { .. } => "reboot_device",
         AutomationAction::SendSms { .. } => "send_sms",
+        AutomationAction::ConsumeData { .. } => "consume_data",
+        AutomationAction::DialCall { .. } => "dial_call",
     };
 
     let handler = match registry.get(task_type) {
@@ -181,9 +230,40 @@ async fn execute_task(
                 "retry_limit": retry_limit
             })
         }
+        AutomationAction::ConsumeData { bytes, unit } => {
+            delay_secs = 120;
+            serde_json::json!({
+                "bytes": bytes,
+                "unit": unit,
+                "target": &task.target,
+            })
+        }
+        AutomationAction::DialCall {
+            country_code,
+            phone_number,
+            duration_seconds,
+        } => {
+            delay_secs = u64::from(*duration_seconds).min(7_200);
+            serde_json::json!({
+                "country_code": country_code,
+                "phone_number": phone_number,
+                "duration_seconds": duration_seconds,
+                "target": &task.target,
+            })
+        }
     };
 
-    // 执行任务并控制超时（基准60秒 + 随机延迟时间）
+    let params = if params.get("target").is_some() {
+        params
+    } else {
+        let mut params = params;
+        if let Some(target) = &task.target {
+            params["target"] = serde_json::to_value(target)?;
+        }
+        params
+    };
+
+    // 执行任务并控制超时（基准60秒 + 动作需要的等待时间）
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(60 + delay_secs),
         handler.execute(app, &params),
@@ -220,4 +300,19 @@ async fn execute_task(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cron_tests {
+    use super::*;
+
+    #[test]
+    fn matches_five_field_cron_with_steps_and_ranges() {
+        let now = beijing_offset()
+            .with_ymd_and_hms(2026, 7, 19, 18, 30, 0)
+            .unwrap();
+        assert!(cron_matches("*/15 18 * * 0", now));
+        assert!(cron_matches("30 18 19 7 0", now));
+        assert!(!cron_matches("31 18 * * *", now));
+    }
 }

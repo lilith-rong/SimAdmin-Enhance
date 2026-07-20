@@ -14,6 +14,7 @@ import {
   TextField,
   Snackbar,
   Alert,
+  Stack,
   LinearProgress,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
@@ -33,7 +34,8 @@ import { api } from '../api/current'
 import type { SimInfo } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import EsimManagerPage from './EsimManager'
-import VowifiDiagnosticsPage from './VowifiDiagnostics'
+import ModemLinesPanel from './sim/ModemLinesPanel'
+import StandaloneSimSlotsPanel from './sim/StandaloneSimSlotsPanel'
 import { useWorkMode } from '../contexts/WorkModeContext'
 
 function getSensitiveStyle(show: boolean) {
@@ -555,43 +557,16 @@ function SimBasicInfo() {
 export default function SimCardPage() {
   const { mode, loading } = useWorkMode()
   const [searchParams, setSearchParams] = useSearchParams()
-  const [vowifiEnabled, setVowifiEnabled] = useState(false)
-  const [configLoading, setConfigLoading] = useState(true)
 
-  useEffect(() => {
-    let active = true
-    api.getVowifiControl()
-      .then((res) => {
-        if (active && res.data) {
-          setVowifiEnabled(res.data.feature_enabled)
-        }
-      })
-      .catch((err) => {
-        console.error('Failed to load VoWiFi control config:', err)
-      })
-      .finally(() => {
-        if (active) {
-          setConfigLoading(false)
-        }
-      })
-    return () => {
-      active = false
-    }
-  }, [])
-
-  let activeTab = searchParams.get('tab') || 'basic'
+  let activeTab = searchParams.get('tab') || 'lines'
 
   if (mode !== 'esim' && activeTab === 'esim') {
-    activeTab = 'basic'
-  }
-
-  if (!configLoading && !vowifiEnabled && activeTab === 'vowifi') {
-    activeTab = 'basic'
+    activeTab = 'lines'
   }
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: string) => {
     const params = new URLSearchParams(searchParams)
-    if (newValue === 'basic') {
+    if (newValue === 'lines') {
       params.delete('tab')
     } else {
       params.set('tab', newValue)
@@ -599,7 +574,7 @@ export default function SimCardPage() {
     setSearchParams(params)
   }
 
-  if (loading || configLoading) {
+  if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="50vh">
         <CircularProgress size={32} />
@@ -617,16 +592,14 @@ export default function SimCardPage() {
 
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
-          <Tab label="基本信息" value="basic" />
+          <Tab label="基带线路" value="lines" />
           {mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
-          {vowifiEnabled && <Tab label="WiFi Calling" value="vowifi" sx={{ textTransform: 'none' }} />}
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
-        {activeTab === 'basic' && <SimBasicInfo />}
+        {activeTab === 'lines' && <Stack spacing={2.5}><ModemLinesPanel primaryBasicInfo={<SimBasicInfo />} /><StandaloneSimSlotsPanel /></Stack>}
         {activeTab === 'esim' && mode === 'esim' && <EsimManagerPage />}
-        {activeTab === 'vowifi' && vowifiEnabled && <VowifiDiagnosticsPage />}
       </Box>
     </Box>
   )

@@ -13,23 +13,12 @@ pub struct VowifiSimIdentity {
     operator_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct MaskedSimIdentity {
     pub present: bool,
     pub iccid: String,
     pub imsi: String,
     pub operator_id: String,
-}
-
-impl Default for MaskedSimIdentity {
-    fn default() -> Self {
-        Self {
-            present: false,
-            iccid: String::new(),
-            imsi: String::new(),
-            operator_id: String::new(),
-        }
-    }
 }
 
 impl VowifiSimIdentity {

@@ -12,7 +12,7 @@
 //! `recreating IMS bearer to match roaming policy`,
 //! `Deleted stale disconnected IMS bearer`.
 
-use std::{net::IpAddr, process::Output};
+use std::{collections::VecDeque, net::IpAddr, process::Output};
 
 use tokio::process::Command;
 
@@ -111,7 +111,11 @@ pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteE
 }
 
 /// Create or reuse an `apn=ims` ModemManager bearer and connect it. Existing
-/// non-IMS bearers are never changed or deleted.
+/// non-IMS bearers are never changed or deleted. New sessions always request
+/// dual-stack first. An explicit `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed` response
+/// jumps directly to the required family; otherwise IPv4 then IPv6 are tried
+/// once each. Every failed temporary bearer is deleted before the next bounded
+/// attempt.
 pub async fn ensure_ims_bearer(
     modem: &str,
     request: &BearerRequest,
@@ -121,15 +125,72 @@ pub async fn ensure_ims_bearer(
     }
 
     let modem_output = run_command("mmcli", &["-m", modem, "--output-keyvalue"]).await?;
+    let mut required_fallback = None;
+    let mut last_error = None;
     for path in parse_bearer_paths(&modem_output) {
         let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
-            return connect_and_read(&path).await;
+            if is_dual_stack_bearer(&details) {
+                if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
+                    return parse_bearer_connection(&path, &details);
+                }
+                match connect_and_read(&path).await {
+                    Ok(bearer) => return Ok(bearer),
+                    Err(error) => {
+                        let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
+                            .await
+                            .unwrap_or_default();
+                        required_fallback = required_ip_type_after_failure(&after);
+                        last_error = Some(error);
+                    }
+                }
+            } else if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
+                disconnect_bearer(&path).await;
+            }
+            delete_bearer(modem, &path).await?;
+            break;
         }
     }
 
+    let mut pending = required_fallback
+        .map(|ip_type| VecDeque::from([ip_type]))
+        .unwrap_or_else(|| VecDeque::from(["ipv4v6"]));
+    let mut attempted = Vec::with_capacity(3);
+    while let Some(ip_type) = pending.pop_front() {
+        if attempted.contains(&ip_type) {
+            continue;
+        }
+        attempted.push(ip_type);
+        match create_and_connect_attempt(modem, request, ip_type).await {
+            Ok(bearer) => return Ok(bearer),
+            Err(failure) => {
+                last_error = Some(failure.error);
+                if ip_type == "ipv4v6" {
+                    pending.extend(fallback_ip_types(&failure.details));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)))
+}
+
+fn is_dual_stack_bearer(details: &str) -> bool {
+    value(details, "bearer.properties.ip-type")
+        .is_some_and(|ip_type| ip_type.eq_ignore_ascii_case("ipv4v6"))
+}
+
+struct BearerAttemptFailure {
+    error: VolteError,
+    details: String,
+}
+
+async fn create_and_connect_attempt(
+    modem: &str,
+    request: &BearerRequest,
+    ip_type: &str,
+) -> Result<BearerConnection, BearerAttemptFailure> {
     let properties = format!(
-        "apn={},ip-type=ipv4v6,allow-roaming={}",
+        "apn={},ip-type={ip_type},allow-roaming={}",
         request.apn,
         if request.allow_roaming { "yes" } else { "no" }
     );
@@ -137,10 +198,53 @@ pub async fn ensure_ims_bearer(
         "mmcli",
         &["-m", modem, &format!("--create-bearer={properties}")],
     )
-    .await?;
-    let path = parse_created_bearer_path(&created)
-        .ok_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING))?;
-    connect_and_read(&path).await
+    .await
+    .map_err(|error| BearerAttemptFailure {
+        error,
+        details: String::new(),
+    })?;
+    let path = parse_created_bearer_path(&created).ok_or_else(|| BearerAttemptFailure {
+        error: VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING),
+        details: String::new(),
+    })?;
+    match connect_and_read(&path).await {
+        Ok(bearer) => Ok(bearer),
+        Err(error) => {
+            let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
+                .await
+                .unwrap_or_default();
+            if let Err(cleanup) = delete_bearer(modem, &path).await {
+                return Err(BearerAttemptFailure {
+                    error: cleanup,
+                    details,
+                });
+            }
+            Err(BearerAttemptFailure { error, details })
+        }
+    }
+}
+
+async fn delete_bearer(modem: &str, path: &str) -> Result<(), VolteError> {
+    run_command("mmcli", &["-m", modem, &format!("--delete-bearer={path}")])
+        .await
+        .map(|_| ())
+}
+
+fn required_ip_type_after_failure(details: &str) -> Option<&'static str> {
+    let error = value(details, "bearer.status.connection-error.name")?;
+    if error.ends_with(".Ipv6OnlyAllowed") {
+        Some("ipv6")
+    } else if error.ends_with(".Ipv4OnlyAllowed") {
+        Some("ipv4")
+    } else {
+        None
+    }
+}
+
+fn fallback_ip_types(details: &str) -> Vec<&'static str> {
+    required_ip_type_after_failure(details)
+        .map(|ip_type| vec![ip_type])
+        .unwrap_or_else(|| vec!["ipv4", "ipv6"])
 }
 
 /// Disconnect an IMS bearer left active by a previous process before the
@@ -179,23 +283,22 @@ async fn connect_and_read(path: &str) -> Result<BearerConnection, VolteError> {
     parse_bearer_connection(path, &connected)
 }
 
-pub fn parse_bearer_connection(
-    path: &str,
-    output: &str,
-) -> Result<BearerConnection, VolteError> {
+pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnection, VolteError> {
     if value(output, "bearer.status.connected").as_deref() != Some("yes") {
         return Err(VolteError::new(code::RUNTIME_MM_BEARER_NOT_CONNECTED));
     }
     let interface = value(output, "bearer.status.interface")
         .filter(|item| item != "--")
         .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
-    let mut settings = ImsIpSettings::default();
-    settings.ipv4_address = ip_value(output, "bearer.ipv4-config.address");
-    settings.ipv4_gateway = ip_value(output, "bearer.ipv4-config.gateway");
-    settings.ipv4_dns = list_ip_values(output, "bearer.ipv4-config.dns.value");
-    settings.ipv6_address = ip_value(output, "bearer.ipv6-config.address");
-    settings.ipv6_gateway = ip_value(output, "bearer.ipv6-config.gateway");
-    settings.ipv6_dns = list_ip_values(output, "bearer.ipv6-config.dns.value");
+    let settings = ImsIpSettings {
+        ipv4_address: ip_value(output, "bearer.ipv4-config.address"),
+        ipv4_gateway: ip_value(output, "bearer.ipv4-config.gateway"),
+        ipv4_dns: list_ip_values(output, "bearer.ipv4-config.dns.value"),
+        ipv6_address: ip_value(output, "bearer.ipv6-config.address"),
+        ipv6_gateway: ip_value(output, "bearer.ipv6-config.gateway"),
+        ipv6_dns: list_ip_values(output, "bearer.ipv6-config.dns.value"),
+        ..Default::default()
+    };
     let ipv4_prefix = number_value(output, "bearer.ipv4-config.prefix");
     let ipv6_prefix = number_value(output, "bearer.ipv6-config.prefix");
     let mtu = number_value(output, "bearer.ipv6-config.mtu")
@@ -216,18 +319,15 @@ pub fn parse_bearer_connection(
 /// Configure the address and DNS host routes for the dedicated bearer. No
 /// default route is added, preserving the management/Wi-Fi path.
 pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), VolteError> {
+    // A raw-IP bearer still has to be administratively UP before Linux accepts
+    // host routes or transmits bound SIP/RTP sockets.  In particular, a
+    // bam-dmux runtime-PM/firmware failure may surface here as EINVAL or
+    // ETIMEDOUT.  Propagate that first failure instead of obscuring it with the
+    // inevitable later "Device for nexthop is not up" route error.
     run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await?;
     if let Some(mtu) = bearer.mtu {
         let mtu = mtu.to_string();
-        run_ip(&[
-            "link",
-            "set",
-            "dev",
-            &bearer.interface,
-            "mtu",
-            &mtu,
-        ])
-        .await?;
+        run_ip(&["link", "set", "dev", &bearer.interface, "mtu", &mtu]).await?;
     }
 
     let mut configured = false;
@@ -251,14 +351,7 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
     if let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address {
         let prefix = bearer.ipv4_prefix.unwrap_or(32);
         let address = format!("{address}/{prefix}");
-        run_ip(&[
-            "address",
-            "replace",
-            &address,
-            "dev",
-            &bearer.interface,
-        ])
-        .await?;
+        run_ip(&["address", "replace", &address, "dev", &bearer.interface]).await?;
         for dns in &bearer.settings.ipv4_dns {
             route_host(&bearer.interface, *dns).await?;
         }
@@ -270,27 +363,22 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
     Ok(())
 }
 
-pub async fn route_pcscf(
-    bearer: &BearerConnection,
-    pcscf: IpAddr,
-) -> Result<(), VolteError> {
+pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(), VolteError> {
     route_host(&bearer.interface, pcscf).await
 }
 
 async fn route_host(interface: &str, host: IpAddr) -> Result<(), VolteError> {
-    let (family, suffix) = if host.is_ipv6() { (Some("-6"), 128) } else { (None, 32) };
+    let (family, suffix) = if host.is_ipv6() {
+        (Some("-6"), 128)
+    } else {
+        (None, 32)
+    };
     let destination = format!("{host}/{suffix}");
     let mut args = Vec::new();
     if let Some(family) = family {
         args.push(family);
     }
-    args.extend_from_slice(&[
-        "route",
-        "replace",
-        &destination,
-        "dev",
-        interface,
-    ]);
+    args.extend_from_slice(&["route", "replace", &destination, "dev", interface]);
     run_ip(&args).await.map(|_| ())
 }
 
@@ -320,16 +408,24 @@ async fn run_command(program: &str, args: &[&str]) -> Result<String, VolteError>
         .map_err(|error| {
             VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("{program}:{error}"))
         })?;
-    command_output(program, output)
+    command_output(program, args, output)
 }
 
-fn command_output(program: &str, output: Output) -> Result<String, VolteError> {
+fn command_output(program: &str, args: &[&str], output: Output) -> Result<String, VolteError> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .replace('\n', " ");
         Err(VolteError::with_detail(
             code::COMMAND_FAILED,
-            format!("{program}:{}", output.status.code().unwrap_or(-1)),
+            format!(
+                "{program}:{}:{}:{}",
+                output.status.code().unwrap_or(-1),
+                args.join(" "),
+                stderr
+            ),
         ))
     }
 }
@@ -434,6 +530,28 @@ mod tests {
     }
 
     #[test]
+    fn network_family_rejection_selects_required_bearer_type() {
+        let ipv6 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed\n";
+        assert_eq!(required_ip_type_after_failure(ipv6), Some("ipv6"));
+        let ipv4 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv4OnlyAllowed\n";
+        assert_eq!(required_ip_type_after_failure(ipv4), Some("ipv4"));
+        let generic = "bearer.status.connection-error.name : org.example.Failed\n";
+        assert_eq!(required_ip_type_after_failure(generic), None);
+        assert_eq!(fallback_ip_types(ipv6), vec!["ipv6"]);
+        assert_eq!(fallback_ip_types(ipv4), vec!["ipv4"]);
+        assert_eq!(fallback_ip_types(generic), vec!["ipv4", "ipv6"]);
+        assert_eq!(fallback_ip_types(""), vec!["ipv4", "ipv6"]);
+    }
+
+    #[test]
+    fn only_explicit_dual_stack_bearers_are_reused() {
+        assert!(is_dual_stack_bearer("bearer.properties.ip-type: ipv4v6"));
+        assert!(is_dual_stack_bearer("bearer.properties.ip-type: IPV4V6"));
+        assert!(!is_dual_stack_bearer("bearer.properties.ip-type: ipv6"));
+        assert!(!is_dual_stack_bearer("bearer.status.connected: yes"));
+    }
+
+    #[test]
     fn parses_connected_ipv6_only_bearer_without_default_route_assumptions() {
         let output = r#"
 bearer.status.connected                  : yes
@@ -448,11 +566,8 @@ bearer.ipv6-config.dns.value[1]          : 2001:db8:53::1
 bearer.ipv6-config.dns.value[2]          : 2001:db8:53::2
 bearer.ipv6-config.mtu                   : 1500
 "#;
-        let bearer = parse_bearer_connection(
-            "/org/freedesktop/ModemManager1/Bearer/2",
-            output,
-        )
-        .unwrap();
+        let bearer =
+            parse_bearer_connection("/org/freedesktop/ModemManager1/Bearer/2", output).unwrap();
         assert_eq!(bearer.interface, "wwan0");
         assert!(bearer.local_addr().unwrap().is_ipv6());
         assert_eq!(bearer.settings.ipv6_dns.len(), 2);
@@ -476,11 +591,8 @@ bearer.ipv6-config.gateway               : 2001:db8:1::1
 bearer.ipv6-config.dns.value[1]          : 2001:db8:53::1
 bearer.ipv6-config.mtu                   : 1428
 "#;
-        let bearer = parse_bearer_connection(
-            "/org/freedesktop/ModemManager1/Bearer/9",
-            output,
-        )
-        .unwrap();
+        let bearer =
+            parse_bearer_connection("/org/freedesktop/ModemManager1/Bearer/9", output).unwrap();
 
         assert_eq!(
             bearer.settings.ipv4_address,

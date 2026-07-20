@@ -429,17 +429,244 @@ export interface SmsMessage {
   status: string
   pdu?: string
   transport?: string
+  line_id?: string
+}
+
+export interface ModemBinding {
+  line_id: string
+  display_order: number
+  slot_label: string
+  slot_source: string
+  slot_stable: boolean
+  slot_conflict: boolean
+  modem_id: string
+  modem_path: string
+  manufacturer: string
+  model: string
+  primary_port: string
+  qmi_device?: string | null
+  uim_slot: number
+  sim_path?: string | null
+  sim_iccid: string
+  operator_id: string
+  state: string
+  present: boolean
+}
+
+export interface VolteRuntimeStatus {
+  phase: string
+  stage: string
+  registration_mode: string
+  pcscf?: string
+  session_started_at?: string
+  registered_at?: string
+  last_rx_at?: string
+  last_tx_at?: string
+  last_error?: string
+  last_failure_at?: string
+  next_retry_at?: string
+  registered: boolean
+  sent_count: number
+  received_count: number
+  duplicate_count: number
+  reconnect_count: number
+  data_path_mode?: string
+  recovery_state: 'idle' | 'waiting_modem' | 'restarting_baseband' | 'connecting' | 'registered' | 'exhausted'
+  recovery_source?: string
+  retry_attempt: number
+  retry_max: number
+  modem_restart_attempt: number
+  modem_restart_max: number
+  manual_retry_available: boolean
+}
+
+export type TrunkRegistrationMode = 'static_peer' | 'outbound_register'
+export type TrunkIncomingMode = 'secondary_dial' | 'bound_pending' | 'bound_immediate'
+export type TrunkIpConnectMode = 'first_rtp' | 'gsm_answer'
+
+export interface TrunkProfileConfig {
+  enabled: boolean
+  registration_mode: TrunkRegistrationMode
+  asterisk_host: string
+  asterisk_port: number
+  local_port: number
+  username: string
+  secret: string
+  context: string
+  incoming_mode: TrunkIncomingMode
+  incoming_binding: string
+  outgoing_binding: string
+  ip_connect_mode: TrunkIpConnectMode
+  codec_allow: string[]
+  register_expiry_secs: number
+  match_host?: string | null
+}
+
+export interface TrunkRuntimeStatus {
+  phase: string
+  stage: string
+  enabled: boolean
+  registration_mode: TrunkRegistrationMode
+  peer?: string
+  local_endpoint?: string
+  registered: boolean
+  last_sip_status?: number
+  started_at?: string
+  registered_at?: string
+  expires_at?: string
+  next_retry_at?: string
+  last_error?: string
+  register_attempts: number
+  reconnect_count: number
+  active_dialogs: number
+  active_calls: number
+  sip_rx_frames: number
+  sip_rx_bytes: number
+  sip_tx_frames: number
+  sip_tx_bytes: number
+  invite_count: number
+  reinvite_count: number
+  media_negotiations: number
+  video_negotiations: number
+  operator_commands: number
+  operator_events: number
+  dtmf_events: number
+  active_media_relays: number
+  rtp_from_asterisk_packets: number
+  rtp_from_asterisk_bytes: number
+  rtp_to_asterisk_packets: number
+  rtp_to_asterisk_bytes: number
+  last_activity_at?: string
+}
+
+export interface TrunkProfileResponse {
+  line_id: string
+  modem: ModemBinding
+  trunk: TrunkProfileConfig
+  secret_set: boolean
+  runtime: TrunkRuntimeStatus
+}
+
+export interface LineProfileConfig {
+  line_id: string
+  enabled: boolean
+  volte_connection_enabled: boolean
+  vowifi: LineVowifiConfig
+  trunk: TrunkProfileConfig
+  data_connection_enabled: boolean
+  data_proxy: LineDataProxyConfig
+  roaming_allowed: boolean
+  airplane_mode_enabled: boolean
+}
+
+export interface LineDataProxyConfig {
+  listen_ip: string
+  listen_port: number
+}
+
+export interface DataProxyStatus {
+  running: boolean
+  phase: string
+  stage: string
+  listen_ip?: string | null
+  port?: number | null
+  interface_name?: string | null
+  protocols: string[]
+  last_error?: string | null
+}
+
+export interface LineNetworkControlsResponse {
+  line_id: string
+  modem_path: string
+  present: boolean
+  data: {
+    enabled: boolean
+    connected: boolean
+    config: LineDataProxyConfig
+    proxy: DataProxyStatus
+  }
+  roaming: RoamingResponse
+  airplane_mode: AirplaneModeResponse
+  airplane_mode_requested: boolean
+  airplane_phase: string
+  airplane_stage: string
+}
+
+export type VowifiProxyMode = 'direct' | 'socks5_udp_associate' | 'connect_udp_masque' | 'udp_relay'
+
+export interface LineVowifiConfig {
+  enabled: boolean
+  proxy_mode: VowifiProxyMode
+  proxy_endpoint: string
+  dns_server: string
+  epdg_host: string
+  epdg_port: number
+}
+
+export interface VowifiLineConfigResponse {
+  line_id: string
+  modem: ModemBinding
+  config: LineVowifiConfig
+  is_primary: boolean
+  runtime_scope: string
+  runtime_phase: string
+  runtime_stage: string
+  runtime_registered: boolean
+  runtime_error?: string | null
+  matched_profile_id?: string | null
+}
+
+export interface StandaloneSimSlotConfig {
+  id: string
+  label: string
+  reader_path: string
+  uim_slot: number
+  enabled: boolean
+}
+
+export interface LineRuntimeStatus {
+  modem: ModemBinding
+  volte: VolteRuntimeStatus
+  trunk: TrunkRuntimeStatus
+}
+
+export interface VolteLineControlResponse {
+  modem: ModemBinding
+  profile: LineProfileConfig
+  runtime: VolteRuntimeStatus
+}
+
+export interface VolteControlResponse {
+  enabled: boolean
+  feature_enabled: boolean
+  sms_enabled: boolean
+  connection_enabled: boolean
+  runtime: VolteRuntimeStatus
 }
 
 export interface SmsListRequest {
   limit?: number
   offset?: number
   direction?: 'incoming' | 'outgoing'
+  channel_id?: string
 }
 
 export interface SmsConversationRequest {
   phone_number: string
   limit?: number
+  channel_id?: string
+}
+
+export interface SmsChannelResponse {
+  id: string
+  kind: 'modem_line' | 'standalone_sim_slot' | 'unassigned'
+  label: string
+  available: boolean
+  uim_slot: number
+  line_id?: string | null
+  slot_id?: string | null
+  iccid?: string | null
+  operator_id?: string | null
 }
 
 export interface SmsStats {
@@ -509,52 +736,12 @@ export interface SmsPathPolicy {
   cs_fallback_receiver: boolean
   mid_flight_disable: 'auto_switch' | 'fail'
   dedup_retention_days: number
+  message_retention_limit: number
 }
 
 export interface VoicePathPolicy {
   priority: PathLayerConfig[]
   gateway_mode: boolean
-}
-
-export type CallHandlingAction = 'forward' | 'screen' | 'voicemail' | 'reject'
-export type NumberListKind = 'whitelist' | 'blacklist'
-export type NumberMatchKind = 'exact' | 'prefix' | 'suffix' | 'contains'
-
-export interface IncomingNumberRule {
-  id: string
-  name: string
-  enabled: boolean
-  list: NumberListKind
-  matcher: NumberMatchKind
-  pattern: string
-  action: CallHandlingAction
-}
-
-export interface VoiceServicesConfig {
-  feature_enabled: boolean
-  number_rules: IncomingNumberRule[]
-  unknown_number_action: CallHandlingAction
-  verification_keywords: string[]
-  marketing_keywords: string[]
-  verification_action: CallHandlingAction
-  marketing_action: CallHandlingAction
-  ordinary_action: CallHandlingAction
-  uncertain_action: CallHandlingAction
-  screening_max_seconds: number
-  inbox_retention_days: number
-  inbox_max_entries: number
-}
-
-export type CallCategory = 'whitelisted' | 'blacklisted' | 'verification' | 'marketing' | 'ordinary' | 'unknown'
-
-export interface CallScreeningDecision {
-  phase: string
-  category: CallCategory
-  action: CallHandlingAction
-  normalized_number: string
-  matched_rule_id?: string
-  verification_code?: string
-  reason: string
 }
 
 export interface MediaIngressCapabilities {
@@ -563,40 +750,6 @@ export interface MediaIngressCapabilities {
   audio_capture_ready: boolean
   browser_webrtc_ready: boolean
   reason: string
-}
-
-export interface VoiceServicesStatusResponse {
-  config: VoiceServicesConfig
-  voice_path: VoicePathPolicy
-  media_ingress: MediaIngressCapabilities
-}
-
-export interface VoiceInboxEntry {
-  id: number
-  session_id: string
-  phone_number: string
-  category: CallCategory
-  action: CallHandlingAction
-  transcript: string
-  verification_code?: string
-  recording_ref?: string
-  duration_seconds: number
-  confidence?: number
-  status: 'new' | 'read'
-  created_at: string
-  updated_at: string
-}
-
-export interface VoiceInboxStats {
-  total: number
-  waiting: number
-  verification: number
-  marketing: number
-}
-
-export interface VoiceInboxListResponse {
-  messages: VoiceInboxEntry[]
-  stats: VoiceInboxStats
 }
 
 export interface WebCallCapabilitiesResponse {
@@ -875,6 +1028,7 @@ export interface NotificationRule {
   enabled: boolean
   matcher: RuleMatcher
   channel_ids: string[]
+  sim_channel_ids: string[]
   event_codes: string[]
   template: string
   quiet_hours: QuietHoursSchedule[]
@@ -933,7 +1087,7 @@ export interface NotificationQueueResponse {
 export const DEFAULT_SMS_TEMPLATE = `{
   "msg_type": "text",
   "content": {
-    "text": "📱 短信通知\\n号码: {{phone_number}}\\n内容: {{content}}\\n时间: {{timestamp}}\\n来源: {{own_number}}"
+    "text": "📱 短信通知\\n号码: {{phone_number}}\\n内容: {{content}}\\n时间: {{timestamp}}\\n路径: {{transport}}\\n来源: {{own_number}}"
   }
 }`
 
@@ -962,6 +1116,7 @@ export const DEFAULT_PLAIN_SMS_TEMPLATE = `📱 短信通知
 号码: {{phone_number}}
 内容: {{content}}
 时间: {{timestamp}}
+路径: {{transport}}
 来源: {{own_number}}`
 
 export const DEFAULT_PLAIN_CALL_TEMPLATE = `📞 来电通知
@@ -1076,6 +1231,17 @@ export interface VowifiProfilesResponse {
   count: number
 }
 
+export interface ExternalVowifiProfile {
+  profile_id: string
+  mcc: string
+  mnc: string
+  epdg_host: string
+  epdg_port: number
+  ip_stack: string
+  apn?: string | null
+  dns_server?: string | null
+}
+
 export interface VowifiMaskedSimIdentity {
   present: boolean
   iccid: string
@@ -1104,6 +1270,8 @@ export interface VowifiEpdgPlan {
   route_kind: string
   route_policy_id: string
   route_note: string
+  source?: string
+  proxy_endpoint_configured?: boolean
 }
 
 export interface VowifiIkeProposalPlan {
@@ -2099,6 +2267,11 @@ export interface AutomationConfig {
 export type AutomationTrigger =
   | { type: 'fixed'; config: { weekdays: number[]; times: string[] } }
   | { type: 'interval'; config: { interval_value: number; interval_unit: string } }
+  | { type: 'cron'; config: { expression: string } }
+
+export type AutomationTarget =
+  | { kind: 'modem_line'; line_id: string }
+  | { kind: 'standalone_sim_slot'; slot_id: string }
 
 export type AutomationAction =
   | { type: 'restart_baseband'; config: null | Record<string, never> }
@@ -2112,12 +2285,15 @@ export type AutomationAction =
         retry_limit?: number
       }
     }
+  | { type: 'consume_data'; config: { bytes: number; unit: 'auto' | 'bytes' | 'kb' | 'mb' } }
+  | { type: 'dial_call'; config: { country_code: string; phone_number: string; duration_seconds: number } }
 
 export interface AutomationTask {
   id: string
   name: string
   enabled: boolean
   trigger: AutomationTrigger
+  target?: AutomationTarget | null
   action: AutomationAction
 }
 

@@ -2,6 +2,10 @@
 //!
 //! 使用 SQLite 存储短信历史记录和通话记录
 
+// The legacy unit-test module predates later database domains. Moving the large
+// block creates a high-conflict diff without changing runtime organization.
+#![allow(clippy::items_after_test_module)]
+
 use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use serde::{Deserialize, Serialize};
@@ -23,6 +27,8 @@ pub struct SmsMessage {
     pub pdu: Option<String>,  // 原始 PDU（如果有）
     #[serde(default = "default_sms_transport")]
     pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
 }
 
 fn default_sms_transport() -> String {
@@ -39,45 +45,6 @@ pub struct CallRecord {
     pub start_time: String,       // 开始时间 ISO 8601
     pub end_time: Option<String>, // 结束时间 ISO 8601
     pub answered: bool,           // 是否接通
-}
-
-/// A call-screening/voicemail result. `recording_ref` is an opaque adapter
-/// token, never a host filesystem path exposed to the browser.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VoiceInboxEntry {
-    pub id: i64,
-    pub session_id: String,
-    pub phone_number: String,
-    pub category: String,
-    pub action: String,
-    pub transcript: String,
-    pub verification_code: Option<String>,
-    pub recording_ref: Option<String>,
-    pub duration_seconds: u32,
-    pub confidence: Option<f32>,
-    pub status: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-pub struct NewVoiceInboxEntry<'a> {
-    pub session_id: &'a str,
-    pub phone_number: &'a str,
-    pub category: &'a str,
-    pub action: &'a str,
-    pub transcript: &'a str,
-    pub verification_code: Option<&'a str>,
-    pub recording_ref: Option<&'a str>,
-    pub duration_seconds: u32,
-    pub confidence: Option<f32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct VoiceInboxStats {
-    pub total: i64,
-    pub waiting: i64,
-    pub verification: i64,
-    pub marketing: i64,
 }
 
 /// 短信统计
@@ -584,70 +551,6 @@ mod tests {
     }
 
     #[test]
-    fn voice_inbox_upsert_is_idempotent_and_tracks_waiting() {
-        let db = test_database();
-        let id = db
-            .upsert_voice_inbox(NewVoiceInboxEntry {
-                session_id: "call-1",
-                phone_number: "+8613800138000",
-                category: "verification",
-                action: "voicemail",
-                transcript: "您的验证码是 123456",
-                verification_code: Some("123456"),
-                recording_ref: Some("recording-token-1"),
-                duration_seconds: 8,
-                confidence: Some(0.97),
-            })
-            .expect("insert voice inbox");
-        let updated_id = db
-            .upsert_voice_inbox(NewVoiceInboxEntry {
-                session_id: "call-1",
-                phone_number: "+8613800138000",
-                category: "verification",
-                action: "voicemail",
-                transcript: "您的登录验证码是 654321",
-                verification_code: Some("654321"),
-                recording_ref: None,
-                duration_seconds: 9,
-                confidence: Some(0.98),
-            })
-            .expect("update voice inbox");
-        assert_eq!(updated_id, id);
-
-        let entries = db.get_voice_inbox(20, 0).expect("list voice inbox");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].verification_code.as_deref(), Some("654321"));
-        assert_eq!(
-            entries[0].recording_ref.as_deref(),
-            Some("recording-token-1")
-        );
-        assert_eq!(db.get_voice_inbox_stats().unwrap().waiting, 1);
-        assert!(db.mark_voice_inbox_read(id, true).unwrap());
-        assert_eq!(db.get_voice_inbox_stats().unwrap().waiting, 0);
-    }
-
-    #[test]
-    fn voice_inbox_cleanup_enforces_max_entries() {
-        let db = test_database();
-        for index in 0..4 {
-            db.upsert_voice_inbox(NewVoiceInboxEntry {
-                session_id: &format!("cleanup-{index}"),
-                phone_number: "10086",
-                category: "ordinary",
-                action: "voicemail",
-                transcript: "test",
-                verification_code: None,
-                recording_ref: None,
-                duration_seconds: 1,
-                confidence: None,
-            })
-            .unwrap();
-        }
-        assert_eq!(db.cleanup_voice_inbox(30, 2).unwrap(), 2);
-        assert_eq!(db.get_voice_inbox_stats().unwrap().total, 2);
-    }
-
-    #[test]
     fn sms_dedup_cleanup_prunes_expired_rows() {
         let db = test_database();
         db.claim_sms_dedup("fresh", "modem").expect("claim fresh");
@@ -755,6 +658,54 @@ mod tests {
     }
 
     #[test]
+    fn sms_retention_keeps_newest_rows_and_unlinks_delivery_diagnostics() {
+        let db = test_database();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            ids.push(
+                db.insert_sms(
+                    "incoming",
+                    "10086",
+                    &format!("message-{index}"),
+                    "received",
+                    Some(&format!("marker-{index}")),
+                )
+                .unwrap(),
+            );
+        }
+        db.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
+            message_id: "msg-pruned",
+            trace_id: "trace-pruned",
+            direction: "mobile_terminated",
+            state: "received",
+            sip_state: "accepted",
+            rpdu_ack: "acked",
+            delivery_reported: true,
+            failure_cause: None,
+            retry_count: 0,
+            api_sms_id: Some(ids[0]),
+        })
+        .unwrap();
+
+        assert_eq!(db.prune_sms_messages(3).unwrap(), 2);
+        let messages = db.get_sms_messages(10, 0, None).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![ids[4], ids[3], ids[2]]
+        );
+        assert_eq!(
+            db.get_vowifi_sms_delivery("msg-pruned")
+                .unwrap()
+                .unwrap()
+                .api_sms_id,
+            None
+        );
+    }
+
+    #[test]
     fn sms_lists_use_id_as_timestamp_tiebreaker() {
         let db = test_database();
 
@@ -823,6 +774,63 @@ mod tests {
         assert!(messages
             .iter()
             .any(|message| message.content == "reply" && message.transport == "vowifi_ims"));
+    }
+
+    #[test]
+    fn sms_line_identity_round_trips_without_changing_transport_label() {
+        let db = test_database();
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        db.insert_sms_with_transport_for_line(
+            "outgoing",
+            "10086",
+            "line-test",
+            "sent",
+            None,
+            "volte_ims",
+            Some(line_id),
+        )
+        .expect("insert line sms");
+
+        let message = db.get_sms_messages(1, 0, None).expect("list sms").remove(0);
+        assert_eq!(message.transport, "volte_ims");
+        assert_eq!(message.line_id.as_deref(), Some(line_id));
+    }
+
+    #[test]
+    fn sms_channel_filters_list_conversation_stats_and_delete() {
+        let db = test_database();
+        let line_a = "line-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let line_b = "line-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        for (content, line_id) in [
+            ("from-a", Some(line_a)),
+            ("from-b", Some(line_b)),
+            ("legacy", None),
+        ] {
+            db.insert_sms_with_transport_for_line(
+                "incoming", "10086", content, "received", None, "modem", line_id,
+            )
+            .expect("insert channel sms");
+        }
+
+        let line_messages = db
+            .get_sms_messages_for_channel(10, 0, None, Some(line_a))
+            .expect("list line channel");
+        assert_eq!(line_messages.len(), 1);
+        assert_eq!(line_messages[0].content, "from-a");
+        assert_eq!(db.get_sms_stats_for_channel(Some(line_b)).unwrap().total, 1);
+        assert_eq!(
+            db.get_sms_conversation_for_channel("10086", 10, Some("unassigned"))
+                .unwrap()[0]
+                .content,
+            "legacy"
+        );
+
+        assert_eq!(
+            db.delete_sms_conversation_for_channel("10086", Some(line_a))
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.get_sms_stats().unwrap().total, 2);
     }
 
     #[test]
@@ -1060,6 +1068,7 @@ fn sms_message_from_row(row: &Row<'_>) -> Result<SmsMessage> {
         status: row.get(5)?,
         pdu: row.get(6)?,
         transport: row.get(7)?,
+        line_id: row.get(8)?,
     })
 }
 
@@ -1135,6 +1144,7 @@ impl Database {
                 notification_status TEXT NOT NULL DEFAULT 'pending',
                 pdu TEXT,
                 transport TEXT NOT NULL DEFAULT 'modem',
+                line_id TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],
@@ -1154,6 +1164,9 @@ impl Database {
                 [],
             )?;
         }
+        if !table_has_column(&conn, "sms_messages", "line_id")? {
+            conn.execute("ALTER TABLE sms_messages ADD COLUMN line_id TEXT", [])?;
+        }
 
         // 创建短信索引
         conn.execute(
@@ -1172,6 +1185,10 @@ impl Database {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sms_transport ON sms_messages(transport)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_line_id ON sms_messages(line_id)",
             [],
         )?;
         normalize_existing_sms_timestamps(&conn)?;
@@ -1280,42 +1297,6 @@ impl Database {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_call_phone ON call_history(phone_number)",
-            [],
-        )?;
-
-        // Voice services: metadata/transcripts only. Audio storage is owned by
-        // a future media adapter and referenced by an opaque recording token.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS voice_inbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL UNIQUE,
-                phone_number TEXT NOT NULL,
-                category TEXT NOT NULL,
-                action TEXT NOT NULL,
-                transcript TEXT NOT NULL DEFAULT '',
-                verification_code TEXT,
-                recording_ref TEXT,
-                duration_seconds INTEGER NOT NULL DEFAULT 0,
-                confidence REAL,
-                status TEXT NOT NULL DEFAULT 'new',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_voice_inbox_created_at
-             ON voice_inbox(created_at DESC, id DESC)",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_voice_inbox_status
-             ON voice_inbox(status, created_at DESC)",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_voice_inbox_category
-             ON voice_inbox(category, created_at DESC)",
             [],
         )?;
 
@@ -2212,7 +2193,7 @@ impl Database {
         transport: &str,
     ) -> Result<i64> {
         let timestamp = beijing_sms_now_string();
-        self.insert_sms_at_with_transport(
+        self.insert_sms_at_with_transport_for_line(
             direction,
             phone_number,
             content,
@@ -2220,6 +2201,31 @@ impl Database {
             status,
             pdu,
             transport,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_sms_with_transport_for_line(
+        &self,
+        direction: &str,
+        phone_number: &str,
+        content: &str,
+        status: &str,
+        pdu: Option<&str>,
+        transport: &str,
+        line_id: Option<&str>,
+    ) -> Result<i64> {
+        let timestamp = beijing_sms_now_string();
+        self.insert_sms_at_with_transport_for_line(
+            direction,
+            phone_number,
+            content,
+            &timestamp,
+            status,
+            pdu,
+            transport,
+            line_id,
         )
     }
 
@@ -2232,7 +2238,7 @@ impl Database {
         status: &str,
         pdu: Option<&str>,
     ) -> Result<i64> {
-        self.insert_sms_at_with_transport(
+        self.insert_sms_at_with_transport_for_line(
             direction,
             phone_number,
             content,
@@ -2240,9 +2246,12 @@ impl Database {
             status,
             pdu,
             "modem",
+            None,
         )
     }
 
+    // SQL boundary: parameters deliberately mirror the persisted SMS columns.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_sms_at_with_transport(
         &self,
         direction: &str,
@@ -2253,12 +2262,37 @@ impl Database {
         pdu: Option<&str>,
         transport: &str,
     ) -> Result<i64> {
+        self.insert_sms_at_with_transport_for_line(
+            direction,
+            phone_number,
+            content,
+            timestamp,
+            status,
+            pdu,
+            transport,
+            None,
+        )
+    }
+
+    // SQL boundary: parameters deliberately mirror the persisted SMS columns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_sms_at_with_transport_for_line(
+        &self,
+        direction: &str,
+        phone_number: &str,
+        content: &str,
+        timestamp: &str,
+        status: &str,
+        pdu: Option<&str>,
+        transport: &str,
+        line_id: Option<&str>,
+    ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let timestamp = sms_timestamp_for_storage(timestamp);
         let transport = normalized_sms_transport(transport);
         conn.execute(
-            "INSERT INTO sms_messages (direction, phone_number, content, timestamp, status, pdu, transport)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sms_messages (direction, phone_number, content, timestamp, status, pdu, transport, line_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 direction,
                 phone_number,
@@ -2266,7 +2300,8 @@ impl Database {
                 timestamp,
                 status,
                 pdu,
-                transport
+                transport,
+                line_id.filter(|value| !value.trim().is_empty())
             ],
         )?;
 
@@ -2351,6 +2386,32 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Keep only the newest `max_messages` user-visible SMS rows. Diagnostic
+    /// delivery rows are retained, but their API foreign-key-like reference is
+    /// cleared before the corresponding SMS row is removed.
+    pub fn prune_sms_messages(&self, max_messages: u32) -> Result<usize> {
+        let max_messages = i64::from(max_messages.max(1));
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE vowifi_sms_delivery
+             SET api_sms_id = NULL
+             WHERE api_sms_id IN (
+                 SELECT id FROM sms_messages ORDER BY id DESC LIMIT -1 OFFSET ?1
+             )",
+            params![max_messages],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM sms_messages
+             WHERE id IN (
+                 SELECT id FROM sms_messages ORDER BY id DESC LIMIT -1 OFFSET ?1
+             )",
+            params![max_messages],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Number of live dedup fingerprints (for status/metrics).
     pub fn sms_dedup_count(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
@@ -2403,59 +2464,61 @@ impl Database {
         offset: i64,
         direction: Option<&str>,
     ) -> Result<Vec<SmsMessage>> {
+        self.get_sms_messages_for_channel(limit, offset, direction, None)
+    }
+
+    pub fn get_sms_messages_for_channel(
+        &self,
+        limit: i64,
+        offset: i64,
+        direction: Option<&str>,
+        channel_id: Option<&str>,
+    ) -> Result<Vec<SmsMessage>> {
         let conn = self.conn.lock().unwrap();
-        match direction {
-            Some(direction) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport
-                     FROM sms_messages
-                     WHERE direction = ?1
-                     ORDER BY timestamp DESC, id DESC
-                     LIMIT ?2 OFFSET ?3",
-                )?;
-
-                let messages =
-                    stmt.query_map(params![direction, limit, offset], sms_message_from_row)?;
-
-                let mut result = Vec::new();
-                for message in messages {
-                    result.push(message?);
-                }
-
-                Ok(result)
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport
-                     FROM sms_messages
-                     ORDER BY timestamp DESC, id DESC
-                     LIMIT ?1 OFFSET ?2",
-                )?;
-
-                let messages = stmt.query_map(params![limit, offset], sms_message_from_row)?;
-
-                let mut result = Vec::new();
-                for message in messages {
-                    result.push(message?);
-                }
-
-                Ok(result)
-            }
+        let mut stmt = conn.prepare(
+            "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
+             FROM sms_messages
+             WHERE (?1 IS NULL OR direction = ?1)
+               AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let messages = stmt.query_map(
+            params![direction, channel_id, limit, offset],
+            sms_message_from_row,
+        )?;
+        let mut result = Vec::new();
+        for message in messages {
+            result.push(message?);
         }
+        Ok(result)
     }
 
     /// 获取与特定号码的对话历史
     pub fn get_sms_conversation(&self, phone_number: &str, limit: i64) -> Result<Vec<SmsMessage>> {
+        self.get_sms_conversation_for_channel(phone_number, limit, None)
+    }
+
+    pub fn get_sms_conversation_for_channel(
+        &self,
+        phone_number: &str,
+        limit: i64,
+        channel_id: Option<&str>,
+    ) -> Result<Vec<SmsMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport
+            "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
              FROM sms_messages
              WHERE phone_number = ?1
+               AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
              ORDER BY timestamp DESC, id DESC
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
 
-        let messages = stmt.query_map(params![phone_number, limit], sms_message_from_row)?;
+        let messages = stmt.query_map(
+            params![phone_number, channel_id, limit],
+            sms_message_from_row,
+        )?;
 
         let mut result = Vec::new();
         for message in messages {
@@ -2545,6 +2608,8 @@ impl Database {
         )
     }
 
+    // Query boundary: explicit filters keep optional/empty-string SQL semantics visible.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_notification_logs(
         &self,
         event_type: &str,
@@ -2968,39 +3033,54 @@ impl Database {
     }
 
     pub fn get_sms_stats(&self) -> Result<SmsStats> {
+        self.get_sms_stats_for_channel(None)
+    }
+
+    pub fn get_sms_stats_for_channel(&self, channel_id: Option<&str>) -> Result<SmsStats> {
         let conn = self.conn.lock().unwrap();
 
-        let total: i64 =
-            conn.query_row("SELECT COUNT(*) FROM sms_messages", [], |row| row.get(0))?;
+        let channel_filter =
+            "(?1 IS NULL OR (?1 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?1)";
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM sms_messages WHERE {channel_filter}"),
+            params![channel_id],
+            |row| row.get(0),
+        )?;
 
         let incoming: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages
-             WHERE direction = 'incoming' AND status = 'received'",
-            [],
+            &format!(
+                "SELECT COUNT(*) FROM sms_messages
+             WHERE direction = 'incoming' AND status = 'received' AND {channel_filter}"
+            ),
+            params![channel_id],
             |row| row.get(0),
         )?;
 
         let outgoing: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages WHERE direction = 'outgoing'",
-            [],
+            &format!("SELECT COUNT(*) FROM sms_messages WHERE direction = 'outgoing' AND {channel_filter}"),
+            params![channel_id],
             |row| row.get(0),
         )?;
 
         let pushed: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages
+            &format!(
+                "SELECT COUNT(*) FROM sms_messages
              WHERE direction = 'incoming'
                AND status = 'received'
-               AND notification_status = 'success'",
-            [],
+               AND notification_status = 'success' AND {channel_filter}"
+            ),
+            params![channel_id],
             |row| row.get(0),
         )?;
 
         let push_attempted: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages
+            &format!(
+                "SELECT COUNT(*) FROM sms_messages
              WHERE direction = 'incoming'
                AND status = 'received'
-               AND notification_status IN ('success', 'failed')",
-            [],
+               AND notification_status IN ('success', 'failed') AND {channel_filter}"
+            ),
+            params![channel_id],
             |row| row.get(0),
         )?;
 
@@ -3011,6 +3091,16 @@ impl Database {
             pushed,
             push_attempted,
         })
+    }
+
+    pub fn has_unassigned_sms(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sms_messages WHERE line_id IS NULL OR TRIM(line_id) = ''",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// 删除所有短信
@@ -3033,23 +3123,42 @@ impl Database {
 
     /// 删除一个对话的所有短信
     pub fn delete_sms_conversation(&self, phone_number: &str) -> Result<usize> {
+        self.delete_sms_conversation_for_channel(phone_number, None)
+    }
+
+    pub fn delete_sms_conversation_for_channel(
+        &self,
+        phone_number: &str,
+        channel_id: Option<&str>,
+    ) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE vowifi_sms_delivery
              SET api_sms_id = NULL
              WHERE api_sms_id IN (
                  SELECT id FROM sms_messages WHERE phone_number = ?1
+                   AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
              )",
-            params![phone_number],
+            params![phone_number, channel_id],
         )?;
         conn.execute(
-            "DELETE FROM sms_messages WHERE phone_number = ?1",
-            params![phone_number],
+            "DELETE FROM sms_messages WHERE phone_number = ?1
+               AND (?2 IS NULL OR (?2 = 'unassigned' AND line_id IS NULL) OR line_id = ?2)",
+            params![phone_number, channel_id],
         )
     }
 
     /// 按短信 ID 和对话号码批量删除
     pub fn delete_sms_batch(&self, ids: &[i64], phone_numbers: &[String]) -> Result<usize> {
+        self.delete_sms_batch_for_channel(ids, phone_numbers, None)
+    }
+
+    pub fn delete_sms_batch_for_channel(
+        &self,
+        ids: &[i64],
+        phone_numbers: &[String],
+        channel_id: Option<&str>,
+    ) -> Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut deleted = 0usize;
@@ -3060,12 +3169,14 @@ impl Database {
                  SET api_sms_id = NULL
                  WHERE api_sms_id IN (
                      SELECT id FROM sms_messages WHERE phone_number = ?1
+                   AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
                  )",
-                params![phone_number],
+                params![phone_number, channel_id],
             )?;
             deleted += tx.execute(
-                "DELETE FROM sms_messages WHERE phone_number = ?1",
-                params![phone_number],
+                "DELETE FROM sms_messages WHERE phone_number = ?1
+                   AND (?2 IS NULL OR (?2 = 'unassigned' AND line_id IS NULL) OR line_id = ?2)",
+                params![phone_number, channel_id],
             )?;
         }
 
@@ -3493,136 +3604,6 @@ impl Database {
         Ok(())
     }
 
-    // ==================== 语音筛选 / 语音信箱 ====================
-
-    /// Idempotently store a transcript result. Media adapters may retry the
-    /// same callback, so `session_id` is unique and updates the existing row.
-    pub fn upsert_voice_inbox(&self, entry: NewVoiceInboxEntry<'_>) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO voice_inbox (
-                session_id, phone_number, category, action, transcript,
-                verification_code, recording_ref, duration_seconds, confidence,
-                status, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'new', ?10, ?10)
-             ON CONFLICT(session_id) DO UPDATE SET
-                phone_number = excluded.phone_number,
-                category = excluded.category,
-                action = excluded.action,
-                transcript = excluded.transcript,
-                verification_code = excluded.verification_code,
-                recording_ref = COALESCE(excluded.recording_ref, voice_inbox.recording_ref),
-                duration_seconds = excluded.duration_seconds,
-                confidence = excluded.confidence,
-                updated_at = excluded.updated_at",
-            params![
-                entry.session_id,
-                entry.phone_number,
-                entry.category,
-                entry.action,
-                entry.transcript,
-                entry.verification_code,
-                entry.recording_ref,
-                entry.duration_seconds,
-                entry.confidence,
-                now,
-            ],
-        )?;
-        conn.query_row(
-            "SELECT id FROM voice_inbox WHERE session_id = ?1",
-            params![entry.session_id],
-            |row| row.get(0),
-        )
-    }
-
-    pub fn get_voice_inbox(&self, limit: i64, offset: i64) -> Result<Vec<VoiceInboxEntry>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, phone_number, category, action, transcript,
-                    verification_code, recording_ref, duration_seconds, confidence,
-                    status, created_at, updated_at
-             FROM voice_inbox
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows = stmt.query_map(params![limit.clamp(1, 500), offset.max(0)], |row| {
-            Ok(VoiceInboxEntry {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                phone_number: row.get(2)?,
-                category: row.get(3)?,
-                action: row.get(4)?,
-                transcript: row.get(5)?,
-                verification_code: row.get(6)?,
-                recording_ref: row.get(7)?,
-                duration_seconds: row.get::<_, i64>(8)?.max(0) as u32,
-                confidence: row.get(9)?,
-                status: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-            })
-        })?;
-        rows.collect()
-    }
-
-    pub fn get_voice_inbox_stats(&self) -> Result<VoiceInboxStats> {
-        let conn = self.conn.lock().unwrap();
-        Ok(VoiceInboxStats {
-            total: conn.query_row("SELECT COUNT(*) FROM voice_inbox", [], |row| row.get(0))?,
-            waiting: conn.query_row(
-                "SELECT COUNT(*) FROM voice_inbox WHERE status = 'new'",
-                [],
-                |row| row.get(0),
-            )?,
-            verification: conn.query_row(
-                "SELECT COUNT(*) FROM voice_inbox WHERE category = 'verification'",
-                [],
-                |row| row.get(0),
-            )?,
-            marketing: conn.query_row(
-                "SELECT COUNT(*) FROM voice_inbox WHERE category = 'marketing'",
-                [],
-                |row| row.get(0),
-            )?,
-        })
-    }
-
-    pub fn mark_voice_inbox_read(&self, id: i64, read: bool) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-        let changed = conn.execute(
-            "UPDATE voice_inbox SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![if read { "read" } else { "new" }, now, id],
-        )?;
-        Ok(changed > 0)
-    }
-
-    pub fn delete_voice_inbox(&self, id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("DELETE FROM voice_inbox WHERE id = ?1", params![id])? > 0)
-    }
-
-    /// Bound long-running storage by age and row count. Returns deleted rows.
-    pub fn cleanup_voice_inbox(&self, retention_days: u32, max_entries: u32) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let cutoff = (Utc::now() - Duration::days(retention_days.max(1) as i64)).to_rfc3339();
-        let by_age = conn.execute(
-            "DELETE FROM voice_inbox WHERE created_at < ?1",
-            params![cutoff],
-        )?;
-        let by_count = conn.execute(
-            "DELETE FROM voice_inbox
-             WHERE id IN (
-                SELECT id FROM voice_inbox
-                ORDER BY created_at DESC, id DESC
-                LIMIT -1 OFFSET ?1
-             )",
-            params![max_entries.max(1)],
-        )?;
-        Ok(by_age + by_count)
-    }
-
     // ==================== 自动化运行日志相关方法 ====================
 
     /// 插入新自动化执行日志
@@ -3645,6 +3626,7 @@ impl Database {
     }
 
     /// 获取自动化执行日志（分页与过滤）
+    #[allow(clippy::too_many_arguments)]
     pub fn get_automation_logs(
         &self,
         task_type: &str,

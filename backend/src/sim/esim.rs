@@ -14,12 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::infra::config::ConfigManager;
 use crate::api::models::{
     EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest,
     EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode,
     WorkModeResponse,
 };
+use crate::infra::config::ConfigManager;
 
 const ESIM_SHORT_TIMEOUT_SECS: u64 = 20;
 const ESIM_LONG_TIMEOUT_SECS: u64 = 60;
@@ -352,7 +352,7 @@ fn normalize_lpac_arch(raw: &str) -> Option<&'static str> {
 }
 
 async fn detect_glibc_version() -> Result<String, String> {
-    if let Ok(output) = tokio::time::timeout(
+    if let Ok(Ok(output)) = tokio::time::timeout(
         Duration::from_secs(LPAC_PROBE_TIMEOUT_SECS),
         tokio::process::Command::new("getconf")
             .arg("GNU_LIBC_VERSION")
@@ -360,13 +360,11 @@ async fn detect_glibc_version() -> Result<String, String> {
     )
     .await
     {
-        if let Ok(output) = output {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(version) = stdout.split_whitespace().last() {
-                    if !version.trim().is_empty() {
-                        return Ok(version.trim().to_string());
-                    }
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(version) = stdout.split_whitespace().last() {
+                if !version.trim().is_empty() {
+                    return Ok(version.trim().to_string());
                 }
             }
         }

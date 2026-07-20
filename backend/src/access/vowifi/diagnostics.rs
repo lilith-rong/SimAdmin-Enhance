@@ -39,7 +39,7 @@ pub struct VowifiProfilesResponse {
     pub count: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct VowifiProfileMatchResponse {
     pub matched: bool,
     pub matched_prefix: Option<String>,
@@ -52,32 +52,18 @@ pub struct VowifiProfileMatchResponse {
     pub sim: MaskedSimIdentity,
 }
 
-impl Default for VowifiProfileMatchResponse {
-    fn default() -> Self {
-        Self {
-            matched: false,
-            matched_prefix: None,
-            profile: None,
-            sim_auth: None,
-            epdg: None,
-            ike: None,
-            dataplane: None,
-            ims: None,
-            sim: MaskedSimIdentity::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicEpdgPlan {
-    pub host: &'static str,
+    pub host: String,
     pub port: u16,
-    pub ip_stack: &'static str,
-    pub apn: Option<&'static str>,
-    pub dns_server: Option<&'static str>,
-    pub route_kind: &'static str,
-    pub route_policy_id: &'static str,
-    pub route_note: &'static str,
+    pub ip_stack: String,
+    pub apn: Option<String>,
+    pub dns_server: Option<String>,
+    pub route_kind: String,
+    pub route_policy_id: String,
+    pub route_note: String,
+    pub source: String,
+    pub proxy_endpoint_configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,7 +202,7 @@ pub struct PublicAkaAdapterPlan {
     pub timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct VowifiReadiness {
     pub identity_ready: bool,
     pub sim_auth_ready: bool,
@@ -228,23 +214,6 @@ pub struct VowifiReadiness {
     pub ims_registered: bool,
     pub sms_ready: bool,
     pub voice_ready: bool,
-}
-
-impl Default for VowifiReadiness {
-    fn default() -> Self {
-        Self {
-            identity_ready: false,
-            sim_auth_ready: false,
-            profile_matched: false,
-            epdg_ready: false,
-            ike_ready: false,
-            child_sa_ready: false,
-            esp_ready: false,
-            ims_registered: false,
-            sms_ready: false,
-            voice_ready: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -497,8 +466,12 @@ fn diagnostics_timeline(
 
     // ── Translated runtime events ──
     for event in &events.events {
-        let (kind, title, detail) =
-            translate_runtime_event(&event.event_type, &event.phase, event.profile_id.as_deref(), &event.detail_json);
+        let (kind, title, detail) = translate_runtime_event(
+            &event.event_type,
+            &event.phase,
+            event.profile_id.as_deref(),
+            &event.detail_json,
+        );
         timeline.push(VowifiDiagnosticsTimelineEntry {
             kind,
             timestamp: Some(event.created_at.clone()),
@@ -525,7 +498,11 @@ fn translate_runtime_event(
 ) -> (String, String, String) {
     let reason = serde_json::from_str::<serde_json::Value>(detail_json)
         .ok()
-        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(|s| s.to_string()));
+        .and_then(|v| {
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+        });
 
     match event_type {
         // ── SIM / Identity ──────────────────────────────────────
@@ -604,10 +581,7 @@ fn translate_runtime_event(
         // ── Profile Matching ────────────────────────────────────
         "profile_match" | "profile_matched" => (
             "PROFILE".into(),
-            format!(
-                "匹配配置模板: ID={}",
-                profile_id.unwrap_or("unknown")
-            ),
+            format!("匹配配置模板: ID={}", profile_id.unwrap_or("unknown")),
             "ePDG 安全接入网关与 IMS 域载入成功。".into(),
         ),
         "profile_search" | "profile_lookup" => (
@@ -906,7 +880,13 @@ fn classify_event_kind(event_type: &str, phase: &str) -> String {
     if lower.contains("dns") {
         return "DNS".into();
     }
-    if lower.contains("ike") || lower.contains("ipsec") || lower.contains("esp") || lower.contains("tunnel") || lower.contains("sa_") || lower.contains("child_sa") {
+    if lower.contains("ike")
+        || lower.contains("ipsec")
+        || lower.contains("esp")
+        || lower.contains("tunnel")
+        || lower.contains("sa_")
+        || lower.contains("child_sa")
+    {
         return "IPSEC".into();
     }
     if lower.contains("ims") || lower.contains("sip") || lower.contains("register") {
@@ -963,14 +943,16 @@ impl PublicEpdgPlan {
     pub fn from_profile(profile: &'static CarrierProfile) -> Self {
         let plan = epdg::build_connection_plan(profile, None);
         Self {
-            host: plan.host,
+            host: plan.host.to_string(),
             port: plan.port,
-            ip_stack: plan.ip_stack,
-            apn: plan.apn,
-            dns_server: plan.dns_server,
-            route_kind: plan.route_policy.kind.as_str(),
-            route_policy_id: plan.route_policy.policy_id,
-            route_note: plan.route_policy.note,
+            ip_stack: plan.ip_stack.to_string(),
+            apn: plan.apn.map(str::to_string),
+            dns_server: plan.dns_server.map(str::to_string),
+            route_kind: plan.route_policy.kind.as_str().to_string(),
+            route_policy_id: plan.route_policy.policy_id.to_string(),
+            route_note: plan.route_policy.note.to_string(),
+            source: "carrier_profile".to_string(),
+            proxy_endpoint_configured: false,
         }
     }
 }
@@ -1203,7 +1185,7 @@ mod tests {
             Some("04")
         );
         assert_eq!(
-            matched.epdg.as_ref().map(|epdg| epdg.host),
+            matched.epdg.as_ref().map(|epdg| epdg.host.as_str()),
             Some("epdg.epc.mnc004.mcc204.pub.3gppnetwork.org")
         );
         assert_eq!(

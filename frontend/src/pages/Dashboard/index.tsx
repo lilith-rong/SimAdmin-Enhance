@@ -1,15 +1,7 @@
-import { Box, Chip, CircularProgress, Paper, Stack, Typography } from '@mui/material'
+import { Box, CircularProgress, Paper, Stack, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import {
-  CheckCircle,
-  FlightTakeoff,
-  SignalCellularAlt,
-  TimerOutlined,
-  WifiTethering,
-} from '@mui/icons-material'
 import { useRefreshInterval } from '@/contexts/RefreshContext'
 import ErrorSnackbar from '@/components/ErrorSnackbar'
-import { getCarrierLogo, formatCarrierName } from '@/utils/carriers'
 import {
   QuickControls,
   SystemResources,
@@ -19,91 +11,8 @@ import {
   DeviceInfoCard,
 } from './components'
 import { useDashboardData, type DashboardData } from './hooks/useDashboardData'
-import type { VowifiStatusResponse } from '@/api/types'
-
-function getNetworkTech(data: DashboardData) {
-  if (data.cellsInfo?.serving_cell?.tech) return data.cellsInfo.serving_cell.tech.toUpperCase()
-  const preference = data.networkInfo?.technology_preference?.toLowerCase()
-  if (preference?.includes('nr')) return '5G'
-  if (preference?.includes('lte')) return 'LTE'
-  return 'N/A'
-}
-
-function getRegistrationLabel(status?: string) {
-  if (status === 'registered') return '已注册'
-  if (status === 'roaming') return '漫游'
-  return status || '未知'
-}
-
-function latencyLabel(value?: number) {
-  return typeof value === 'number' ? `${value.toFixed(0)}ms` : '-'
-}
-
-function getReadyCount(status: VowifiStatusResponse) {
-  const readiness = status.readiness
-  const simPresent = status.profile.sim?.present
-
-  const step1 = readiness.identity_ready || simPresent
-  const step2 = step1 && (readiness.profile_matched || status.profile.matched)
-  const step3 = step2 && readiness.esp_ready
-  const step4 = step3 && readiness.ims_registered
-  const step5 = step4 && readiness.sms_ready
-
-  let count = 0
-  if (step1) count++
-  if (step2) count++
-  if (step3) count++
-  if (step4) count++
-  if (step5) count++
-  return count
-}
 
 function StatusBar({ data }: { data: DashboardData }) {
-  const signal = data.networkInfo?.signal_strength ?? 0
-  const networkTech = getNetworkTech(data)
-  const carrierLogo = getCarrierLogo(data.networkInfo?.mcc, data.networkInfo?.mnc)
-  const carrierName = formatCarrierName(data.networkInfo?.mcc, data.networkInfo?.mnc)
-  const isAirplaneMode = data.airplaneMode?.enabled ?? false
-  const ipValueSx = {
-    minWidth: 0,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    fontSize: '0.75rem',
-  } as const
-  const ipLabelSx = { ...ipValueSx, flexShrink: 0 } as const
-
-  const vowifiControl = data.vowifiControl
-  const vowifiStatus = data.vowifiStatus
-  const showVowifiChip = vowifiControl?.feature_enabled && vowifiControl?.connection_enabled && vowifiStatus
-
-  let vowifiChip = null
-  if (showVowifiChip) {
-    const phase = vowifiStatus.phase
-    const readyCount = getReadyCount(vowifiStatus)
-    let label = `WiFi Calling：正在连接 (${readyCount}/5)`
-    let bgColor = '#ed6c02'
-
-    if (phase === 'sms_ready') {
-      label = 'WiFi Calling：已就绪'
-      bgColor = '#2aae67'
-    } else if (phase === 'failed') {
-      label = 'WiFi Calling：连接失败'
-      bgColor = '#ef4444'
-    }
-
-    vowifiChip = (
-      <Chip
-        label={label}
-        size="small"
-        sx={{
-          bgcolor: bgColor,
-          color: '#ffffff',
-          fontWeight: 600,
-        }}
-      />
-    )
-  }
-
   return (
     <Paper
       elevation={0}
@@ -112,7 +21,7 @@ function StatusBar({ data }: { data: DashboardData }) {
         display: 'flex',
         flexWrap: 'wrap',
         alignItems: 'center',
-        justifyContent: 'space-between',
+        justifyContent: 'flex-start',
         gap: 2,
       }}
     >
@@ -148,65 +57,9 @@ function StatusBar({ data }: { data: DashboardData }) {
           </Typography>
         </Box>
 
-        {vowifiChip}
-
-        {!isAirplaneMode && (
-          <>
-            <Box display="flex" alignItems="center" gap={1}>
-              {carrierLogo ? (
-                <Box component="img" src={carrierLogo} alt={carrierName} sx={{ height: 24, maxWidth: 92, objectFit: 'contain' }} />
-              ) : (
-                <Chip label={carrierName} size="small" variant="outlined" />
-              )}
-              <Chip
-                icon={<SignalCellularAlt />}
-                label={`${signal}%`}
-                color={signal > 70 ? 'success' : signal > 35 ? 'primary' : 'warning'}
-                size="small"
-                variant="outlined"
-              />
-            </Box>
-            <Chip icon={<WifiTethering />} label={networkTech} color={networkTech === '5G' ? 'success' : 'primary'} size="small" />
-            <Chip
-              icon={<CheckCircle />}
-              label={getRegistrationLabel(data.networkInfo?.registration_status)}
-              color={data.networkInfo?.registration_status === 'registered' ? 'success' : 'default'}
-              size="small"
-              variant="outlined"
-            />
-          </>
-        )}
-        {isAirplaneMode && <Chip icon={<FlightTakeoff />} label="飞行模式" color="warning" size="small" />}
         <Typography variant="caption" color="text.disabled">
           | 运行 {data.systemStats?.uptime?.uptime_formatted || '-'}
         </Typography>
-      </Stack>
-
-      <Stack spacing={0.75} sx={{ minWidth: { xs: '100%', md: 360 }, ml: { md: 'auto' } }}>
-        <Box display="flex" alignItems="center" justifyContent="flex-end" gap={1}>
-          <Typography variant="body2" sx={ipLabelSx}>IPv4：</Typography>
-          <Typography variant="body2" sx={ipValueSx}>
-            {data.connectionAddresses.ipv4[0] || '-'}
-          </Typography>
-          <Box display="flex" alignItems="center" gap={0.35} color={data.connectivity?.ipv4?.success ? 'success.main' : 'text.disabled'}>
-            <TimerOutlined sx={{ fontSize: 14 }} />
-            <Typography variant="caption" fontFamily="monospace" fontWeight={700}>
-              {latencyLabel(data.connectivity?.ipv4?.latency_ms)}
-            </Typography>
-          </Box>
-        </Box>
-        <Box display="flex" alignItems="center" justifyContent="flex-end" gap={1}>
-          <Typography variant="body2" sx={ipLabelSx}>IPv6：</Typography>
-          <Typography variant="body2" sx={ipValueSx}>
-            {data.connectionAddresses.ipv6[0] || '-'}
-          </Typography>
-          <Box display="flex" alignItems="center" gap={0.35} color={data.connectivity?.ipv6?.success ? 'success.main' : 'text.disabled'}>
-            <TimerOutlined sx={{ fontSize: 14 }} />
-            <Typography variant="caption" fontFamily="monospace" fontWeight={700}>
-              {latencyLabel(data.connectivity?.ipv6?.latency_ms)}
-            </Typography>
-          </Box>
-        </Box>
       </Stack>
     </Paper>
   )
@@ -233,16 +86,7 @@ export default function DashboardPage() {
 
         <Grid container spacing={2}>
           <Grid size={{ xs: 12, md: 6, lg: 3 }}>
-            <QuickControls
-              dataStatus={data.dataStatus}
-              airplaneMode={data.airplaneMode}
-              roaming={data.roaming}
-              vowifiControl={data.vowifiControl}
-              onToggleData={() => void actions.toggleData()}
-              onToggleAirplaneMode={() => void actions.toggleAirplaneMode()}
-              onToggleRoaming={() => void actions.toggleRoaming()}
-              onToggleVowifiConnection={() => void actions.toggleVowifiConnection()}
-            />
+            <QuickControls />
           </Grid>
 
           <Grid size={{ xs: 12, md: 6, lg: 3 }}>
