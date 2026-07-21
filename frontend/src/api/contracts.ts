@@ -453,6 +453,16 @@ export interface ModemBinding {
   present: boolean
 }
 
+export interface VolteConnectionAttempt {
+  sequence: number
+  stage: string
+  ip_family?: string
+  outcome: 'started' | 'succeeded' | 'failed' | string
+  error_code?: string
+  detail?: string
+  at: string
+}
+
 export interface VolteRuntimeStatus {
   phase: string
   stage: string
@@ -460,6 +470,7 @@ export interface VolteRuntimeStatus {
   pcscf?: string
   session_started_at?: string
   registered_at?: string
+  last_register_refresh_at?: string
   last_rx_at?: string
   last_tx_at?: string
   last_error?: string
@@ -470,7 +481,16 @@ export interface VolteRuntimeStatus {
   received_count: number
   duplicate_count: number
   reconnect_count: number
+  register_refresh_count: number
   data_path_mode?: string
+  qmi_device?: string
+  bearer_interface?: string
+  bearer_ip_type?: string
+  current_ip_family?: string
+  identity_source?: string
+  usim_aid?: string
+  isim_aid?: string
+  connection_attempts: VolteConnectionAttempt[]
   recovery_state: 'idle' | 'waiting_modem' | 'restarting_baseband' | 'connecting' | 'registered' | 'exhausted'
   recovery_source?: string
   retry_attempt: number

@@ -27,9 +27,19 @@ pub enum VolteStage {
     Identity,
     IdentityAka,
     Radio,
+    ImsContext,
     Pcscf,
+    Ipv6Preflight,
     Modem,
     Bearer,
+    BearerDual,
+    BearerIpv4,
+    BearerIpv6,
+    IpConfig,
+    RegisterInitial,
+    Ipsec,
+    RegisterAuthenticated,
+    RegisterRefresh,
     RegisterIpsec,
     RegisterUdp,
     Registered,
@@ -44,15 +54,41 @@ impl VolteStage {
             VolteStage::Identity => "identity",
             VolteStage::IdentityAka => "identity_aka",
             VolteStage::Radio => "radio",
+            VolteStage::ImsContext => "ims_context",
             VolteStage::Pcscf => "pcscf",
+            VolteStage::Ipv6Preflight => "ipv6_preflight",
             VolteStage::Modem => "modem",
             VolteStage::Bearer => "bearer",
+            VolteStage::BearerDual => "bearer_dual",
+            VolteStage::BearerIpv4 => "bearer_ipv4",
+            VolteStage::BearerIpv6 => "bearer_ipv6",
+            VolteStage::IpConfig => "ip_config",
+            VolteStage::RegisterInitial => "register_initial",
+            VolteStage::Ipsec => "ipsec",
+            VolteStage::RegisterAuthenticated => "register_authenticated",
+            VolteStage::RegisterRefresh => "register_refresh",
             VolteStage::RegisterIpsec => "register_ipsec",
             VolteStage::RegisterUdp => "register_udp",
             VolteStage::Registered => "registered",
             VolteStage::Stopping => "stopping",
         }
     }
+}
+
+const MAX_CONNECTION_ATTEMPTS: usize = 32;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VolteConnectionAttempt {
+    pub sequence: u32,
+    pub stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_family: Option<String>,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub at: String,
 }
 
 /// High-level phase. String values MUST match `volteStatus.js` `g()`.
@@ -131,6 +167,7 @@ pub struct VolteSnapshot {
     pub pcscf: Option<String>,
     pub session_started_at: Option<String>,
     pub registered_at: Option<String>,
+    pub last_register_refresh_at: Option<String>,
     pub last_rx_at: Option<String>,
     pub last_tx_at: Option<String>,
     pub last_error: Option<String>,
@@ -140,7 +177,16 @@ pub struct VolteSnapshot {
     pub received_count: u64,
     pub duplicate_count: u64,
     pub reconnect_count: u64,
+    pub register_refresh_count: u64,
     pub data_path_mode: Option<String>,
+    pub qmi_device: Option<String>,
+    pub bearer_interface: Option<String>,
+    pub bearer_ip_type: Option<String>,
+    pub current_ip_family: Option<String>,
+    pub identity_source: Option<String>,
+    pub usim_aid: Option<String>,
+    pub isim_aid: Option<String>,
+    pub connection_attempts: Vec<VolteConnectionAttempt>,
     pub recovery_state: VolteRecoveryState,
     pub recovery_source: Option<String>,
     pub retry_attempt: u32,
@@ -159,6 +205,7 @@ impl Default for VolteSnapshot {
             pcscf: None,
             session_started_at: None,
             registered_at: None,
+            last_register_refresh_at: None,
             last_rx_at: None,
             last_tx_at: None,
             last_error: None,
@@ -168,7 +215,16 @@ impl Default for VolteSnapshot {
             received_count: 0,
             duplicate_count: 0,
             reconnect_count: 0,
+            register_refresh_count: 0,
             data_path_mode: None,
+            qmi_device: None,
+            bearer_interface: None,
+            bearer_ip_type: None,
+            current_ip_family: None,
+            identity_source: None,
+            usim_aid: None,
+            isim_aid: None,
+            connection_attempts: Vec::new(),
             recovery_state: VolteRecoveryState::Idle,
             recovery_source: None,
             retry_attempt: 0,
@@ -201,6 +257,8 @@ pub struct VolteRuntimeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registered_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_register_refresh_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_rx_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tx_at: Option<String>,
@@ -215,8 +273,24 @@ pub struct VolteRuntimeStatus {
     pub received_count: u64,
     pub duplicate_count: u64,
     pub reconnect_count: u64,
+    pub register_refresh_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_path_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qmi_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_ip_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_ip_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usim_aid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isim_aid: Option<String>,
+    pub connection_attempts: Vec<VolteConnectionAttempt>,
     pub recovery_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_source: Option<String>,
@@ -236,6 +310,7 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             pcscf: s.pcscf.clone(),
             session_started_at: s.session_started_at.clone(),
             registered_at: s.registered_at.clone(),
+            last_register_refresh_at: s.last_register_refresh_at.clone(),
             last_rx_at: s.last_rx_at.clone(),
             last_tx_at: s.last_tx_at.clone(),
             last_error: s.last_error.clone(),
@@ -246,7 +321,16 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             received_count: s.received_count,
             duplicate_count: s.duplicate_count,
             reconnect_count: s.reconnect_count,
+            register_refresh_count: s.register_refresh_count,
             data_path_mode: s.data_path_mode.clone(),
+            qmi_device: s.qmi_device.clone(),
+            bearer_interface: s.bearer_interface.clone(),
+            bearer_ip_type: s.bearer_ip_type.clone(),
+            current_ip_family: s.current_ip_family.clone(),
+            identity_source: s.identity_source.clone(),
+            usim_aid: s.usim_aid.clone(),
+            isim_aid: s.isim_aid.clone(),
+            connection_attempts: s.connection_attempts.clone(),
             recovery_state: s.recovery_state.as_str().to_string(),
             recovery_source: s.recovery_source.clone(),
             retry_attempt: s.retry_attempt,
@@ -306,6 +390,37 @@ impl VolteRuntime {
         guard.clone()
     }
 
+    pub async fn record_attempt(
+        &self,
+        stage: VolteStage,
+        ip_family: Option<&str>,
+        outcome: &str,
+        error: Option<&crate::access::volte::errors::VolteError>,
+        detail: Option<String>,
+    ) {
+        self.update(|snapshot| {
+            let sequence = snapshot
+                .connection_attempts
+                .last()
+                .map_or(1, |attempt| attempt.sequence.saturating_add(1));
+            snapshot.connection_attempts.push(VolteConnectionAttempt {
+                sequence,
+                stage: stage.as_str().to_string(),
+                ip_family: ip_family.map(str::to_string),
+                outcome: outcome.to_string(),
+                error_code: error.map(|error| error.code().to_string()),
+                detail: detail
+                    .or_else(|| error.and_then(|error| error.detail().map(str::to_string))),
+                at: chrono::Utc::now().to_rfc3339(),
+            });
+            if snapshot.connection_attempts.len() > MAX_CONNECTION_ATTEMPTS {
+                let excess = snapshot.connection_attempts.len() - MAX_CONNECTION_ATTEMPTS;
+                snapshot.connection_attempts.drain(..excess);
+            }
+        })
+        .await;
+    }
+
     /// Acquire the advance serialization lock. Drivers hold this for the
     /// duration of a stage-progression pass so two passes don't interleave.
     pub async fn advance_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -319,10 +434,12 @@ impl VolteRuntime {
         let reason = reason.into();
         self.update(|s| {
             let prev_reconnect = s.reconnect_count;
+            let prev_refresh = s.register_refresh_count;
             *s = VolteSnapshot {
                 phase: VoltePhase::Disabled,
                 stage: VolteStage::Disabled,
                 reconnect_count: prev_reconnect,
+                register_refresh_count: prev_refresh,
                 last_error: if reason.is_empty() {
                     None
                 } else {

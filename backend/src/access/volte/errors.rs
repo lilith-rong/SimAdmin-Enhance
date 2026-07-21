@@ -62,6 +62,10 @@ pub mod code {
     pub const RUNTIME_MM_BEARER_PATH_MISSING: &str = "volte_runtime_mm_bearer_path_missing";
     pub const RUNTIME_MM_MODEM_WAIT_TIMEOUT: &str = "volte_runtime_mm_modem_wait_timeout";
     pub const RUNTIME_ALL_PCSCF_FAILED: &str = "volte_runtime_all_pcscf_failed";
+    /// A required IP family could not be brought up on the IMS bearer (e.g. the
+    /// network forced IPv6-only but no prefix was delivered, or per-family IP
+    /// configuration failed). Mirrors 1.7's `volte_runtime_ims_family_unsupported`.
+    pub const RUNTIME_IMS_FAMILY_UNSUPPORTED: &str = "volte_runtime_ims_family_unsupported";
     pub const IP_SETTINGS_MISSING: &str = "volte_ip_settings_missing";
     pub const IPV6_GATEWAY_MISSING: &str = "volte_ipv6_gateway_missing";
     pub const PCSCF_FAMILY_MISMATCH: &str = "volte_pcscf_family_mismatch";

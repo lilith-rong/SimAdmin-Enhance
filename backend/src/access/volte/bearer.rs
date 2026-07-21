@@ -12,7 +12,7 @@
 //! `recreating IMS bearer to match roaming policy`,
 //! `Deleted stale disconnected IMS bearer`.
 
-use std::{collections::VecDeque, net::IpAddr, process::Output};
+use std::{collections::VecDeque, future::Future, net::IpAddr, process::Output};
 
 use tokio::process::Command;
 
@@ -47,10 +47,19 @@ pub struct BearerRequest {
 pub struct BearerConnection {
     pub path: String,
     pub interface: String,
+    pub ip_type: String,
     pub settings: ImsIpSettings,
     pub ipv4_prefix: Option<u8>,
     pub ipv6_prefix: Option<u8>,
     pub mtu: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BearerAttempt {
+    pub ip_type: String,
+    pub source: String,
+    pub outcome: String,
+    pub error: Option<VolteError>,
 }
 
 impl BearerConnection {
@@ -120,8 +129,40 @@ pub async fn ensure_ims_bearer(
     modem: &str,
     request: &BearerRequest,
 ) -> Result<BearerConnection, VolteError> {
+    ensure_ims_bearer_observed(modem, request, |_| async {}).await
+}
+
+pub async fn ensure_ims_bearer_observed<F, Fut>(
+    modem: &str,
+    request: &BearerRequest,
+    mut observe: F,
+) -> Result<BearerConnection, VolteError>
+where
+    F: FnMut(BearerAttempt) -> Fut,
+    Fut: Future<Output = ()>,
+{
     if let Some(path) = bearer_path_override() {
-        return connect_and_read(&path).await;
+        observe(BearerAttempt {
+            ip_type: "override".to_string(),
+            source: "environment".to_string(),
+            outcome: "started".to_string(),
+            error: None,
+        })
+        .await;
+        let result = connect_and_read(&path).await;
+        observe(BearerAttempt {
+            ip_type: "override".to_string(),
+            source: "environment".to_string(),
+            outcome: if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            }
+            .to_string(),
+            error: result.as_ref().err().cloned(),
+        })
+        .await;
+        return result;
     }
 
     let modem_output = run_command("mmcli", &["-m", modem, "--output-keyvalue"]).await?;
@@ -132,15 +173,51 @@ pub async fn ensure_ims_bearer(
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
             if is_dual_stack_bearer(&details) {
                 if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
-                    return parse_bearer_connection(&path, &details);
+                    let result = parse_bearer_connection(&path, &details);
+                    observe(BearerAttempt {
+                        ip_type: "ipv4v6".to_string(),
+                        source: "reused".to_string(),
+                        outcome: if result.is_ok() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        }
+                        .to_string(),
+                        error: result.as_ref().err().cloned(),
+                    })
+                    .await;
+                    return result;
                 }
+                observe(BearerAttempt {
+                    ip_type: "ipv4v6".to_string(),
+                    source: "reconnected".to_string(),
+                    outcome: "started".to_string(),
+                    error: None,
+                })
+                .await;
                 match connect_and_read(&path).await {
-                    Ok(bearer) => return Ok(bearer),
+                    Ok(bearer) => {
+                        observe(BearerAttempt {
+                            ip_type: "ipv4v6".to_string(),
+                            source: "reconnected".to_string(),
+                            outcome: "succeeded".to_string(),
+                            error: None,
+                        })
+                        .await;
+                        return Ok(bearer);
+                    }
                     Err(error) => {
                         let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
                             .await
                             .unwrap_or_default();
                         required_fallback = required_ip_type_after_failure(&after);
+                        observe(BearerAttempt {
+                            ip_type: "ipv4v6".to_string(),
+                            source: "reconnected".to_string(),
+                            outcome: "failed".to_string(),
+                            error: Some(error.clone()),
+                        })
+                        .await;
                         last_error = Some(error);
                     }
                 }
@@ -161,9 +238,32 @@ pub async fn ensure_ims_bearer(
             continue;
         }
         attempted.push(ip_type);
+        observe(BearerAttempt {
+            ip_type: ip_type.to_string(),
+            source: "created".to_string(),
+            outcome: "started".to_string(),
+            error: None,
+        })
+        .await;
         match create_and_connect_attempt(modem, request, ip_type).await {
-            Ok(bearer) => return Ok(bearer),
+            Ok(bearer) => {
+                observe(BearerAttempt {
+                    ip_type: ip_type.to_string(),
+                    source: "created".to_string(),
+                    outcome: "succeeded".to_string(),
+                    error: None,
+                })
+                .await;
+                return Ok(bearer);
+            }
             Err(failure) => {
+                observe(BearerAttempt {
+                    ip_type: ip_type.to_string(),
+                    source: "created".to_string(),
+                    outcome: "failed".to_string(),
+                    error: Some(failure.error.clone()),
+                })
+                .await;
                 last_error = Some(failure.error);
                 if ip_type == "ipv4v6" {
                     pending.extend(fallback_ip_types(&failure.details));
@@ -231,10 +331,18 @@ async fn delete_bearer(modem: &str, path: &str) -> Result<(), VolteError> {
 }
 
 fn required_ip_type_after_failure(details: &str) -> Option<&'static str> {
-    let error = value(details, "bearer.status.connection-error.name")?;
-    if error.ends_with(".Ipv6OnlyAllowed") {
+    let error = value(details, "bearer.status.connection-error.name")
+        .unwrap_or_else(|| details.to_string())
+        .to_ascii_lowercase();
+    if error.contains("ipv6onlyallowed")
+        || error.contains("ipv6-only-allowed")
+        || error.contains("only ipv6 allowed")
+    {
         Some("ipv6")
-    } else if error.ends_with(".Ipv4OnlyAllowed") {
+    } else if error.contains("ipv4onlyallowed")
+        || error.contains("ipv4-only-allowed")
+        || error.contains("only ipv4 allowed")
+    {
         Some("ipv4")
     } else {
         None
@@ -309,6 +417,8 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
     Ok(BearerConnection {
         path: path.to_string(),
         interface,
+        ip_type: value(output, "bearer.properties.ip-type")
+            .unwrap_or_else(|| "unknown".to_string()),
         settings,
         ipv4_prefix,
         ipv6_prefix,
@@ -330,35 +440,74 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
         run_ip(&["link", "set", "dev", &bearer.interface, "mtu", &mtu]).await?;
     }
 
+    // Configure each available family independently. A per-family failure
+    // (e.g. the network handed out an IPv6 address but the prefix/DNS route
+    // cannot be installed) must not discard a working sibling family. Mirrors
+    // 1.7's "IPv6 data configuration failed; retaining IPv4 data" behaviour.
     let mut configured = false;
-    if let Some(IpAddr::V6(address)) = bearer.settings.ipv6_address {
-        let prefix = bearer.ipv6_prefix.unwrap_or(64);
-        let address = format!("{address}/{prefix}");
-        run_ip(&[
-            "-6",
-            "address",
-            "replace",
-            &address,
-            "dev",
-            &bearer.interface,
-        ])
-        .await?;
-        for dns in &bearer.settings.ipv6_dns {
-            route_host(&bearer.interface, *dns).await?;
+    let mut last_error = None;
+    if bearer.settings.ipv6_address.is_some() {
+        match configure_ipv6(bearer).await {
+            Ok(()) => configured = true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    interface = %bearer.interface,
+                    "VoLTE IPv6 data configuration failed; retaining any IPv4 data"
+                );
+                last_error = Some(error);
+            }
         }
-        configured = true;
     }
-    if let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address {
-        let prefix = bearer.ipv4_prefix.unwrap_or(32);
-        let address = format!("{address}/{prefix}");
-        run_ip(&["address", "replace", &address, "dev", &bearer.interface]).await?;
-        for dns in &bearer.settings.ipv4_dns {
-            route_host(&bearer.interface, *dns).await?;
+    if bearer.settings.ipv4_address.is_some() {
+        match configure_ipv4(bearer).await {
+            Ok(()) => configured = true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    interface = %bearer.interface,
+                    "VoLTE IPv4 data configuration failed; retaining any IPv6 data"
+                );
+                last_error = Some(error);
+            }
         }
-        configured = true;
     }
-    if !configured {
+    if configured {
+        return Ok(());
+    }
+    Err(last_error.unwrap_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING)))
+}
+
+async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
+    let Some(IpAddr::V6(address)) = bearer.settings.ipv6_address else {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+    };
+    let prefix = bearer.ipv6_prefix.unwrap_or(64);
+    let address = format!("{address}/{prefix}");
+    run_ip(&[
+        "-6",
+        "address",
+        "replace",
+        &address,
+        "dev",
+        &bearer.interface,
+    ])
+    .await?;
+    for dns in &bearer.settings.ipv6_dns {
+        route_host(&bearer.interface, *dns).await?;
+    }
+    Ok(())
+}
+
+async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), VolteError> {
+    let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address else {
+        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+    };
+    let prefix = bearer.ipv4_prefix.unwrap_or(32);
+    let address = format!("{address}/{prefix}");
+    run_ip(&["address", "replace", &address, "dev", &bearer.interface]).await?;
+    for dns in &bearer.settings.ipv4_dns {
+        route_host(&bearer.interface, *dns).await?;
     }
     Ok(())
 }

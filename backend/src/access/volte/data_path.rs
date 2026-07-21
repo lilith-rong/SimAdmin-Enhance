@@ -5,7 +5,7 @@
 //! data connection: it is a short-lived IPv6 `ims` WDS session used to make
 //! the modem allocate the PCO/prefix state that the later bearer consumes.
 
-use std::{net::IpAddr, process::Output, time::Duration};
+use std::{net::IpAddr, path::Path, process::Output, time::Duration};
 
 use tokio::{process::Command, time::timeout};
 
@@ -21,6 +21,12 @@ pub enum ProbeResult {
     Ready,
     /// The reference also tolerates a SIP probe timeout after WDS succeeds.
     NoSipResponse,
+    /// No QMI MUX data endpoint exists on this device (e.g. a bam-dmux target
+    /// with no `a2-mux-rmnet*` node). The WDS preflight is a no-op here and the
+    /// caller proceeds straight to the ModemManager bearer. Attempting a
+    /// `wds-start-network` on a nonexistent MUX port is pointless and, on some
+    /// firmware, actively harmful (it can wedge the baseband).
+    NoMuxEndpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +35,9 @@ struct ProbePath<'a> {
     data_port: &'a str,
 }
 
+/// Candidate MUX endpoints, in the reference's probe order. Only the entries
+/// whose data port actually exists on the running device are used; the rest
+/// are skipped rather than probed blindly.
 const PROBE_PATHS: &[ProbePath<'_>] = &[
     ProbePath {
         interface: "wwan1",
@@ -40,13 +49,34 @@ const PROBE_PATHS: &[ProbePath<'_>] = &[
     },
 ];
 
+/// A MUX data port is usable only if the kernel actually exposes it, either as
+/// a network device (`/sys/class/net/<port>`) or a device node (`/dev/<port>`).
+/// bam-dmux targets expose neither, so this returns `false` there and the whole
+/// preflight collapses to a no-op.
+fn data_port_exists(data_port: &str) -> bool {
+    Path::new(&format!("/sys/class/net/{data_port}")).exists()
+        || Path::new(&format!("/dev/{data_port}")).exists()
+}
+
 /// Run the bounded WDS preflight. A failed path is cleaned up before trying
 /// the next MUX endpoint; callers may continue to the ModemManager bearer if
 /// every path is unavailable, matching the reference's best-effort probe.
+///
+/// If no MUX endpoint exists at all (bam-dmux devices), the preflight is
+/// skipped entirely and `NoMuxEndpoint` is returned, avoiding a wasted — and
+/// potentially baseband-wedging — `wds-start-network` on a port that is not
+/// there.
 pub async fn probe_ims_ipv6(qmi_device: &str, cid_hint: u8) -> Result<ProbeResult, VolteError> {
+    let present: Vec<&ProbePath<'_>> = PROBE_PATHS
+        .iter()
+        .filter(|path| data_port_exists(path.data_port))
+        .collect();
+    if present.is_empty() {
+        return Ok(ProbeResult::NoMuxEndpoint);
+    }
     let mut last_error = None;
     let mut initialized = false;
-    for path in PROBE_PATHS {
+    for path in present {
         match probe_path(qmi_device, cid_hint, path).await {
             // The reference continues to the shared wwan0 MUX after the
             // wwan1 SIP capability probe times out, so prime both paths.
@@ -209,6 +239,21 @@ mod tests {
         assert_eq!(PROBE_PATHS[0].data_port, "a2-mux-rmnet1");
         assert_eq!(PROBE_PATHS[1].interface, "wwan0");
         assert_eq!(PROBE_PATHS[1].data_port, "a2-mux-rmnet0");
+    }
+
+    #[test]
+    fn absent_mux_endpoints_are_not_probed() {
+        // None of the reference MUX ports exist on a bam-dmux target (nor on
+        // the CI host), so the preflight must report NoMuxEndpoint without ever
+        // shelling out to qmicli.
+        assert!(!data_port_exists("a2-mux-rmnet0"));
+        assert!(!data_port_exists("a2-mux-rmnet1"));
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(probe_ims_ipv6("/dev/does-not-exist", 2));
+        assert_eq!(result, Ok(ProbeResult::NoMuxEndpoint));
     }
 
     #[test]

@@ -176,6 +176,18 @@ pub async fn discover_pcscf_via_at(
     }
 }
 
+/// The IMS PDP context id used for P-CSCF discovery and the IPv6 WDS preflight.
+/// Honors `SIMADMIN_VOLTE_IMS_CID` (1..=16), else falls back to CID 2. Exposed
+/// so callers that skip the AT probe (e.g. when it is non-fatal and returns no
+/// candidates) still have a stable CID hint for the preflight.
+pub fn configured_ims_cid() -> u8 {
+    std::env::var(ENV_IMS_CID)
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or(DEFAULT_IMS_CID)
+}
+
 /// Discover P-CSCF candidates and retain the successful Qualcomm IMS context.
 ///
 /// Keeping the context is intentional: on the 410 firmware, cleaning CID 2
@@ -186,11 +198,7 @@ pub async fn discover_pcscf_via_at_with_context(
     modem: &str,
     preference: VolteIpFamilyPreference,
 ) -> Result<AtPcscfDiscovery, VolteError> {
-    let cid = std::env::var(ENV_IMS_CID)
-        .ok()
-        .and_then(|value| value.trim().parse::<u8>().ok())
-        .filter(|value| (1..=16).contains(value))
-        .unwrap_or(DEFAULT_IMS_CID);
+    let cid = configured_ims_cid();
 
     let mut last_error = None;
     for _ in 0..AT_DISCOVERY_ROUNDS {
@@ -285,8 +293,10 @@ async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
 
 fn ordered_pdp_types(preference: VolteIpFamilyPreference) -> &'static [&'static str] {
     match preference {
-        VolteIpFamilyPreference::Ipv6First => &["IPV6", "IP"],
-        VolteIpFamilyPreference::Ipv4First => &["IP", "IPV6"],
+        // Runtime registration always asks the modem for dual stack first.
+        // The legacy preference only defines the bounded single-stack order.
+        VolteIpFamilyPreference::Ipv6First => &["IPV4V6", "IPV6", "IP"],
+        VolteIpFamilyPreference::Ipv4First => &["IPV4V6", "IP", "IPV6"],
         VolteIpFamilyPreference::Ipv6Only => &["IPV6"],
         VolteIpFamilyPreference::Ipv4Only => &["IP"],
     }
@@ -766,11 +776,11 @@ IPv4 primary DNS: 10.0.0.53";
     fn at_probe_family_order_matches_runtime_preference() {
         assert_eq!(
             ordered_pdp_types(VolteIpFamilyPreference::Ipv6First),
-            &["IPV6", "IP"]
+            &["IPV4V6", "IPV6", "IP"]
         );
         assert_eq!(
             ordered_pdp_types(VolteIpFamilyPreference::Ipv4First),
-            &["IP", "IPV6"]
+            &["IPV4V6", "IP", "IPV6"]
         );
         assert_eq!(
             ordered_pdp_types(VolteIpFamilyPreference::Ipv6Only),

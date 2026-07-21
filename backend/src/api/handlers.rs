@@ -3095,99 +3095,67 @@ async fn send_sms_over_volte_path(
     payload: &SendSmsRequest,
 ) -> Result<serde_json::Value, String> {
     let mut config = app.config_manager.get_volte_config();
-    if !config.feature_enabled || !config.sms_enabled {
-        return Err("disabled".to_string());
-    }
-    if let Some(line_id) = payload.line_id.as_deref() {
-        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
-        let line = app
-            .line_registry
-            .get(line_id)
-            .await
-            .ok_or_else(|| "line_not_found".to_string())?;
-        let binding = line.binding();
-        if !binding.present {
-            return Err("line_not_present".to_string());
-        }
-        let profile = app.config_manager.get_line_profile(line_id);
-        if !profile.enabled || !profile.volte_connection_enabled {
-            return Err("line_volte_connection_disabled".to_string());
-        }
-        config.connection_enabled = true;
-        if !line.volte.status().await.registered {
-            let device = crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
-                .map_err(|error| error.to_string())?;
-            let _guard = line.volte_connect_lock.lock().await;
-            if !line.volte.status().await.registered {
-                crate::access::volte::live::connect_live_for_line(
-                    &line.volte_live,
-                    &device,
-                    &line.volte,
-                    &config,
-                    app.config_manager.get_sms_path_policy().dedupe_enabled,
-                    Arc::clone(&app.database),
-                    Arc::clone(&app.notification_sender),
-                )
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let selected_line_id = match payload.line_id.as_deref() {
+        Some(line_id) => line_id.to_string(),
+        None => {
+            let enabled = app
+                .line_registry
+                .all()
                 .await
-                .map_err(|error| error.to_string())?;
+                .into_iter()
+                .filter(|line| {
+                    let binding = line.binding();
+                    let profile = app.config_manager.get_line_profile(&binding.line_id);
+                    binding.present && profile.enabled && profile.volte_connection_enabled
+                })
+                .collect::<Vec<_>>();
+            if enabled.len() != 1 {
+                return Err("volte_line_id_required".to_string());
             }
+            enabled[0].binding().line_id
         }
-        let sim = get_sim_info_for_modem_with_cache(
-            &app.dbus_conn,
-            &binding.modem_path,
-            Some(&app.database),
-        )
+    };
+    let line_id = selected_line_id.as_str();
+    let line = app
+        .line_registry
+        .get(line_id)
         .await
-        .map_err(|error| error.to_string())?;
-        let result = crate::access::volte::live::send_live_sms_for_line(
-            &line.volte_live,
-            &line.volte,
-            &payload.phone_number,
-            &payload.content,
-            &sim.sms_center,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        app.database
-            .insert_sms_with_transport_for_line(
-                "outgoing",
-                &payload.phone_number,
-                &payload.content,
-                "sent",
-                None,
-                "volte_ims",
-                Some(line_id),
-            )
+        .ok_or_else(|| "line_not_found".to_string())?;
+    let binding = line.binding();
+    if !binding.present {
+        return Err("line_not_present".to_string());
+    }
+    let profile = app.config_manager.get_line_profile(line_id);
+    if !profile.enabled || !profile.volte_connection_enabled {
+        return Err("line_volte_connection_disabled".to_string());
+    }
+    config.connection_enabled = true;
+    if !line.volte.status().await.registered {
+        let device = crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
             .map_err(|error| error.to_string())?;
-        return Ok(json!({
-            "path": "volte_ims",
-            "transport": "volte_ims",
-            "line_id": line_id,
-            "message_id": result.message_id,
-            "trace_id": result.trace_id,
-            "part_count": result.part_count,
-            "sip_statuses": result.sip_statuses,
-        }));
+        let _guard = line.volte_connect_lock.lock().await;
+        if !line.volte.status().await.registered {
+            crate::access::volte::live::connect_live_for_line(
+                &line.volte_live,
+                &device,
+                &line.volte,
+                &config,
+                app.config_manager.get_sms_path_policy().dedupe_enabled,
+                Arc::clone(&app.database),
+                Arc::clone(&app.notification_sender),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
     }
-    if !config.connection_enabled {
-        return Err("disabled".to_string());
-    }
-    if !app.volte_runtime.status().await.registered {
-        crate::access::volte::live::connect_live(
-            &app.volte_runtime,
-            &config,
-            app.config_manager.get_sms_path_policy().dedupe_enabled,
-            Arc::clone(&app.database),
-            Arc::clone(&app.notification_sender),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    }
-    let sim = get_sim_info_data_with_cache(&app.dbus_conn, Some(&app.database))
-        .await
-        .map_err(|error| error.to_string())?;
-    let result = crate::access::volte::live::send_live_sms(
-        &app.volte_runtime,
+    let sim =
+        get_sim_info_for_modem_with_cache(&app.dbus_conn, &binding.modem_path, Some(&app.database))
+            .await
+            .map_err(|error| error.to_string())?;
+    let result = crate::access::volte::live::send_live_sms_for_line(
+        &line.volte_live,
+        &line.volte,
         &payload.phone_number,
         &payload.content,
         &sim.sms_center,
@@ -3195,22 +3163,24 @@ async fn send_sms_over_volte_path(
     .await
     .map_err(|error| error.to_string())?;
     app.database
-        .insert_sms_with_transport(
+        .insert_sms_with_transport_for_line(
             "outgoing",
             &payload.phone_number,
             &payload.content,
             "sent",
             None,
             "volte_ims",
+            Some(line_id),
         )
         .map_err(|error| error.to_string())?;
     Ok(json!({
-        "path": "volte_ims",
-        "transport": "volte_ims",
-        "message_id": result.message_id,
-        "trace_id": result.trace_id,
-        "part_count": result.part_count,
-        "sip_statuses": result.sip_statuses,
+            "path": "volte_ims",
+            "transport": "volte_ims",
+            "line_id": line_id,
+            "message_id": result.message_id,
+            "trace_id": result.trace_id,
+            "part_count": result.part_count,
+            "sip_statuses": result.sip_statuses,
     }))
 }
 
@@ -5325,8 +5295,7 @@ pub async fn retry_volte_line_handler(
         );
     };
     let profile = app.config_manager.get_line_profile(&line_id);
-    let config = app.config_manager.get_volte_config();
-    if !config.feature_enabled || !config.sms_enabled || !profile.volte_connection_enabled {
+    if !profile.enabled || !profile.volte_connection_enabled {
         return (
             StatusCode::CONFLICT,
             Json(ApiResponse::error("volte_line_connection_disabled")),
@@ -5502,15 +5471,26 @@ pub async fn set_line_trunk_enabled_handler(
 }
 
 impl VolteControlResponse {
-    fn build(config: &VolteConfig, runtime: crate::access::volte::VolteRuntimeStatus) -> Self {
+    fn build(
+        _config: &VolteConfig,
+        runtime: crate::access::volte::VolteRuntimeStatus,
+        line_enabled: bool,
+    ) -> Self {
         Self {
-            enabled: config.feature_enabled && config.sms_enabled,
-            feature_enabled: config.feature_enabled,
-            sms_enabled: config.sms_enabled,
-            connection_enabled: config.connection_enabled,
+            enabled: line_enabled,
+            feature_enabled: line_enabled,
+            sms_enabled: line_enabled,
+            connection_enabled: line_enabled,
             runtime,
         }
     }
+}
+
+fn any_volte_line_enabled(app: &AppState) -> bool {
+    app.config_manager
+        .get_line_profiles()
+        .iter()
+        .any(|profile| profile.enabled && profile.volte_connection_enabled)
 }
 
 pub async fn get_volte_control_handler(
@@ -5522,7 +5502,7 @@ pub async fn get_volte_control_handler(
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Success",
-            VolteControlResponse::build(&config, runtime),
+            VolteControlResponse::build(&config, runtime, any_volte_line_enabled(&app)),
         )),
     )
 }
@@ -5539,21 +5519,13 @@ pub async fn set_volte_feature_handler(
             if !payload.enabled {
                 crate::access::volte::live::disconnect_live(&app.volte_runtime, "volte_disabled")
                     .await;
-                for line in app.line_registry.all().await {
-                    crate::access::volte::live::disconnect_live_for_line(
-                        &line.volte_live,
-                        &line.volte,
-                        "volte_disabled",
-                    )
-                    .await;
-                }
             }
             let runtime = app.volte_runtime.status().await;
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
                     "Success",
-                    VolteControlResponse::build(&config, runtime),
+                    VolteControlResponse::build(&config, runtime, any_volte_line_enabled(&app)),
                 )),
             )
         }
@@ -5566,48 +5538,36 @@ pub async fn set_volte_feature_handler(
     }
 }
 
-/// Start/stop the live VoLTE IMS bearer and REGISTER session. The feature gate
-/// must be enabled first; disabling performs scoped xfrm and bearer cleanup.
+/// Legacy global endpoint. Physical IMS sessions must be controlled through a
+/// line endpoint so multi-modem systems never select an implicit modem.
 pub async fn set_volte_connection_handler(
     State(app): State<AppState>,
     Json(payload): Json<VolteControlToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<VolteControlResponse>>) {
+    if payload.enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("volte_line_endpoint_required")),
+        );
+    }
     let _guard = app.volte_connect_lock.lock().await;
     match app
         .config_manager
         .set_volte_connection_enabled(payload.enabled)
     {
         Ok(config) => {
-            let result = if payload.enabled {
-                crate::access::volte::live::connect_live(
-                    &app.volte_runtime,
-                    &config,
-                    app.config_manager.get_sms_path_policy().dedupe_enabled,
-                    Arc::clone(&app.database),
-                    Arc::clone(&app.notification_sender),
-                )
-                .await
-            } else {
-                Ok(crate::access::volte::live::disconnect_live(
-                    &app.volte_runtime,
-                    "volte_connection_disabled",
-                )
-                .await)
-            };
+            crate::access::volte::live::disconnect_live(
+                &app.volte_runtime,
+                "volte_connection_disabled",
+            )
+            .await;
             let runtime = app.volte_runtime.status().await;
-            let response = VolteControlResponse::build(&config, runtime);
-            match result {
-                Ok(_) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::success_with_message("Success", response)),
-                ),
-                Err(error) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::<VolteControlResponse>::error(format!(
-                        "Failed: {error}"
-                    ))),
-                ),
-            }
+            let response =
+                VolteControlResponse::build(&config, runtime, any_volte_line_enabled(&app));
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", response)),
+            )
         }
         Err(error) => (
             StatusCode::OK,
@@ -5632,10 +5592,10 @@ pub struct VolteVoiceStatusResponse {
 }
 
 impl VolteVoiceStatusResponse {
-    fn build(config: &VolteConfig) -> Self {
+    fn build(config: &VolteConfig, line_enabled: bool) -> Self {
         Self {
-            enabled: config.feature_enabled && config.voice_enabled,
-            feature_enabled: config.feature_enabled,
+            enabled: line_enabled && config.voice_enabled,
+            feature_enabled: line_enabled,
             voice_enabled: config.voice_enabled,
             // Qualcomm 410 pocket-WiFi has no mic/speaker/PCM: relay only.
             gateway_mode: true,
@@ -5652,7 +5612,7 @@ pub async fn get_volte_call_status_handler(
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Success",
-            VolteVoiceStatusResponse::build(&config),
+            VolteVoiceStatusResponse::build(&config, any_volte_line_enabled(&app)),
         )),
     )
 }
@@ -5666,7 +5626,7 @@ pub async fn set_volte_voice_handler(
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
                 "Success",
-                VolteVoiceStatusResponse::build(&config),
+                VolteVoiceStatusResponse::build(&config, any_volte_line_enabled(&app)),
             )),
         ),
         Err(err) => (
@@ -5737,7 +5697,7 @@ impl VilteStatusResponse {
     fn build(app: &AppState) -> Self {
         let volte = app.config_manager.get_volte_config();
         let vilte = app.config_manager.get_vilte_config();
-        let voice_ready = volte.feature_enabled && volte.voice_enabled;
+        let voice_ready = any_volte_line_enabled(app) && volte.voice_enabled;
         Self {
             enabled: voice_ready && vilte.feature_enabled,
             feature_enabled: vilte.feature_enabled,
@@ -6011,7 +5971,7 @@ async fn start_line_volte_restore(
     let vilte = app.config_manager.get_vilte_config();
     line.volte_live
         .operator_link()
-        .set_video_enabled(volte.feature_enabled && volte.voice_enabled && vilte.feature_enabled);
+        .set_video_enabled(volte.voice_enabled && vilte.feature_enabled);
     line.volte
         .update(|state| {
             state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Connecting;
@@ -6042,12 +6002,8 @@ fn line_volte_restore_enabled(
     app: &AppState,
     line: &crate::access::line_registry::LineRuntime,
 ) -> bool {
-    let config = app.config_manager.get_volte_config();
     let profile = app.config_manager.get_line_profile(&line.binding().line_id);
-    config.feature_enabled
-        && config.sms_enabled
-        && profile.enabled
-        && profile.volte_connection_enabled
+    profile.enabled && profile.volte_connection_enabled
 }
 
 async fn wait_for_line_modem(
@@ -6152,11 +6108,7 @@ async fn run_line_volte_restore_batch(
     for attempt in 1..=VOLTE_RESTORE_MAX_ATTEMPTS {
         let config = app.config_manager.get_volte_config();
         let profile = app.config_manager.get_line_profile(&line.binding().line_id);
-        if !config.feature_enabled
-            || !config.sms_enabled
-            || !profile.enabled
-            || !profile.volte_connection_enabled
-        {
+        if !profile.enabled || !profile.volte_connection_enabled {
             line.volte
                 .update(|state| {
                     state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Idle;
@@ -6253,59 +6205,6 @@ async fn run_line_volte_restore_batch(
         .await;
 }
 
-async fn run_legacy_volte_restore_batch(app: &AppState) {
-    let runtime = Arc::clone(&app.volte_runtime);
-    let volte = app.config_manager.get_volte_config();
-    let vilte = app.config_manager.get_vilte_config();
-    crate::access::volte::live::default_live_operator_link()
-        .set_video_enabled(volte.feature_enabled && volte.voice_enabled && vilte.feature_enabled);
-    for attempt in 1..=VOLTE_RESTORE_MAX_ATTEMPTS {
-        let config = app.config_manager.get_volte_config();
-        if !config.feature_enabled || !config.sms_enabled || !config.connection_enabled {
-            return;
-        }
-        runtime
-            .update(|state| {
-                state.recovery_state =
-                    crate::access::volte::runtime::VolteRecoveryState::Connecting;
-                state.recovery_source = Some("automatic_legacy".to_string());
-                state.retry_attempt = attempt;
-                state.retry_max = VOLTE_RESTORE_MAX_ATTEMPTS;
-                state.manual_retry_available = false;
-                state.next_retry_at = None;
-            })
-            .await;
-        let result = {
-            let _guard = app.volte_connect_lock.lock().await;
-            crate::access::volte::live::connect_live(
-                &runtime,
-                &config,
-                app.config_manager.get_sms_path_policy().dedupe_enabled,
-                Arc::clone(&app.database),
-                Arc::clone(&app.notification_sender),
-            )
-            .await
-        };
-        if result.is_ok() {
-            return;
-        }
-        if attempt < VOLTE_RESTORE_MAX_ATTEMPTS {
-            let delay = config.auto_restore_retry_delay_secs.clamp(5, 180);
-            runtime
-                .update(|state| state.next_retry_at = Some(volte_next_retry_at(delay)))
-                .await;
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-        }
-    }
-    runtime
-        .update(|state| {
-            state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Exhausted;
-            state.manual_retry_available = true;
-            state.next_retry_at = None;
-        })
-        .await;
-}
-
 /// Keep explicitly enabled VoLTE lines alive, but stop after one bounded batch.
 /// A later registered-session failure starts a fresh batch; an exhausted batch
 /// waits for an explicit Web retry instead of looping forever.
@@ -6317,35 +6216,24 @@ pub fn spawn_volte_auto_restore(app: AppState) {
         ))
         .await;
         loop {
-            let config = app.config_manager.get_volte_config();
-            if config.feature_enabled {
-                let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
-                let profiles = app.config_manager.get_line_profiles();
-                let enabled_profiles = profiles
-                    .iter()
-                    .filter(|profile| profile.enabled && profile.volte_connection_enabled)
-                    .collect::<Vec<_>>();
-                if enabled_profiles.is_empty()
-                    && config.sms_enabled
-                    && config.connection_enabled
-                    && !app.volte_runtime.status().await.registered
-                    && !app.volte_runtime.status().await.manual_retry_available
+            let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+            for profile in app
+                .config_manager
+                .get_line_profiles()
+                .iter()
+                .filter(|profile| profile.enabled && profile.volte_connection_enabled)
+            {
+                let Some(line) = app.line_registry.get(&profile.line_id).await else {
+                    continue;
+                };
+                let status = line.volte.status().await;
+                if status.registered
+                    || status.manual_retry_available
+                    || line.volte_retry_in_progress()
                 {
-                    run_legacy_volte_restore_batch(&app).await;
+                    continue;
                 }
-                for profile in enabled_profiles {
-                    let Some(line) = app.line_registry.get(&profile.line_id).await else {
-                        continue;
-                    };
-                    let status = line.volte.status().await;
-                    if status.registered
-                        || status.manual_retry_available
-                        || line.volte_retry_in_progress()
-                    {
-                        continue;
-                    }
-                    start_line_volte_restore(app.clone(), line, "automatic").await;
-                }
+                start_line_volte_restore(app.clone(), line, "automatic").await;
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }

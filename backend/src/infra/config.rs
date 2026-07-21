@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn per_line_volte_connection_enables_hidden_capability_and_persists() {
+    fn per_line_volte_connection_is_independent_and_persists() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-config-{}-{}.json",
             std::process::id(),
@@ -1474,7 +1474,7 @@ mod tests {
             .set_line_volte_connection_enabled(line_id, true)
             .unwrap();
         assert!(profile.volte_connection_enabled);
-        assert!(manager.get_volte_config().feature_enabled);
+        assert!(!manager.get_volte_config().feature_enabled);
 
         let reloaded = ConfigManager::new(path.clone());
         assert!(reloaded.get_line_profile(line_id).volte_connection_enabled);
@@ -1872,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_volte_ip_family_preference_is_read_but_not_serialized() {
+    fn volte_ip_family_preference_round_trips() {
         let defaulted: VolteConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(
             defaulted.ip_family_preference,
@@ -1885,10 +1885,15 @@ mod tests {
             configured.ip_family_preference,
             VolteIpFamilyPreference::Ipv4First
         );
-        assert!(serde_json::to_value(configured)
-            .unwrap()
-            .get("ip_family_preference")
-            .is_none());
+        // The preference is now honored by the connect flow, so it must survive a
+        // serialize/deserialize round-trip and stay visible to the config UI.
+        assert_eq!(
+            serde_json::to_value(configured)
+                .unwrap()
+                .get("ip_family_preference")
+                .and_then(|value| value.as_str()),
+            Some("ipv4_first")
+        );
     }
 
     #[test]
@@ -2461,9 +2466,12 @@ fn default_volte_auto_restore_retry_delay_secs() -> u64 {
     30
 }
 
-/// Legacy address-family values accepted while reading older configurations.
-/// Runtime selection is now fixed to dual-stack first with bounded IPv4/IPv6
-/// fallback, so this value is ignored and no longer serialized or exposed.
+/// IMS bearer IP address-family attempt order. The runtime always asks the
+/// modem for dual-stack first; this preference decides which single family is
+/// tried first when the network forces a fallback, and the order in which the
+/// bearer's local addresses are offered to SIP/REGISTER. `Ipv6First` matches
+/// the usual IMS deployment; `Ipv4First` suits carriers that only provision an
+/// IPv4 P-CSCF.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VolteIpFamilyPreference {
@@ -2487,10 +2495,10 @@ impl VolteIpFamilyPreference {
 
 /// VoLTE (IMS over LTE) SMS configuration.
 ///
-/// `feature_enabled` + `sms_enabled` mirror the observed persisted config on the
-/// reference build (`struct VolteConfig { feature_enabled, sms_enabled }`). The
-/// `connection_enabled` gate and auto-restore triple follow the `VowifiConfig`
-/// pattern so the two features behave consistently.
+/// `feature_enabled`, `sms_enabled`, and `connection_enabled` are retained for
+/// backward-compatible config/API deserialization. Physical modem lines use
+/// `LineProfileConfig::volte_connection_enabled` as their sole IMS connection
+/// intent; these legacy global fields must not gate a line.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolteConfig {
     #[serde(default)]
@@ -2501,7 +2509,7 @@ pub struct VolteConfig {
     pub voice_enabled: bool,
     #[serde(default)]
     pub connection_enabled: bool,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub ip_family_preference: VolteIpFamilyPreference,
     #[serde(default = "default_volte_auto_restore_initial_delay_secs")]
     pub auto_restore_initial_delay_secs: u64,
@@ -3783,9 +3791,6 @@ impl ConfigManager {
             c.volte.feature_enabled = enabled;
             if !enabled {
                 c.volte.connection_enabled = false;
-                for profile in &mut c.line_profiles {
-                    profile.volte_connection_enabled = false;
-                }
             }
             c.volte.clone()
         };
@@ -4035,9 +4040,6 @@ impl ConfigManager {
         }
         let next = {
             let mut config = self.config.write().unwrap();
-            if enabled {
-                config.volte.feature_enabled = true;
-            }
             let profile = if let Some(profile) = config
                 .line_profiles
                 .iter_mut()
@@ -4394,14 +4396,10 @@ impl ConfigManager {
         Ok(next)
     }
 
-    /// Toggle the VoLTE voice (gateway) feature. Requires the VoLTE feature to
-    /// be enabled first (voice rides the same IMS registration as SMS).
+    /// Toggle VoLTE voice handling for registered per-line IMS sessions.
     pub fn set_volte_voice_enabled(&self, enabled: bool) -> Result<VolteConfig, String> {
         let next = {
             let mut c = self.config.write().unwrap();
-            if enabled && !c.volte.feature_enabled {
-                return Err("volte_feature_disabled".to_string());
-            }
             c.volte.voice_enabled = enabled;
             if !enabled {
                 c.vilte.feature_enabled = false;
@@ -4456,14 +4454,12 @@ impl ConfigManager {
     }
 
     /// Toggle the ViLTE video feature. Video rides the VoLTE voice session, so
-    /// enabling ViLTE requires the VoLTE voice feature to be on (which in turn
-    /// requires the VoLTE feature). This keeps the gating chain
-    /// `volte.feature_enabled -> volte.voice_enabled -> vilte.feature_enabled`
-    /// consistent with the "video is an add-on to the voice call" model.
+    /// enabling ViLTE requires VoLTE voice handling to be enabled. The actual
+    /// IMS availability is derived from per-line profiles at runtime.
     pub fn set_vilte_feature_enabled(&self, enabled: bool) -> Result<VilteConfig, String> {
         let next = {
             let mut c = self.config.write().unwrap();
-            if enabled && !(c.volte.feature_enabled && c.volte.voice_enabled) {
+            if enabled && !c.volte.voice_enabled {
                 return Err("volte_voice_disabled".to_string());
             }
             c.vilte.feature_enabled = enabled;
@@ -4486,7 +4482,7 @@ impl ConfigManager {
         let next = {
             let mut c = self.config.write().unwrap();
             let mut incoming = vilte;
-            if incoming.feature_enabled && !(c.volte.feature_enabled && c.volte.voice_enabled) {
+            if incoming.feature_enabled && !c.volte.voice_enabled {
                 incoming.feature_enabled = false;
             }
             c.vilte = incoming;

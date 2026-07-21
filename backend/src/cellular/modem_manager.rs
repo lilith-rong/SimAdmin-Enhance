@@ -3952,7 +3952,9 @@ pub async fn connect_data_via_modem(
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
 ) -> Result<(), String> {
-    simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn)
+    // Per-line data connections are isolated from the host default route. The
+    // line's HTTP/SOCKS5 proxy is the only supported egress for this bearer.
+    simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn, true)
         .await
         .map(|_| ())
 }
@@ -4000,7 +4002,9 @@ async fn set_data_connection_inner(
             };
 
             // 更新 NM profile 的 APN/漫游设置
-            if let Err(err) = nm_update_connection(&profile, &connect_settings, allow_roaming).await {
+            if let Err(err) =
+                nm_update_connection(&profile, &connect_settings, allow_roaming, false).await
+            {
                 warn!(error = %err, "Failed to update NM connection settings, proceeding with existing");
             }
 
@@ -4336,10 +4340,13 @@ async fn simple_connect_for_baseband_restart(
     modem_path: &str,
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
+    isolated: bool,
 ) -> Result<String, String> {
     let profile = find_nm_modem_connection().await?;
     let connect_settings = resolve_simple_connect_settings(conn, modem_path, configured_apn).await;
-    if let Err(err) = nm_update_connection(&profile, &connect_settings, allow_roaming).await {
+    if let Err(err) =
+        nm_update_connection(&profile, &connect_settings, allow_roaming, isolated).await
+    {
         warn!(error = %err, "Failed to update NM connection for baseband restart");
     }
     let device = find_nm_device_for_modem(conn, modem_path).await?;
@@ -6072,6 +6079,7 @@ async fn nm_update_connection(
     profile: &str,
     settings: &SimpleConnectSettings,
     allow_roaming: bool,
+    isolated: bool,
 ) -> Result<(), String> {
     let mut args: Vec<String> = vec!["connection".into(), "modify".into(), profile.into()];
 
@@ -6093,6 +6101,19 @@ async fn nm_update_connection(
     }
     args.push("gsm.home-only".into());
     args.push(if allow_roaming { "no" } else { "yes" }.into());
+    // Never let a per-line proxy bearer become the system's default route.
+    // Connected/interface routes remain available to sockets bound to the
+    // cellular device by DataProxyRuntime.
+    args.push("ipv4.never-default".into());
+    args.push(if isolated { "yes" } else { "no" }.into());
+    args.push("ipv6.never-default".into());
+    args.push(if isolated { "yes" } else { "no" }.into());
+    if isolated {
+        args.push("ipv4.ignore-auto-dns".into());
+        args.push("yes".into());
+        args.push("ipv6.ignore-auto-dns".into());
+        args.push("yes".into());
+    }
 
     run_recovery_command_owned("nmcli", &args, Duration::from_secs(10)).await?;
     Ok(())
