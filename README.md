@@ -38,6 +38,8 @@
 	<br/><br/>
 	<img src="./static/eSIM.png" width="100%" alt="eSIM" />
 	<br/><br/>
+	<img src="./static/WiFi_Calling.png" width="100%" alt="WiFi_Calling" />
+	<br/><br/>
 	<img src="./static/Cellular_Network.png" width="100%" alt="Cellular_Network" />
 	<br/><br/>
 	<img src="./static/WLAN.png" width="100%" alt="WLAN" />
@@ -68,7 +70,9 @@
 
 # SimAdmin - SIM/eSIM 中枢
 
-SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的 SIM/eSIM、蜂窝网络、短信、DDNS 和系统状态管理系统。
+SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的 SIM/eSIM、蜂窝网络、短信、WiFi Calling(VoWiFi)、DDNS 和系统状态管理系统。
+
+**💡 核心亮点 —— 支持 WiFi Calling (VoWiFi)**：原生实现 IKEv2/IPsec 全链路能力，无第三方程序依赖；依托 SIM 硬件鉴权搭建加密隧道，无蜂窝信号、飞行模式下仍可通过无线网络完成 IMS 注册与加密短信收发。
 
 当前项目由 Rust 后端和 React 前端组成：
 
@@ -80,11 +84,11 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 
 ## 📖 文档导航
 
-*   🚀 **[安装与部署指南](./docs/install.md)**：设备一键安装/卸载、后台默认访问地址及首次管理员密码设置。
-*   📜 **[版本更新记录](./docs/changelog.md)**：历史版本详细的更新说明日志。
-*   ⚙️ **[运行环境与系统管理](./docs/environment.md)**：目标设备硬件与依赖指令要求、默认安装路径、eSIM 管理机制、systemd 服务维护及数据持久化。
-*   🛠️ **[开发者指南](./docs/developer.md)**：项目工程结构、前端与后端开发编译、OTA 构建、ADB 部署调试及 D-Bus 接口说明。
-*   🔌 **[REST API 接口文档](./bruno-api/README.md)**：详细的 REST API 路由映射表、请求/响应报文规约与 Bruno API 调试集合。
+*   🚀 **[安装与部署指南 (docs/INSTALL.md)](./docs/INSTALL.md)**：设备一键安装/卸载、后台默认访问地址及首次管理员密码设置。
+*   📜 **[版本更新记录 (docs/CHANGELOG.md)](./docs/CHANGELOG.md)**：历史版本详细的更新说明日志。
+*   ⚙️ **[运行环境与系统管理 (docs/ENVIRONMENT.md)](./docs/ENVIRONMENT.md)**：目标设备硬件与依赖指令要求、默认安装路径、eSIM/VoWiFi 管理机制、systemd 服务维护及数据持久化。
+*   🛠️ **[开发者指南 (docs/DEVELOPER.md)](./docs/DEVELOPER.md)**：项目工程结构、前端与后端开发编译、OTA 构建、ADB 部署调试及 D-Bus 接口说明。
+*   🔌 **[REST API 接口文档 (bruno-api/README.md)](./bruno-api/README.md)**：详细的 REST API 路由映射表、请求/响应报文规约与 Bruno API 调试集合。
 
 ---
 
@@ -152,7 +156,7 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 |------|------|------|
 | 登录认证 | `/login` | 首次设置管理员密码、登录后台 |
 | 仪表盘 | `/` | 包含在线状态、运营商、信号、网络延迟、数据/漫游/飞行模式快捷开关、系统资源、温度、流量，以及设备信息 |
-| SIM 卡管理 | `/sim` | 全面展示卡状态、标识信息、解锁次数及存储路径，支持号码与短信中心行内修改；在 eSIM 模式下集成管理与写卡功能 |
+| SIM 卡管理 | `/sim` | 全面展示卡状态、标识信息、解锁次数及存储路径，支持号码与短信中心行内修改；在 eSIM 模式下集成管理与写卡功能，在开启 WiFi Calling 时提供连接状态与耗时时序图诊断看板 |
 | 蜂窝网络 | `/network` | 网络注册、服务小区和邻区、运营商扫描、APN、射频模式、频段锁定、小区锁定状态 |
 | 设备网络 | `/device-network` | WLAN 客户端联网、无线网络扫描和连接、DDNS 动态解析配置和同步日志 |
 | 短信管理 | `/sms` | 接收短信、发送短信、短信列表、会话、统计、删除对话、删除短信 |
@@ -164,7 +168,7 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 
 ### 后端能力
 
-- 单管理员密码登录，支持首次设置、会话 Cookie、受保护 API 拦截和 SSH 本机恢复。
+- 单管理员密码登录，支持首次设置、会话 Cookie、受保护 API 拦截 and SSH 本机恢复。
 - 设备信息、SIM 信息、网络注册信息读取。
 - 数据连接开关和漫游策略持久化。
 - 飞行模式控制。
@@ -183,6 +187,11 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 - eSIM 模式下按需调用 `lpac` 管理实体 eUICC SIM 卡 Profiles；普通 SIM 模式下不调用 eSIM 能力。
 - 安装脚本按设备架构自动准备私有 `lpac`；OTA 包本身不绑定 `lpac` 架构或版本。
 - OTA 上传、在线下载、校验、替换二进制和前端资源。
+- 实现用户态 IKEv2 协议协商与 IPsec/ESP 安全报文加解密，提供零外部依赖的 VoWiFi 运行环境。
+- 集成 QMI UIM D-Bus 接口直连硬件，利用实体/eSIM卡的物理硬件鉴权能力，支持 3GPP 规范的 EAP-AKA 鉴权。
+- 支持 3GPP 动态运营商配置预设生成，自动解析 MCC/MNC 推导 ePDG 网关并原生支持大部分标准网络运营商。
+- 落地用户态虚拟 TUN 路由转发与 IMS 注册，集成 SMS over IPsec 安全短信收发机制。
+- 细化的 VoWiFi 错误诊断系统与连接状态时序图，支持连接中断后智能退避重试与自动恢复。
 
 ---
 
@@ -190,32 +199,16 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
 
 ### 👥 贡献者
 
-<table>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/crossgg">
-        <img src="https://avatars.githubusercontent.com/u/37495419?v=4" width="64" style="border-radius:50%;"/><br>
-        <sub>crossgg</sub>
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/enjin1314">
-        <img src="https://avatars.githubusercontent.com/u/64971822?v=4" width="64" style="border-radius:50%;"/><br>
-        <sub>enjin1314</sub>
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/nkguo">
-        <img src="https://avatars.githubusercontent.com/u/217694652?v=4" width="64" style="border-radius:50%;"/><br>
-        <sub>nkguo</sub>
-      </a>
-    </td>
-  </tr>
-</table>
+- [crossgg](https://github.com/crossgg)
 
 ### 📦 参考项目
 
 - [project-cpe](https://github.com/1orz/project-cpe)
 - [SmsForwarder](https://github.com/pppscn/SmsForwarder)
 - [ddns-go](https://github.com/jeessy2/ddns-go)
-- [lpac](https://github.com/estkme-group/lpac)
+- [strongSwan](https://github.com/strongswan/strongswan) (VoWiFi / ePDG IPsec 隧道与 IKEv2/EAP-AKA 协议实现)
+- [smoltcp](https://github.com/smoltcp-rs/smoltcp) (用户态 TCP/IP 协议栈及虚拟网关路由设计)
+- [sip-core](https://github.com/snipsco/sip-core) (IMS SIP 信令解析与注册流处理)
+- [Open5GS](https://github.com/open5gs/open5gs) / [free5GC](https://github.com/free5gc/free5gc) (3GPP 标准网元 ePDG/IMS 功能及域名的互操作规范)
+- [AOSP CarrierConfig](https://android.googlesource.com/platform/packages/apps/CarrierConfig/) (安卓标准运营商配置与 3GPP 动态降级回退机制设计)
+- [mobile-broadband-provider-info](https://gitlab.gnome.org/GNOME/mobile-broadband-provider-info) (移动宽带运营商数据匹配与基准拨号参数设计)

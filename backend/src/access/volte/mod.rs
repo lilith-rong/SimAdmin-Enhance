@@ -28,6 +28,7 @@ pub mod identity;
 pub mod ipsec;
 pub mod live;
 pub mod pcscf;
+pub mod plan;
 pub mod rtp_relay;
 pub mod runtime;
 pub mod sip;

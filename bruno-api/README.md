@@ -128,6 +128,37 @@
 - **set_notification_config.bru** - 设置多渠道通知配置
 - **test_notification_channel.bru** - 测试指定通知渠道，可通过 `channel` 变量切换
 
+### WiFi Calling (VoWiFi) 接口
+- **get_vowifi_status.bru** - 获取 VoWiFi 连接状态
+- **get_vowifi_control.bru** - 获取 VoWiFi 控制配置
+- **set_vowifi_feature.bru** - 开启或关闭 VoWiFi 功能（控制 UI 和功能的激活）
+- **set_vowifi_connection.bru** - 开启或关闭 VoWiFi 连接（控制后台隧道的拨号）
+- **post_vowifi_connect.bru** - 手动触发 VoWiFi 立即连接与重试
+- **get_vowifi_profile.bru** - 获取当前匹配的 VoWiFi 运营商配置详情
+- **get_vowifi_profiles.bru** - 获取系统支持的所有预设 VoWiFi 运营商配置
+- **get_vowifi_diagnostics.bru** - 获取 VoWiFi 诊断详细数据与时序监控数据
+- **get_vowifi_events.bru** - 获取 VoWiFi 运行日志流
+- **get_vowifi_soak.bru** - 获取 VoWiFi 稳定性压力测试运行记录
+- **get_vowifi_sms_delivery.bru** - 获取基于 IPsec 隧道的短信投递记录列表
+- **get_vowifi_esim_restore_status.bru** - 获取 eSIM 切卡与基带状态恢复的同步进度
+
+### VoLTE / ViLTE 接口
+- **get_volte_control.bru** - 获取 VoLTE 总开关及恢复状态
+- **get_volte_lines.bru** - 获取所有基带线路的 IMS 状态
+- **get_volte_line.bru** - 获取单条线路的 IMS 状态
+- **set_volte_line_connection.bru** - 开关单条线路的 IMS 连接
+- **retry_volte_line.bru** - 不切换开关，手动启动新的五轮 IMS 恢复批次
+- **get_vilte_control.bru** - 获取 ViLTE 视频转发开关
+- **set_vilte_feature.bru** - 开关 ViLTE 视频转发
+- **set_vilte_config.bru** - 设置 H.264 payload type 和 fmtp
+
+### Asterisk Trunk 接口
+- **get_trunk_lines.bru** - 获取所有线路的 Trunk 配置和运行快照
+- **get_trunk_line.bru** - 获取单条线路的 Trunk 配置和运行快照
+- **set_trunk_line.bru** - 保存 Trunk 配置（留空 `secret` 保持原密码）
+- **set_trunk_line_enabled.bru** - 开关单条线路的 Trunk
+- **get_trunk_runtime.bru** - 获取 Trunk runtime 诊断快照
+
 ## 使用方法
 
 1. **安装 Bruno**
@@ -164,6 +195,12 @@
 | GET | `/api/stats` | 综合系统统计（网速+内存+运行时间+系统信息） |
 | GET | `/api/stats/cpu` | CPU信息 |
 | GET | `/api/location/cell-info` | 基站定位参数 |
+| GET | `/api/volte/control` | VoLTE 总开关和恢复状态 |
+| GET | `/api/volte/lines` | VoLTE 线路列表 |
+| POST | `/api/volte/lines/{line_id}/retry` | 手动启动五轮 IMS 恢复 |
+| GET | `/api/trunk/lines` | Trunk 配置和 runtime 诊断 |
+| POST | `/api/trunk/lines/{line_id}` | 保存线路 Trunk 配置 |
+| POST | `/api/trunk/lines/{line_id}/enabled` | 开关线路 Trunk |
 | GET | `/api/network/interfaces` | 网络接口详情 |
 | GET | `/api/radio-mode` | 射频模式（Auto/LTE/NR） |
 | POST | `/api/radio-mode` | 设置射频模式 |
@@ -219,6 +256,18 @@
 | GET | `/api/notifications/config` | 获取多渠道通知配置 |
 | POST | `/api/notifications/config` | 设置多渠道通知配置 |
 | POST | `/api/notifications/test/:channel` | 测试指定通知渠道 |
+| GET | `/api/vowifi/status` | 获取 VoWiFi 连接状态 |
+| GET | `/api/vowifi/control` | 获取 VoWiFi 控制配置 |
+| POST | `/api/vowifi/feature` | 开启/关闭 VoWiFi 功能 |
+| POST | `/api/vowifi/connection` | 启用/停止 VoWiFi 隧道连接 |
+| POST | `/api/vowifi/connect` | 立即手动触发 VoWiFi 连接 |
+| GET | `/api/vowifi/profile` | 获取当前匹配的 VoWiFi 配置 |
+| GET | `/api/vowifi/profiles` | 列出所有 VoWiFi 预设配置 |
+| GET | `/api/vowifi/diagnostics` | 获取 VoWiFi 诊断详细数据 |
+| GET | `/api/vowifi/events` | 获取 VoWiFi 运行日志流 |
+| GET | `/api/vowifi/soak` | 获取 VoWiFi 稳定性压测记录 |
+| GET | `/api/vowifi/sms/delivery` | 获取 VoWiFi 短信投递日志 |
+| GET | `/api/vowifi/esim-restore/status` | 获取基带/eSIM 状态恢复进度 |
 
 ## USB 模式说明
 

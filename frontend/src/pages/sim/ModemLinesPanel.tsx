@@ -15,7 +15,7 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, FlightTakeoff, Lan, Refresh, Replay, SettingsEthernet, SimCard, TravelExplore, Wifi } from '@mui/icons-material'
+import { CellTower, FlightTakeoff, Lan, Refresh, Replay, SettingsEthernet, SimCard, SwapVert, TravelExplore, Wifi } from '@mui/icons-material'
 import {
   api,
   type LineNetworkControlsResponse,
@@ -28,6 +28,7 @@ import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
 import LineDetailsDialog, { type LineDetailTab } from './LineDetailsDialog'
 import DataProxyDialog from './DataProxyDialog'
+import { formatBytes } from '../Dashboard/utils'
 
 const stageLabels: Record<string, string> = {
   disabled: '未连接',
@@ -95,7 +96,7 @@ const vowifiStageLabels: Record<string, string> = {
   profile_matched: '运营商配置已匹配', sim_auth_ready: 'SIM AKA 已就绪',
   epdg_ready: 'ePDG 已连接', ike_ready: 'IKE 已建立', child_sa_ready: 'CHILD SA 已建立',
   esp_ready: 'ESP 数据通道已建立', ims_registered: 'IMS 已注册', sms_ready: '短信已就绪',
-  voice_ready: '语音已就绪', configuration_only: '等待独立运行时', not_started: '等待启动',
+  voice_ready: '语音已就绪', not_started: '等待启动',
 }
 
 function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
@@ -213,6 +214,22 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
       if (response.data) updateNetworkControl(response.data)
       await load(true)
       setSuccess(`${shortLineId(lineId)} 飞行模式已${enabled ? '开启，移动射频、数据与 VoLTE 已关闭' : '关闭'}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      await load(true)
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
+  const resetTraffic = async (lineId: string) => {
+    setSavingKey(`traffic:${lineId}`)
+    setError(null)
+    setSuccess(null)
+    try {
+      const response = await api.resetLineDataTraffic(lineId)
+      if (response.data) updateNetworkControl(response.data)
+      setSuccess(`${shortLineId(lineId)} 流量统计已清零`)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       await load(true)
@@ -372,6 +389,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
             const vowifiBusy = savingKey === `vowifi:${line.modem.line_id}`
             const trunkBusy = savingKey === `trunk:${line.modem.line_id}`
             const dataBusy = savingKey === `data:${line.modem.line_id}`
+            const trafficBusy = savingKey === `traffic:${line.modem.line_id}`
             const roamingBusy = savingKey === `roaming:${line.modem.line_id}`
             const airplaneBusy = savingKey === `airplane:${line.modem.line_id}`
             const trunkLine = trunkByLineId.get(line.modem.line_id)
@@ -494,6 +512,38 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           onChange={(_, enabled) => void toggleDataConnection(line.modem.line_id, enabled)}
                           disabled={!network || !line.modem.present || airplaneEnabled || savingKey !== null}
                         />
+                      </Box>
+                    </Box>
+
+                    {/* 该卡的流量用量（上下行分开统计，重启后仍累计） */}
+                    <Box order={3} display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
+                      <Box minWidth={0}>
+                        <Box display="flex" alignItems="center" gap={0.75}>
+                          <SwapVert color={network?.data.proxy.traffic_used ? 'primary' : 'disabled'} fontSize="small" />
+                          <Typography variant="body2" fontWeight={600}>流量用量</Typography>
+                        </Box>
+                        <Typography variant="caption" color="text.secondary" display="block" mt={0.25} sx={{ wordBreak: 'break-word' }}>
+                          {network?.data.proxy.traffic_used
+                            ? `上行 ${formatBytes(network.data.proxy.traffic.uplink_bytes)} · 下行 ${formatBytes(network.data.proxy.traffic.downlink_bytes)} · 连接 ${network.data.proxy.traffic.total_connections} 次${network.data.proxy.traffic.active_connections > 0 ? `（活跃 ${network.data.proxy.traffic.active_connections}）` : ''}`
+                            : '这张卡还没有走过流量'}
+                        </Typography>
+                      </Box>
+                      <Box display="flex" alignItems="center" gap={1}>
+                        <Chip
+                          size="small"
+                          label={network?.data.proxy.traffic_used ? formatBytes((network.data.proxy.traffic.uplink_bytes ?? 0) + (network.data.proxy.traffic.downlink_bytes ?? 0)) : '未使用'}
+                          color={network?.data.proxy.traffic_used ? 'primary' : 'default'}
+                          variant="outlined"
+                        />
+                        {trafficBusy && <CircularProgress size={18} />}
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => void resetTraffic(line.modem.line_id)}
+                          disabled={!network?.data.proxy.traffic_used || savingKey !== null}
+                        >
+                          清零
+                        </Button>
                       </Box>
                     </Box>
 

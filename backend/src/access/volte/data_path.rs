@@ -14,6 +14,14 @@ use super::errors::{code, VolteError};
 const QMI_TIMEOUT: Duration = Duration::from_secs(30);
 const IMS_APN: &str = "ims";
 
+/// Opt-in environment flag to re-enable the direct-QMI WDS preflight. Default
+/// (unset) keeps it OFF: the connect path is pure ModemManager, which avoids the
+/// `interface-in-use-config-match` QMI error that occurs when this preflight
+/// grabs a second WDS session on the same `/dev/wwan0qmi0` that ModemManager is
+/// already using. Set `SIMADMIN_VOLTE_WDS_PREFLIGHT=1` only on devices with a
+/// dedicated secondary QMI endpoint where the preflight is known to help.
+pub const WDS_PREFLIGHT_ENV: &str = "SIMADMIN_VOLTE_WDS_PREFLIGHT";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeResult {
     /// WDS returned an IPv6 address and gateway; SIP probing is intentionally
@@ -27,6 +35,21 @@ pub enum ProbeResult {
     /// `wds-start-network` on a nonexistent MUX port is pointless and, on some
     /// firmware, actively harmful (it can wedge the baseband).
     NoMuxEndpoint,
+    /// The preflight is disabled (the default). The connect path relies purely
+    /// on ModemManager to create the IMS bearer, so no direct-QMI WDS session is
+    /// opened and there is no contention with ModemManager's own QMI client.
+    Disabled,
+}
+
+/// Whether the direct-QMI WDS preflight is opted in via the environment.
+fn wds_preflight_enabled() -> bool {
+    std::env::var(WDS_PREFLIGHT_ENV)
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +90,13 @@ fn data_port_exists(data_port: &str) -> bool {
 /// potentially baseband-wedging — `wds-start-network` on a port that is not
 /// there.
 pub async fn probe_ims_ipv6(qmi_device: &str, cid_hint: u8) -> Result<ProbeResult, VolteError> {
+    // Default path is pure ModemManager: no direct-QMI WDS session is opened, so
+    // ModemManager keeps sole ownership of `/dev/wwan0qmi0` and there is no
+    // `interface-in-use-config-match` contention. The preflight only runs when
+    // explicitly opted in for a device with a dedicated secondary QMI endpoint.
+    if !wds_preflight_enabled() {
+        return Ok(ProbeResult::Disabled);
+    }
     let present: Vec<&ProbePath<'_>> = PROBE_PATHS
         .iter()
         .filter(|path| data_port_exists(path.data_port))
@@ -242,18 +272,36 @@ mod tests {
     }
 
     #[test]
-    fn absent_mux_endpoints_are_not_probed() {
-        // None of the reference MUX ports exist on a bam-dmux target (nor on
-        // the CI host), so the preflight must report NoMuxEndpoint without ever
-        // shelling out to qmicli.
-        assert!(!data_port_exists("a2-mux-rmnet0"));
-        assert!(!data_port_exists("a2-mux-rmnet1"));
+    fn preflight_is_disabled_by_default() {
+        // With the opt-in flag unset, the connect path is pure ModemManager and
+        // the preflight must report Disabled without touching qmicli or sysfs.
+        // (Guard against a stray env var from the surrounding shell.)
+        std::env::remove_var(WDS_PREFLIGHT_ENV);
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(probe_ims_ipv6("/dev/does-not-exist", 2));
-        assert_eq!(result, Ok(ProbeResult::NoMuxEndpoint));
+        assert_eq!(result, Ok(ProbeResult::Disabled));
+    }
+
+    #[test]
+    fn absent_mux_endpoints_are_not_probed_when_opted_in() {
+        // None of the reference MUX ports exist on a bam-dmux target (nor on
+        // the CI host), so once opted in the preflight reports NoMuxEndpoint
+        // without ever shelling out to qmicli.
+        assert!(!data_port_exists("a2-mux-rmnet0"));
+        assert!(!data_port_exists("a2-mux-rmnet1"));
+        assert!(wds_preflight_env_parses("1"));
+        assert!(wds_preflight_env_parses("true"));
+        assert!(!wds_preflight_env_parses("0"));
+    }
+
+    /// Pure parse check for the opt-in flag values (avoids mutating process env
+    /// in a way that could race other tests).
+    fn wds_preflight_env_parses(value: &str) -> bool {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
     }
 
     #[test]

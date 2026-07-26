@@ -51,6 +51,7 @@ use super::{
         configured_ims_cid, discover_pcscf, discover_pcscf_via_at_with_context, pcscf_socket,
         ImsAtContextLease,
     },
+    plan::{FailureClass, ImsConnectionPlan},
     rtp_relay::{ActiveRtpRelay, PayloadTypeMapping, PendingRtpRelay},
     runtime::{RegistrationMode, VoltePhase, VolteRuntime, VolteRuntimeStatus, VolteStage},
     sip::{self, ImsIdentity, RequestIds},
@@ -472,11 +473,11 @@ pub async fn connect_live_for_line(
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
 ) -> Result<VolteRuntimeStatus, VolteError> {
-    // Per-line connection intent is authoritative. `feature_enabled` is kept
-    // only for compatibility with older configuration files and APIs.
-    if !config.connection_enabled {
-        return Err(VolteError::new(code::RUNTIME_NOT_RUNNING));
-    }
+    // Per-line connection intent is authoritative: the caller has already
+    // verified `profile.enabled && profile.volte_connection_enabled` for this
+    // physical line. The legacy global `VolteConfig::connection_enabled`
+    // (and `feature_enabled`/`sms_enabled`) are no longer consulted here; they
+    // are retained only for backward-compatible config/API serialization.
     let _advance = runtime.advance_guard().await;
     if live.session.lock().await.is_some() {
         return Ok(runtime.status().await);
@@ -491,6 +492,8 @@ pub async fn connect_live_for_line(
             state.qmi_device = Some(device.qmi_device.clone());
             state.bearer_interface = None;
             state.bearer_ip_type = None;
+            state.bearer_path = None;
+            state.at_cid = None;
             state.current_ip_family = None;
             state.connection_attempts.clear();
         })
@@ -552,6 +555,10 @@ async fn connect_inner(
     device: &VolteDeviceBinding,
     family_pref: VolteIpFamilyPreference,
 ) -> Result<VolteLiveSession, VolteError> {
+    // Build the canonical connection plan from the configured preference. All
+    // four family-selection consumers (AT probe order, bearer fallback, IPv6
+    // preflight hint, SIP local-address order) now derive from this one object.
+    let plan = ImsConnectionPlan::from_preference(family_pref);
     let mut device = resolve_device_binding(device).await?;
     runtime
         .update(|state| state.stage = VolteStage::Identity)
@@ -586,7 +593,7 @@ async fn connect_inner(
     // to the bearer and rely on its PCO. The CID hint for the IPv6 preflight comes
     // from the probe when it succeeds, else from the configured/default IMS CID.
     let (at_pcscf, mut at_context, ims_cid) =
-        match discover_pcscf_via_at_with_context(&device.modem_id, family_pref).await {
+        match discover_pcscf_via_at_with_context(&device.modem_id, &plan).await {
             Ok(discovery) => {
                 runtime
                     .record_attempt(
@@ -616,6 +623,9 @@ async fn connect_inner(
                 (Vec::new(), None, configured_ims_cid())
             }
         };
+    // Record the resolved IMS CID so every subsequent attempt row carries it as
+    // a structured field (auto-captured by `record_attempt`).
+    runtime.update(|state| state.at_cid = Some(ims_cid)).await;
     if let Err(error) = ensure_generation(runtime, generation) {
         if let Some(context) = at_context.take() {
             context.cleanup().await;
@@ -636,6 +646,24 @@ async fn connect_inner(
         .update(|state| state.stage = VolteStage::Ipv6Preflight)
         .await;
     match probe_ims_ipv6(&device.qmi_device, ims_cid).await {
+        Ok(ProbeResult::Disabled) => {
+            // Default: pure ModemManager path. No direct-QMI WDS session is
+            // opened, so ModemManager keeps sole ownership of the QMI control
+            // port and there is no `interface-in-use-config-match` contention.
+            // The IMS bearer (and its P-CSCF PCO) comes from ModemManager next.
+            runtime
+                .record_attempt(
+                    VolteStage::Ipv6Preflight,
+                    Some("ipv6"),
+                    "skipped",
+                    None,
+                    Some("wds_preflight_disabled_managed_mm".to_string()),
+                )
+                .await;
+            tracing::info!(
+                "VoLTE IMS IPv6 WDS preflight disabled; using ModemManager-managed bearer"
+            );
+        }
         Ok(ProbeResult::NoMuxEndpoint) => {
             // bam-dmux devices have no MUX data port; the WDS preflight is a
             // deliberate no-op here so we never issue a wds-start-network on a
@@ -680,10 +708,14 @@ async fn connect_inner(
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
     let request = BearerRequest::default();
-    let mut bearer = match ensure_bearer_with_runtime(runtime, &device.modem_id, &request).await {
+    let mut bearer = match ensure_bearer_with_runtime(runtime, &device.modem_id, &request, &plan)
+        .await
+    {
         Ok(bearer) => bearer,
         Err(error)
-            if at_context.is_some() && should_retry_bearer_after_at_context_cleanup(&error) =>
+            if at_context.is_some()
+                && FailureClass::from_details(error.detail().unwrap_or(""))
+                    == FailureClass::PrefixUnavailable =>
         {
             tracing::warn!(
                 error = %error,
@@ -693,7 +725,7 @@ async fn connect_inner(
                 context.cleanup().await;
             }
             device = resolve_device_binding(&device).await?;
-            ensure_bearer_with_runtime(runtime, &device.modem_id, &request).await?
+            ensure_bearer_with_runtime(runtime, &device.modem_id, &request, &plan).await?
         }
         Err(error) => {
             if let Some(context) = at_context.take() {
@@ -713,6 +745,7 @@ async fn connect_inner(
                 state.stage = VolteStage::IpConfig;
                 state.bearer_interface = Some(bearer.interface.clone());
                 state.bearer_ip_type = Some(bearer.ip_type.clone());
+                state.bearer_path = Some(bearer.path.clone());
             })
             .await;
         if let Err(error) = configure_bearer_network(&bearer).await {
@@ -737,14 +770,14 @@ async fn connect_inner(
             )
             .await;
         ensure_generation(runtime, generation)?;
-        let local_addrs = bearer.settings.ordered_local_addrs(family_pref);
+        let local_addrs = bearer.settings.ordered_local_addrs(&plan);
         if local_addrs.is_empty() {
             // The bearer connected but carries no address in a family the
             // configured preference admits (e.g. an ipv4-only preference on an
             // IPv6-only bearer). This is a family-support mismatch, not a
             // generic missing-settings error.
-            let has_any_addr = bearer.settings.ipv4_address.is_some()
-                || bearer.settings.ipv6_address.is_some();
+            let has_any_addr =
+                bearer.settings.ipv4_address.is_some() || bearer.settings.ipv6_address.is_some();
             let code = if has_any_addr {
                 code::RUNTIME_IMS_FAMILY_UNSUPPORTED
             } else {
@@ -775,7 +808,10 @@ async fn connect_inner(
                         .await;
                     return Ok(session);
                 }
-                Err(error) if index + 1 < local_addrs.len() && should_try_next_family(&error) => {
+                Err(error)
+                    if index + 1 < local_addrs.len()
+                        && FailureClass::from_error(&error).is_retryable_family() =>
+                {
                     runtime
                         .record_attempt(
                             VolteStage::Pcscf,
@@ -830,9 +866,10 @@ async fn ensure_bearer_with_runtime(
     runtime: &VolteRuntime,
     modem_id: &str,
     request: &BearerRequest,
+    plan: &ImsConnectionPlan,
 ) -> Result<BearerConnection, VolteError> {
     let observed_runtime = runtime.clone();
-    ensure_ims_bearer_observed(modem_id, request, move |attempt: BearerAttempt| {
+    ensure_ims_bearer_observed(modem_id, request, plan, move |attempt: BearerAttempt| {
         let runtime = observed_runtime.clone();
         async move {
             let stage = bearer_stage(&attempt.ip_type);
@@ -3173,24 +3210,6 @@ fn map_register_error(error: ImsError) -> VolteError {
     VolteError::with_detail(stage, error.code())
 }
 
-fn should_try_next_family(error: &VolteError) -> bool {
-    matches!(
-        error.code(),
-        code::RUNTIME_ALL_PCSCF_FAILED
-            | code::PCSCF_FAMILY_MISMATCH
-            | code::IPSEC_UDP_BIND_FAILED
-            | code::REGISTER_INITIAL_UNEXPECTED_STATUS
-            | code::COMMAND_FAILED
-    )
-}
-
-fn should_retry_bearer_after_at_context_cleanup(error: &VolteError) -> bool {
-    error.code() == code::RUNTIME_MM_BEARER_CONNECT_FAILED
-        && error
-            .detail()
-            .is_some_and(|detail| detail.contains("prefix-unavailable"))
-}
-
 fn ip_family_name(address: IpAddr) -> &'static str {
     if address.is_ipv6() {
         "ipv6"
@@ -3252,16 +3271,26 @@ mod tests {
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
             "volte_command_failed:mmcli:prefix-unavailable",
         );
-        assert!(should_retry_bearer_after_at_context_cleanup(&prefix));
-
+        assert_eq!(
+            FailureClass::from_details(prefix.detail().unwrap_or("")),
+            FailureClass::PrefixUnavailable
+        );
         let generic = VolteError::with_detail(
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
             "volte_command_failed:mmcli:operation-failed",
         );
-        assert!(!should_retry_bearer_after_at_context_cleanup(&generic));
-        assert!(!should_retry_bearer_after_at_context_cleanup(
-            &VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)
-        ));
+        assert_ne!(
+            FailureClass::from_details(generic.detail().unwrap_or("")),
+            FailureClass::PrefixUnavailable
+        );
+        assert_ne!(
+            FailureClass::from_details(
+                VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)
+                    .detail()
+                    .unwrap_or("")
+            ),
+            FailureClass::PrefixUnavailable
+        );
     }
 
     #[test]
@@ -3349,18 +3378,22 @@ mod tests {
 
     #[test]
     fn family_fallback_is_limited_to_discovery_and_initial_transport_failures() {
-        assert!(should_try_next_family(&VolteError::new(
-            code::RUNTIME_ALL_PCSCF_FAILED
-        )));
-        assert!(should_try_next_family(&VolteError::new(
+        assert!(
+            FailureClass::from_error(&VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+                .is_retryable_family()
+        );
+        assert!(FailureClass::from_error(&VolteError::new(
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
-        )));
-        assert!(!should_try_next_family(&VolteError::new(
-            code::REGISTER_AUTH_UNEXPECTED_STATUS
-        )));
-        assert!(!should_try_next_family(&VolteError::new(
-            code::USIM_AKA_FAILED
-        )));
+        ))
+        .is_retryable_family());
+        assert!(
+            !FailureClass::from_error(&VolteError::new(code::REGISTER_AUTH_UNEXPECTED_STATUS))
+                .is_retryable_family()
+        );
+        assert!(
+            !FailureClass::from_error(&VolteError::new(code::USIM_AKA_FAILED))
+                .is_retryable_family()
+        );
         assert_eq!(ip_family_name("2001:db8::1".parse().unwrap()), "ipv6");
         assert_eq!(ip_family_name("192.0.2.1".parse().unwrap()), "ipv4");
     }

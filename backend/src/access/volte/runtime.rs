@@ -88,6 +88,20 @@ pub struct VolteConnectionAttempt {
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Structured context captured from the runtime snapshot at the instant this
+    /// attempt was recorded, so the Web UI can show exactly "where and with what"
+    /// a step failed without parsing the free-text `detail`. Each is skipped when
+    /// not yet known at that point in the connect flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_cid: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qmi_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pcscf: Option<String>,
     pub at: String,
 }
 
@@ -179,9 +193,19 @@ pub struct VolteSnapshot {
     pub reconnect_count: u64,
     pub register_refresh_count: u64,
     pub data_path_mode: Option<String>,
+    /// Primary QMI control port for this line — what ModemManager uses for normal
+    /// mobile data.
     pub qmi_device: Option<String>,
+    /// Dedicated QMI endpoint carrying this line's IMS/VoLTE session, when one is
+    /// prepared. Always belongs to the same baseband as `qmi_device` (paired by
+    /// sysfs ancestor), so multi-baseband hosts never cross wires.
+    pub secondary_qmi_device: Option<String>,
+    /// rpmsg channel backing `secondary_qmi_device`, e.g. `DATA6_CNTL`.
+    pub secondary_qmi_channel: Option<String>,
     pub bearer_interface: Option<String>,
     pub bearer_ip_type: Option<String>,
+    pub bearer_path: Option<String>,
+    pub at_cid: Option<u8>,
     pub current_ip_family: Option<String>,
     pub identity_source: Option<String>,
     pub usim_aid: Option<String>,
@@ -218,7 +242,11 @@ impl Default for VolteSnapshot {
             register_refresh_count: 0,
             data_path_mode: None,
             qmi_device: None,
+            secondary_qmi_device: None,
+            secondary_qmi_channel: None,
+            at_cid: None,
             bearer_interface: None,
+            bearer_path: None,
             bearer_ip_type: None,
             current_ip_family: None,
             identity_source: None,
@@ -279,6 +307,10 @@ pub struct VolteRuntimeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qmi_device: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_qmi_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_qmi_channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bearer_interface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bearer_ip_type: Option<String>,
@@ -324,6 +356,8 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             register_refresh_count: s.register_refresh_count,
             data_path_mode: s.data_path_mode.clone(),
             qmi_device: s.qmi_device.clone(),
+            secondary_qmi_device: s.secondary_qmi_device.clone(),
+            secondary_qmi_channel: s.secondary_qmi_channel.clone(),
             bearer_interface: s.bearer_interface.clone(),
             bearer_ip_type: s.bearer_ip_type.clone(),
             current_ip_family: s.current_ip_family.clone(),
@@ -403,6 +437,15 @@ impl VolteRuntime {
                 .connection_attempts
                 .last()
                 .map_or(1, |attempt| attempt.sequence.saturating_add(1));
+            // Auto-capture the structured context that the snapshot already
+            // tracks at record time, so each attempt row carries the AT CID,
+            // QMI device, bearer path/interface and P-CSCF as first-class
+            // fields instead of smuggling them inside the free-text `detail`.
+            let at_cid = snapshot.at_cid;
+            let qmi_device = snapshot.qmi_device.clone();
+            let bearer_path = snapshot.bearer_path.clone();
+            let bearer_interface = snapshot.bearer_interface.clone();
+            let pcscf = snapshot.pcscf.clone();
             snapshot.connection_attempts.push(VolteConnectionAttempt {
                 sequence,
                 stage: stage.as_str().to_string(),
@@ -411,6 +454,11 @@ impl VolteRuntime {
                 error_code: error.map(|error| error.code().to_string()),
                 detail: detail
                     .or_else(|| error.and_then(|error| error.detail().map(str::to_string))),
+                at_cid,
+                qmi_device,
+                bearer_path,
+                interface: bearer_interface,
+                pcscf,
                 at: chrono::Utc::now().to_rfc3339(),
             });
             if snapshot.connection_attempts.len() > MAX_CONNECTION_ATTEMPTS {

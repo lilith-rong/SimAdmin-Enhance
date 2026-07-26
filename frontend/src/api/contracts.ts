@@ -233,12 +233,9 @@ export interface RoamingResponse {
   is_roaming: boolean
 }
 
+/** Body of the per-line roaming toggle; there is no device-wide equivalent. */
 export interface RoamingRequest {
   allowed: boolean
-}
-
-export interface AirplaneModeRequest {
-  enabled: boolean
 }
 
 export interface AirplaneModeResponse {
@@ -408,6 +405,8 @@ export interface CellLockRequest {
   lock_type?: number
   pci?: number
   arfcn?: number
+  /** Omitted means the primary line. */
+  line_id?: string
 }
 
 export interface CellLockResult {
@@ -460,7 +459,22 @@ export interface VolteConnectionAttempt {
   outcome: 'started' | 'succeeded' | 'failed' | string
   error_code?: string
   detail?: string
+  at_cid?: number
+  qmi_device?: string
+  bearer_path?: string
+  interface?: string
+  pcscf?: string
   at: string
+}
+
+/** A line's QMI endpoint pair. Both entries always belong to the same baseband. */
+export interface VolteQmiEndpoints {
+  /** Primary control port — ModemManager uses this for normal mobile data. */
+  primary?: string
+  /** Dedicated endpoint carrying IMS/VoLTE, when one has been prepared. */
+  secondary?: string
+  /** rpmsg channel backing the secondary endpoint, e.g. DATA6_CNTL. */
+  secondary_channel?: string
 }
 
 export interface VolteRuntimeStatus {
@@ -483,7 +497,12 @@ export interface VolteRuntimeStatus {
   reconnect_count: number
   register_refresh_count: number
   data_path_mode?: string
+  /** Primary QMI control port — ModemManager uses this for normal mobile data. */
   qmi_device?: string
+  /** Dedicated QMI endpoint carrying IMS/VoLTE; same baseband as qmi_device. */
+  secondary_qmi_device?: string
+  /** rpmsg channel backing the secondary endpoint, e.g. DATA6_CNTL. */
+  secondary_qmi_channel?: string
   bearer_interface?: string
   bearer_ip_type?: string
   current_ip_family?: string
@@ -596,10 +615,179 @@ export interface DataProxyStatus {
   protocols: string[]
   auth_required?: boolean
   last_error?: string | null
+  /** Cumulative traffic, surviving restarts. */
+  traffic: DataProxyTraffic
+  /** Whether this SIM has carried any proxied traffic at all. */
+  traffic_used: boolean
+}
+
+// ===================== VoWiFi carrier profile database =====================
+
+export interface CarrierProfileMetaRecord {
+  profile_id: string
+  mcc: string
+  mnc: string
+  mnc_len: number
+  plmn: string
+  country_iso2: string
+  brand: string
+  operator_legal_name: string
+  aliases: string[]
+  source_refs: string[]
+  last_verified: string
+}
+
+export interface ProfileIdentityPolicyRecord {
+  device_model_hint: string
+  spoof_imei: boolean
+  /** Present a device identity (IMEI) during IKE_AUTH. */
+  device_identity_enabled: boolean
+  /** null = use the modem's own IMEI. */
+  device_identity_imei: string | null
+}
+
+export interface EpdgPolicyRecord {
+  host: string
+  port: number
+  apn: string | null
+  ip_stack: 'ipv4' | 'ipv6' | 'ipv4v6'
+  dns_server: string | null
+  /** Ordered DNS servers tried in turn when resolving the ePDG. */
+  dns_servers: string[]
+}
+
+export interface Ikev2PolicyRecord {
+  nat_keepalive_seconds: number
+  dpd_interval_seconds: number
+  reauth_interval_seconds: number | null
+  ike_proposals: string[]
+  esp_proposals: string[]
+  aka_challenge_mode: string
+  include_epdg_idr: boolean
+}
+
+export interface RegisterPolicyRecord {
+  supported_header: string
+  include_pani_authenticated: boolean
+  strict_security_server_offer: boolean
+  enable_initial_reject_fallback: boolean
+  use_plain_digest_placeholder: boolean
+  require_sec_agree_headers: boolean
+  sec_agree_mode: 'auto' | 'required' | 'disabled'
+  security_client_mechanisms: string[]
+  live_header_variant_set: string
+  expires_seconds: number
+  access_network_info: string
+  contact_mode: 'android_default' | 'legacy'
+  contact_param_order: string[]
+  temporary_status_codes: number[]
+  forbidden_status_codes: number[]
+  initial_reject_fallback_status_codes: number[]
+  temporary_retry_seconds: number
+}
+
+export interface ImsPolicyRecord {
+  domain: string
+  realm: string
+  registrar: string | null
+  pcscf: string | null
+  transport: string
+  local_port: number
+  user_agent: string
+  identity_source: string
+  tcp_keepalive_seconds: number
+  options_ping_interval_seconds: number
+  register: RegisterPolicyRecord
+}
+
+export interface SmsPolicyRecord {
+  receiver_transport: string
+  smsc_auth_required: boolean
+}
+
+export interface VoicePolicyRecord {
+  vowifi_enabled: boolean
+  carrier_fallback_enabled: boolean
+  preferred_codecs: string[]
+  amr_octet_align: boolean
+  ptime_ms: number
+  sip_endpoint_exposed: boolean
+}
+
+export interface E911PolicyRecord {
+  enabled: boolean
+  provider: string | null
+  entitlement_url: string | null
+  websheet_host_policy: string | null
+}
+
+export interface CarrierProfileRecord {
+  meta: CarrierProfileMetaRecord
+  identity: ProfileIdentityPolicyRecord
+  epdg: EpdgPolicyRecord
+  ikev2: Ikev2PolicyRecord
+  ims: ImsPolicyRecord
+  sms: SmsPolicyRecord
+  voice: VoicePolicyRecord
+  e911: E911PolicyRecord
+}
+
+/** Where a resolved profile came from. */
+export type ProfileOrigin = 'database' | 'builtin' | 'derived'
+
+export interface StoredCarrierProfile {
+  profile_id: string
+  plmn: string
+  /** `builtin`, `manual`, `aosp_apns`, `ipcc`, … */
+  source: string
+  updated_at: string
+  record: CarrierProfileRecord
+}
+
+export interface ResolvedCarrierProfile {
+  origin: ProfileOrigin
+  /** Whether emergency configuration is expected for this carrier's country. */
+  e911_expected: boolean
+  record: CarrierProfileRecord
+}
+
+export type CarrierProfileImportFormat = 'aosp_apns' | 'aosp_carrier_config' | 'ipcc'
+
+export interface CarrierProfileImportRequest {
+  format: CarrierProfileImportFormat
+  content: string
+  mcc?: string
+  mnc?: string
+  dry_run?: boolean
+}
+
+export interface CarrierProfileImportResult {
+  dry_run: boolean
+  imported: Array<{
+    profile_id: string
+    plmn: string
+    brand: string
+    ims_apn: string | null
+    vowifi_supported: boolean | null
+    e911_expected: boolean
+  }>
+  skipped: Array<{ plmn: string; reason: string }>
+}
+
+/** Traffic one line's proxy has carried, from the SIM's point of view. */
+export interface DataProxyTraffic {
+  /** Bytes sent out through this SIM. */
+  uplink_bytes: number
+  /** Bytes received on this SIM. */
+  downlink_bytes: number
+  total_connections: number
+  active_connections: number
 }
 
 export interface LineNetworkControlsResponse {
   line_id: string
+  /** Human-readable slot name for labelling per-line state. */
+  slot_label: string
   modem_path: string
   present: boolean
   data: {
@@ -616,7 +804,12 @@ export interface LineNetworkControlsResponse {
   airplane_stage: string
 }
 
-export type VowifiProxyMode = 'direct' | 'socks5_udp_associate' | 'connect_udp_masque' | 'udp_relay'
+/**
+ * Transports able to carry IKEv2/NAT-T (UDP 500/4500).
+ * Plain HTTP CONNECT is absent (TCP-only); MASQUE/Connect-UDP was removed because
+ * no reachable deployment can target an operator ePDG at an arbitrary host:port.
+ */
+export type VowifiProxyMode = 'direct' | 'socks5_udp_associate' | 'udp_relay'
 
 export interface LineVowifiConfig {
   enabled: boolean
@@ -847,6 +1040,8 @@ export interface OperatorListResponse {
 
 export interface ManualRegisterRequest {
   mccmnc: string
+  /** Omitted means the primary line. */
+  line_id?: string
 }
 
 export interface ApnContext {
@@ -872,6 +1067,8 @@ export interface SetApnRequest {
   username?: string
   password?: string
   auth_method?: string
+  /** Omitted means the primary line, and only then is the global APN written. */
+  line_id?: string
 }
 
 export interface PingResult {

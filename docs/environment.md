@@ -11,7 +11,8 @@
   - `NetworkManager` 和 `nmcli`
   - `qmicli`（用于基站定位/网络小区信息兜底读取）
   - `iptables` / `ip6tables`（仅用于网络通路只读诊断；本程序不会自动修改或清空防火墙规则）
-  - `ip` / `ifconfig` / `route`（用于网络状态诊断，其中 `ifconfig` 和 `route` 需确保系统已安装 `net-tools`）
+  - `ip` / `ifconfig` / `route`（用于配置 VoWiFi 虚拟 TUN 网关与路由，其中 `ifconfig` 和 `route` 需确保系统已安装 `net-tools`）
+  - `/dev/net/tun` 设备支持（VoWiFi 用户态 IPsec 报文传输必需）
   - `tar`（OTA 包解压必需）
   - `unzip` / `busybox unzip` / `python3`（用于自动解压及下载的 `lpac`；`unzip` 也用于手动上传 zip 格式 OTA 包）
 - **eSIM 芯片管理**：eSIM 模式下的芯片/配置管理依赖开源的 `lpac` 辅助程序。
@@ -47,6 +48,17 @@
   - 一键安装脚本 `install_latest.sh` 会根据 `uname -m` 和 glibc 版本，优先匹配架构并拉取 ESTK 的 `lpac` 静态编译程序至 `/opt/simadmin/lpac/lpac`。如果系统已存在可用版本则跳过下载。如果需要阻止脚本下载，请在安装时设置环境变量 `SIMADMIN_INSTALL_LPAC=0`。
   - 单独手动应用 OTA 包**不会**自动安装或升级 `lpac`。
   - 若系统检测到有 eSIM 支持却缺失 `lpac`，管理页面会提供「安装/修复 lpac」的便捷入口。其内部修复逻辑由后端内置 zip 解压引擎在内存中运行完成，不依赖外部环境命令。
+
+---
+
+## WiFi Calling (VoWiFi) 运行管理
+
+本项目实现了 WiFi Calling 核心协议能力，无需额外安装其他后台程序即可使用。
+
+* **开启 WiFi Calling**：系统会在后台自动启动服务，通过设备的有线网卡或 WiFi 网络与运营商服务器建立加密安全隧道，并借助卡槽内实体 SIM 卡或 eSIM 的硬件鉴权能力完成身份验证。隧道建立成功后，系统会自动配置虚拟网络通道（如 `simadmin-vowifi-tun0`）与专属路由，短信与网络注册流量将通过加密隧道传输。即使设备无蜂窝信号，或是飞行模式下仅连接局域网，也可以正常收发短信。有蜂窝信号时无需开启飞行模式，也可以正常使用 WiFi Calling。
+* **关闭 WiFi Calling**：所有加密隧道与相关网络任务会全部释放，虚拟网卡同步销毁，不会常驻占用系统网络接口与内存资源。
+
+---
 
 ## systemd 服务配置说明
 

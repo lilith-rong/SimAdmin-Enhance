@@ -8,4 +8,5 @@
 pub mod cell_lock_store;
 pub mod data_proxy;
 pub mod modem_manager;
+pub mod secondary_qmi;
 pub mod serial;

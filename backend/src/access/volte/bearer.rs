@@ -19,6 +19,7 @@ use tokio::process::Command;
 use super::{
     errors::{code, VolteError},
     pcscf::ImsIpSettings,
+    plan::{FailureClass, ImsConnectionPlan, IpType},
 };
 
 /// The IMS APN used for the dedicated IMS bearer.
@@ -120,21 +121,24 @@ pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteE
 }
 
 /// Create or reuse an `apn=ims` ModemManager bearer and connect it. Existing
-/// non-IMS bearers are never changed or deleted. New sessions always request
-/// dual-stack first. An explicit `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed` response
-/// jumps directly to the required family; otherwise IPv4 then IPv6 are tried
-/// once each. Every failed temporary bearer is deleted before the next bounded
-/// attempt.
+/// non-IMS bearers are never changed or deleted. The plan determines the initial
+/// attempt type (dual-stack for `*First` modes) and the preference-ordered
+/// single-family fallbacks — so `Ipv6First` now falls back v6→v4 rather than
+/// always v4→v6. An explicit `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed` response from
+/// the network still collapses the fallback to that one family, regardless of
+/// preference. Every failed temporary bearer is deleted before the next attempt.
 pub async fn ensure_ims_bearer(
     modem: &str,
     request: &BearerRequest,
+    plan: &ImsConnectionPlan,
 ) -> Result<BearerConnection, VolteError> {
-    ensure_ims_bearer_observed(modem, request, |_| async {}).await
+    ensure_ims_bearer_observed(modem, request, plan, |_| async {}).await
 }
 
 pub async fn ensure_ims_bearer_observed<F, Fut>(
     modem: &str,
     request: &BearerRequest,
+    plan: &ImsConnectionPlan,
     mut observe: F,
 ) -> Result<BearerConnection, VolteError>
 where
@@ -210,7 +214,13 @@ where
                         let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
                             .await
                             .unwrap_or_default();
-                        required_fallback = required_ip_type_after_failure(&after);
+                        required_fallback =
+                            FailureClass::from_details(&after)
+                                .forced_family()
+                                .map(|f| match f {
+                                    crate::access::volte::plan::IpFamily::Ipv6 => IpType::Ipv6,
+                                    crate::access::volte::plan::IpFamily::Ipv4 => IpType::Ipv4,
+                                });
                         observe(BearerAttempt {
                             ip_type: "ipv4v6".to_string(),
                             source: "reconnected".to_string(),
@@ -229,10 +239,16 @@ where
         }
     }
 
-    let mut pending = required_fallback
-        .map(|ip_type| VecDeque::from([ip_type]))
-        .unwrap_or_else(|| VecDeque::from(["ipv4v6"]));
-    let mut attempted = Vec::with_capacity(3);
+    // Seed the attempt queue from the plan. If an earlier reconnect already
+    // forced a single family (network told us v4-only or v6-only), collapse
+    // directly to that; otherwise start with the plan's initial type.
+    let initial: &'static str = match required_fallback {
+        Some(IpType::Ipv6) => "ipv6",
+        Some(IpType::Ipv4) => "ipv4",
+        _ => plan.initial_bearer_attempt().as_mm_str(),
+    };
+    let mut pending: VecDeque<&'static str> = VecDeque::from([initial]);
+    let mut attempted: Vec<&'static str> = Vec::with_capacity(3);
     while let Some(ip_type) = pending.pop_front() {
         if attempted.contains(&ip_type) {
             continue;
@@ -265,8 +281,14 @@ where
                 })
                 .await;
                 last_error = Some(failure.error);
+                // Only fan out into single-family fallbacks after a dual-stack
+                // attempt fails. Single-family failures are terminal for that
+                // family; the plan already decided the order.
                 if ip_type == "ipv4v6" {
-                    pending.extend(fallback_ip_types(&failure.details));
+                    let class = FailureClass::from_details(&failure.details);
+                    for fallback in plan.bearer_fallbacks_after(class) {
+                        pending.push_back(fallback.as_mm_str());
+                    }
                 }
             }
         }
@@ -328,31 +350,6 @@ async fn delete_bearer(modem: &str, path: &str) -> Result<(), VolteError> {
     run_command("mmcli", &["-m", modem, &format!("--delete-bearer={path}")])
         .await
         .map(|_| ())
-}
-
-fn required_ip_type_after_failure(details: &str) -> Option<&'static str> {
-    let error = value(details, "bearer.status.connection-error.name")
-        .unwrap_or_else(|| details.to_string())
-        .to_ascii_lowercase();
-    if error.contains("ipv6onlyallowed")
-        || error.contains("ipv6-only-allowed")
-        || error.contains("only ipv6 allowed")
-    {
-        Some("ipv6")
-    } else if error.contains("ipv4onlyallowed")
-        || error.contains("ipv4-only-allowed")
-        || error.contains("only ipv4 allowed")
-    {
-        Some("ipv4")
-    } else {
-        None
-    }
-}
-
-fn fallback_ip_types(details: &str) -> Vec<&'static str> {
-    required_ip_type_after_failure(details)
-        .map(|ip_type| vec![ip_type])
-        .unwrap_or_else(|| vec!["ipv4", "ipv6"])
 }
 
 /// Disconnect an IMS bearer left active by a previous process before the
@@ -680,16 +677,40 @@ mod tests {
 
     #[test]
     fn network_family_rejection_selects_required_bearer_type() {
+        use crate::access::volte::plan::{FailureClass, ImsConnectionPlan};
+        use crate::infra::config::VolteIpFamilyPreference;
+        let plan_v6 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First);
+        let plan_v4 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);
         let ipv6 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed\n";
-        assert_eq!(required_ip_type_after_failure(ipv6), Some("ipv6"));
+        assert_eq!(
+            FailureClass::from_details(ipv6),
+            FailureClass::NetworkForcedIpv6
+        );
         let ipv4 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv4OnlyAllowed\n";
-        assert_eq!(required_ip_type_after_failure(ipv4), Some("ipv4"));
+        assert_eq!(
+            FailureClass::from_details(ipv4),
+            FailureClass::NetworkForcedIpv4
+        );
         let generic = "bearer.status.connection-error.name : org.example.Failed\n";
-        assert_eq!(required_ip_type_after_failure(generic), None);
-        assert_eq!(fallback_ip_types(ipv6), vec!["ipv6"]);
-        assert_eq!(fallback_ip_types(ipv4), vec!["ipv4"]);
-        assert_eq!(fallback_ip_types(generic), vec!["ipv4", "ipv6"]);
-        assert_eq!(fallback_ip_types(""), vec!["ipv4", "ipv6"]);
+        assert_eq!(FailureClass::from_details(generic), FailureClass::Other);
+        // Forced families collapse to a single type regardless of preference.
+        assert_eq!(
+            plan_v4.bearer_fallbacks_after(FailureClass::from_details(ipv6)),
+            vec![super::IpType::Ipv6]
+        );
+        assert_eq!(
+            plan_v6.bearer_fallbacks_after(FailureClass::from_details(ipv4)),
+            vec![super::IpType::Ipv4]
+        );
+        // Generic failure respects preference order.
+        assert_eq!(
+            plan_v4.bearer_fallbacks_after(FailureClass::from_details(generic)),
+            vec![super::IpType::Ipv4, super::IpType::Ipv6]
+        );
+        assert_eq!(
+            plan_v6.bearer_fallbacks_after(FailureClass::from_details(generic)),
+            vec![super::IpType::Ipv6, super::IpType::Ipv4]
+        );
     }
 
     #[test]
