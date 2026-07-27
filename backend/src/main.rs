@@ -188,14 +188,23 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
     }
 }
 
-/// 解压 ZIP 文件到指定目录（供安装脚本使用，无需依赖 unzip / python3）
-/// Prepare each baseband's secondary QMI endpoint for IMS/VoLTE.
+/// Prepare each baseband's secondary QMI endpoint, and hide every spare QMI port
+/// from ModemManager.
 ///
 /// Intended to run before ModemManager starts. For every discovered modem this
-/// binds a spare QMI channel belonging to *that* baseband, verifies it really
-/// speaks QMI (`wds` present), and writes a udev rule so ModemManager leaves the
-/// endpoint alone. Endpoint state is published under `/run/simadmin/` so the
-/// service can pick it up without re-probing.
+/// binds a spare QMI channel belonging to *that* baseband and verifies it really
+/// speaks QMI (`wds` present). Endpoint state is published under `/run/simadmin/`
+/// so the service can pick it up without re-probing.
+///
+/// Note on roles: the secondary endpoint is for the *data* bearer, not IMS. On
+/// the reference firmware a secondary rpmsg endpoint cannot hold a WDS CID across
+/// processes, and the IMS flow needs exactly that (allocate CID → start-network →
+/// read P-CSCF). IMS therefore runs on the primary port through `qmi-proxy`,
+/// which multiplexes it alongside ModemManager. See `cellular::qmi_wds`.
+///
+/// The udev rules cover *every* spare QMI port, not just the one bound here:
+/// the kernel module publishes one port per registered channel, and any spare
+/// left visible gets claimed by ModemManager as an extra modem port.
 async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<()> {
     use cellular::secondary_qmi;
 

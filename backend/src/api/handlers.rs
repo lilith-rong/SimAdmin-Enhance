@@ -6540,6 +6540,32 @@ async fn run_line_volte_restore_batch(
             }
             Err(error) => {
                 warn!(line_id = %binding.line_id, attempt, source, error = %error, "VoLTE IMS restore attempt failed");
+                // A wedged baseband must not be retried. Re-issuing IMS PDP
+                // activation against it can escalate to a modem subsystem
+                // restart and take the whole device down, so stop the batch and
+                // wait for an explicit operator retry instead.
+                if crate::access::volte::plan::FailureClass::from_details(
+                    error.detail().unwrap_or_default(),
+                ) == crate::access::volte::plan::FailureClass::BasebandWedged
+                {
+                    warn!(
+                        line_id = %binding.line_id,
+                        error = %error,
+                        "VoLTE IMS restore aborted: the baseband refused the session in a way that is unsafe to retry"
+                    );
+                    line.volte
+                        .update(|state| {
+                            state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
+                            state.recovery_state =
+                                crate::access::volte::runtime::VolteRecoveryState::Exhausted;
+                            state.manual_retry_available = true;
+                            state.next_retry_at = None;
+                            state.last_error = Some(format!("volte_baseband_wedged:{error}"));
+                            state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
+                        })
+                        .await;
+                    return;
+                }
                 if attempt < VOLTE_RESTORE_MAX_ATTEMPTS {
                     let delay = config.auto_restore_retry_delay_secs.clamp(5, 180);
                     line.volte

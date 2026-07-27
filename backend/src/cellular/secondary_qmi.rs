@@ -388,6 +388,51 @@ fn ports_for_baseband(baseband: &str) -> Vec<(String, Option<String>)> {
     ports
 }
 
+/// Every non-primary QMI port on this host, one entry per port.
+///
+/// ModemManager must be kept off *all* of them, not just the one that ends up
+/// carrying a session: the custom module publishes a spare port per registered
+/// channel (DATA6 *and* DATA7), and any spare left visible is enumerated by
+/// ModemManager as an extra modem port. On the reference device that left
+/// `wwan0qmi2` claimable while `wwan0qmi1` was correctly ignored.
+///
+/// The primary of each baseband is excluded — that one is ModemManager's, by
+/// design. Boot AT consoles are excluded because they are not QMI at all.
+pub fn discover_spare_qmi_ports() -> Vec<String> {
+    let primaries: Vec<String> = discover_primary_qmi_ports()
+        .into_iter()
+        .map(|device| device.rsplit('/').next().unwrap_or_default().to_string())
+        .collect();
+    let Ok(entries) = std::fs::read_dir(WWAN_CLASS_DIR) else {
+        return Vec::new();
+    };
+    let mut spares = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if primaries.contains(&name) || is_boot_port(&name) {
+            continue;
+        }
+        let Ok(resolved) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        // Only QMI-typed ports; an AT port cannot host a WDS session and
+        // ModemManager may legitimately want it.
+        let is_qmi = std::fs::read_to_string(resolved.join("type"))
+            .ok()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("QMI"));
+        if is_qmi && remoteproc_of_path(&resolved.to_string_lossy()).is_some() {
+            spares.push(name);
+        }
+    }
+    spares.sort();
+    spares
+}
+
+/// The udev line that hides one port from ModemManager.
+pub fn udev_ignore_rule(port_name: &str) -> String {
+    format!("SUBSYSTEM==\"wwan\", KERNEL==\"{port_name}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\"")
+}
+
 /// Probe-order hint for a discovered port: prefer names that advertise QMI, then
 /// anything else. Naming is only a hint — the capability probe decides.
 fn port_rank(port: &str, port_type: Option<&str>) -> usize {

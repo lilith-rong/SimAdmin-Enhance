@@ -538,7 +538,21 @@ pub async fn teardown_bearer_network(bearer: &BearerConnection) {
     let _ = run_ip(&["link", "set", "dev", &bearer.interface, "down"]).await;
 }
 
+/// Disconnect a ModemManager bearer.
+///
+/// A natively established bearer has no ModemManager object behind its `path`, so
+/// sending it here would fail *and* leave the real WDS session running. Those are
+/// torn down through `native_bearer::release_native_ims_bearer` instead, which
+/// owns the session handle; this guard means a caller that does not yet know the
+/// difference cannot silently leak a PDP context.
 pub async fn disconnect_bearer(path: &str) {
+    if super::native_bearer::is_native_bearer(path) {
+        tracing::debug!(
+            path = %path,
+            "Skipping mmcli disconnect for a native QMI bearer; its WDS session is released separately"
+        );
+        return;
+    }
     let _ = run_command("mmcli", &["-b", path, "--disconnect"]).await;
 }
 

@@ -560,8 +560,8 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async unlockAllCells() {
-    return request<ApiResponse<CellLockResult>>('/cell-lock/unlock-all', {
+  async unlockAllCells(lineId?: string) {
+    return request<ApiResponse<CellLockResult>>(`/cell-lock/unlock-all${lineScopeQuery(lineId)}`, {
       method: 'POST',
       body: JSON.stringify({}),
     })

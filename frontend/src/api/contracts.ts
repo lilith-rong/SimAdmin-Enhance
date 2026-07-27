@@ -456,7 +456,7 @@ export interface VolteConnectionAttempt {
   sequence: number
   stage: string
   ip_family?: string
-  outcome: 'started' | 'succeeded' | 'failed' | string
+  outcome: string
   error_code?: string
   detail?: string
   at_cid?: number

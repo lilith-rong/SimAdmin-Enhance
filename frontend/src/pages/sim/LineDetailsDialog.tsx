@@ -58,7 +58,7 @@ function VolteDetails({ line }: { line: VolteLineControlResponse }) {
                 <Typography variant="body2" sx={{ wordBreak: 'break-word' }}>{attempt.stage}{attempt.ip_family ? ` · ${attempt.ip_family}` : ''}{attempt.detail ? ` · ${attempt.detail}` : ''}</Typography>
                 {(() => {
                   const meta = [
-                    attempt.at_cid != null ? `CID ${attempt.at_cid}` : null,
+                    attempt.at_cid !== undefined && attempt.at_cid !== null ? `CID ${attempt.at_cid}` : null,
                     attempt.qmi_device ? `QMI ${attempt.qmi_device}` : null,
                     attempt.interface ? `网卡 ${attempt.interface}` : null,
                     attempt.bearer_path ? `Bearer ${attempt.bearer_path}` : null,

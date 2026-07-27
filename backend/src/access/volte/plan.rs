@@ -97,8 +97,30 @@ pub enum FailureClass {
     FamilyUnsupported,
     /// P-CSCF discovery/registration failed for the current family.
     PcscfFailed,
+    /// The baseband refused the IMS session in a way that means it is wedged, or
+    /// that the QMI control port is already owned by ModemManager.
+    ///
+    /// Retrying this is actively harmful: repeatedly re-issuing PDP activation
+    /// against a wedged modem can escalate to a subsystem restart and take the
+    /// whole device down. Callers must abandon the attempt batch, not back off
+    /// and try again.
+    BasebandWedged,
     /// Anything else — treated as fatal for family fallback.
     Other,
+}
+
+/// Signatures of a baseband that has stopped accepting IMS session setup.
+///
+/// `interface-in-use-config-match` is QMI telling us the data interface is
+/// already claimed — on this platform that is ModemManager holding the primary
+/// QMI port. The generic ModemManager "internal error" on an IMS bearer connect
+/// is the same condition surfaced one layer up. `endpoint hangup` is the QMI
+/// control channel itself going away.
+fn is_baseband_wedge(lowercased: &str) -> bool {
+    lowercased.contains("interface-in-use-config-match")
+        || lowercased.contains("endpoint hangup")
+        || lowercased.contains("mobileequipment.unknown")
+        || (lowercased.contains("call failed") && lowercased.contains("internal error"))
 }
 
 impl FailureClass {
@@ -117,6 +139,8 @@ impl FailureClass {
             FailureClass::NetworkForcedIpv4
         } else if error.contains("prefix-unavailable") {
             FailureClass::PrefixUnavailable
+        } else if is_baseband_wedge(&error) {
+            FailureClass::BasebandWedged
         } else {
             FailureClass::Other
         }
@@ -134,6 +158,11 @@ impl FailureClass {
             code::RUNTIME_IMS_FAMILY_UNSUPPORTED => FailureClass::FamilyUnsupported,
             _ => FailureClass::Other,
         }
+    }
+
+    /// Whether it is unsafe to retry this failure against the same baseband.
+    pub fn is_unsafe_to_retry(self) -> bool {
+        matches!(self, FailureClass::BasebandWedged)
     }
 
     /// If the failure forces a single family, which one.
@@ -227,6 +256,50 @@ impl ImsConnectionPlan {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// The exact detail string produced on the reference device. Retrying this
+    /// is what escalates a wedged modem into a subsystem restart, so it must be
+    /// classified as unsafe rather than as a generic failure.
+    #[test]
+    fn real_device_bearer_internal_error_is_classified_as_wedged() {
+        let detail = "volte_command_failed:mmcli:1:-b /org/freedesktop/ModemManager1/Bearer/4 \
+             --connect:error: couldn't connect the bearer: \
+             'GDBus.Error:org.freedesktop.ModemManager1.Error.MobileEquipment.Unknown: \
+             Unknown error: Call failed: internal error: error'";
+        let class = FailureClass::from_details(detail);
+        assert_eq!(class, FailureClass::BasebandWedged);
+        assert!(class.is_unsafe_to_retry());
+    }
+
+    #[test]
+    fn qmi_interface_contention_and_endpoint_hangup_are_wedge_signatures() {
+        for detail in [
+            "QMI protocol error (14): CallFailed - interface-in-use-config-match",
+            "CID allocation failed in the CTL client: endpoint hangup",
+        ] {
+            assert_eq!(
+                FailureClass::from_details(detail),
+                FailureClass::BasebandWedged,
+                "{detail}"
+            );
+        }
+    }
+
+    /// Family negotiation and prefix problems are normal and must stay
+    /// retryable, otherwise a recoverable case would be turned into a hard stop.
+    #[test]
+    fn recoverable_failures_are_not_treated_as_wedged() {
+        for (detail, expected) in [
+            ("[3gpp] ipv4-only-allowed", FailureClass::NetworkForcedIpv4),
+            ("ipv6-only-allowed", FailureClass::NetworkForcedIpv6),
+            ("prefix-unavailable", FailureClass::PrefixUnavailable),
+            ("operation-failed", FailureClass::Other),
+        ] {
+            let class = FailureClass::from_details(detail);
+            assert_eq!(class, expected, "{detail}");
+            assert!(!class.is_unsafe_to_retry(), "{detail}");
+        }
+    }
 
     #[test]
     fn dual_stack_default_leads_with_ipv4v6() {
