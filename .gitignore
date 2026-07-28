@@ -30,3 +30,16 @@ userdata/home/root/www/
 temp/
 .tmp
 .device-dump/
+# IDE 配置
+.idea/
+backend/.idea/
+
+# 临时诊断脚本
+_recon.sh
+
+# 临时构建诊断输出
+backend/build_err.txt
+backend/testerrs.json
+backend/testres.txt
+backend/errs.json
+backend/build_out.txt
