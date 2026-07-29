@@ -1555,13 +1555,13 @@ mod tests {
                 LineVowifiConfig {
                     enabled: true,
                     dns_server: "1.1.1.1".to_string(),
-                    epdg_host: "epdg.example.net".to_string(),
+                    profile_id: Some("gb_ee_23433".to_string()),
                     ..LineVowifiConfig::default()
                 },
             )
             .unwrap();
         assert!(profile.vowifi.enabled);
-        assert_eq!(profile.vowifi.epdg_host, "epdg.example.net");
+        assert_eq!(profile.vowifi.profile_id.as_deref(), Some("gb_ee_23433"));
         assert!(manager.get_vowifi_config().feature_enabled);
 
         assert_eq!(
@@ -2564,6 +2564,51 @@ impl VolteIpFamilyPreference {
             Self::Ipv4Only => "ipv4_only",
         }
     }
+
+    /// The equivalent ordered attempt list. Lets the runtime treat the legacy
+    /// single-select preference and the newer per-line ordered list uniformly.
+    /// The `*First` presets lead with dual-stack, matching the historical
+    /// "always try dual-stack first, then fall back to single families" behaviour.
+    pub fn to_families(self) -> Vec<VolteIpFamily> {
+        match self {
+            Self::Ipv6First => vec![
+                VolteIpFamily::Ipv4v6,
+                VolteIpFamily::Ipv6,
+                VolteIpFamily::Ipv4,
+            ],
+            Self::Ipv4First => vec![
+                VolteIpFamily::Ipv4v6,
+                VolteIpFamily::Ipv4,
+                VolteIpFamily::Ipv6,
+            ],
+            Self::Ipv6Only => vec![VolteIpFamily::Ipv6],
+            Self::Ipv4Only => vec![VolteIpFamily::Ipv4],
+        }
+    }
+}
+
+/// One IMS bearer attempt a line may enable: dual-stack or a single family. The
+/// order of a `Vec<VolteIpFamily>` is the attempt/fallback order, so a line can
+/// place `Ipv4v6` (dual-stack) anywhere in the sequence rather than it always
+/// being tried first. A one-element list means "only this attempt, no fallback".
+/// This is the per-line, web-editable form of the legacy
+/// [`VolteIpFamilyPreference`] and is a strict superset of it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VolteIpFamily {
+    Ipv4v6,
+    Ipv4,
+    Ipv6,
+}
+
+impl VolteIpFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4v6 => "ipv4v6",
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        }
+    }
 }
 
 /// VoLTE (IMS over LTE) SMS configuration.
@@ -2820,10 +2865,17 @@ pub struct LineVowifiConfig {
     pub proxy_endpoint: String,
     #[serde(default)]
     pub dns_server: String,
-    #[serde(default)]
-    pub epdg_host: String,
-    #[serde(default = "default_vowifi_epdg_port")]
-    pub epdg_port: u16,
+    /// Pin this line to a specific carrier profile by `profile_id`. `None`
+    /// (the default) resolves the profile automatically from the SIM's IMSI:
+    /// database match first, then the built-in / dynamic 3GPP derivation.
+    ///
+    /// Only a profile that exists in the carrier-profile database is honored; a
+    /// pinned id that no longer resolves there falls back to automatic matching,
+    /// so deleting a profile can never strand a line. This replaces the old
+    /// per-line `epdg_host`/`epdg_port` overrides — the ePDG now always comes
+    /// from the resolved profile, editable on the 运营商 Profile page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2885,8 +2937,7 @@ impl Default for LineVowifiConfig {
             proxy_mode: VowifiProxyMode::Direct,
             proxy_endpoint: String::new(),
             dns_server: String::new(),
-            epdg_host: String::new(),
-            epdg_port: default_vowifi_epdg_port(),
+            profile_id: None,
         }
     }
 }
@@ -2940,6 +2991,13 @@ pub struct LineProfileConfig {
     /// Per-line voice path priority; same inheritance rule as `sms_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_path: Option<VoicePathPolicy>,
+    /// Per-line ordered IMS IP-family attempt order. `None` inherits the global
+    /// `VolteConfig.ip_family_preference`. The list elements are the families to
+    /// enable, in fallback order: `[Ipv4, Ipv6]` tries dual-stack then IPv4 then
+    /// IPv6 (== `Ipv4First`), `[Ipv6]` is IPv6-only, and so on. An empty list is
+    /// treated as "follow the default" so a line can never disable both families.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volte_ip_families: Option<Vec<VolteIpFamily>>,
     /// Per-line APN. `None` inherits the global APN, which is only correct while
     /// every SIM is on the same carrier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3034,6 +3092,7 @@ impl LineProfileConfig {
             line_id: line_id.into(),
             enabled: true,
             volte_connection_enabled: false,
+            volte_ip_families: None,
             vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
             data_connection_enabled: false,
@@ -3080,19 +3139,14 @@ fn validate_line_data_proxy_config(config: &mut LineDataProxyConfig) -> Result<(
 fn validate_line_vowifi_config(config: &mut LineVowifiConfig) -> Result<(), String> {
     config.proxy_endpoint = config.proxy_endpoint.trim().to_string();
     config.dns_server = config.dns_server.trim().to_string();
-    config.epdg_host = config.epdg_host.trim().trim_end_matches('.').to_string();
+    config.profile_id = config
+        .profile_id
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     if !config.dns_server.is_empty() && config.dns_server.parse::<std::net::IpAddr>().is_err() {
         return Err("vowifi_dns_server_invalid".to_string());
-    }
-    if config.epdg_port == 0 {
-        return Err("vowifi_epdg_port_invalid".to_string());
-    }
-    if config.epdg_host.chars().any(char::is_whitespace)
-        || config.epdg_host.contains('/')
-        || config.epdg_host.contains(':') && config.epdg_host.parse::<std::net::IpAddr>().is_err()
-    {
-        return Err("vowifi_epdg_host_invalid".to_string());
     }
     match config.proxy_mode {
         VowifiProxyMode::Direct => config.proxy_endpoint.clear(),
@@ -4093,6 +4147,55 @@ impl ConfigManager {
                 return Err("line_disabled".to_string());
             }
             profile.volte_connection_enabled = enabled;
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    /// Set this line's ordered VoLTE IMS address-family list. `None` clears the
+    /// per-line override so the line falls back to the global
+    /// `VolteConfig::ip_family_preference`. An empty or duplicated list is
+    /// rejected so a saved override always means something the runtime can use.
+    pub fn set_line_volte_ip_families(
+        &self,
+        line_id: &str,
+        families: Option<Vec<VolteIpFamily>>,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        if let Some(families) = families.as_ref() {
+            if families.is_empty() {
+                return Err("volte_ip_families_empty".to_string());
+            }
+            let mut seen = Vec::new();
+            for family in families {
+                if seen.contains(family) {
+                    return Err("volte_ip_families_duplicate".to_string());
+                }
+                seen.push(*family);
+            }
+        }
+        let next = {
+            let mut config = self.config.write().unwrap();
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            profile.volte_ip_families = families;
             let next = profile.clone();
             config
                 .line_profiles

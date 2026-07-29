@@ -586,6 +586,13 @@ export interface TrunkProfileResponse {
   runtime: TrunkRuntimeStatus
 }
 
+/** A single IMS bearer address family. */
+/**
+ * One IMS bearer attempt: dual-stack (`ipv4v6`) or a single family. Dual-stack is
+ * an ordinary orderable entry, so a line may try single families before it.
+ */
+export type VolteIpFamily = 'ipv4v6' | 'ipv4' | 'ipv6'
+
 export interface LineProfileConfig {
   line_id: string
   enabled: boolean
@@ -596,6 +603,12 @@ export interface LineProfileConfig {
   data_proxy: LineDataProxyConfig
   roaming_allowed: boolean
   airplane_mode_enabled: boolean
+  /**
+   * Ordered IMS address-family attempt list. `null` inherits the global VoLTE
+   * preference. Order is the attempt/fallback order; a one-element list means
+   * "only that family".
+   */
+  volte_ip_families?: VolteIpFamily[] | null
 }
 
 export interface LineDataProxyConfig {
@@ -816,8 +829,13 @@ export interface LineVowifiConfig {
   proxy_mode: VowifiProxyMode
   proxy_endpoint: string
   dns_server: string
-  epdg_host: string
-  epdg_port: number
+  /**
+   * Pin this line to a specific carrier profile by `profile_id`. `null`/omitted
+   * resolves the profile automatically from the SIM's IMSI. The dropdown only
+   * offers database profiles; a pinned id that no longer resolves falls back to
+   * automatic matching so deleting a profile never strands a line.
+   */
+  profile_id?: string | null
 }
 
 export interface VowifiLineConfigResponse {

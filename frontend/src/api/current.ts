@@ -52,6 +52,7 @@ import type {
   TrunkProfileResponse,
   VolteControlResponse,
   VolteLineControlResponse,
+  VolteIpFamily,
   NetworkInfo,
   NetworkInterfacesResponse,
   NotificationConfig,
@@ -691,6 +692,13 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<VolteLineControlResponse>>(
       `/volte/lines/${encodeURIComponent(lineId)}/retry`,
       { method: 'POST', body: JSON.stringify({}) },
+    )
+  }
+
+  async setVolteLineIpFamilies(lineId: string, families: VolteIpFamily[] | null) {
+    return request<ApiResponse<VolteLineControlResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/ip-families`,
+      { method: 'POST', body: JSON.stringify({ families }) },
     )
   }
 

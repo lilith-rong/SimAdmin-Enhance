@@ -26,6 +26,7 @@ import {
 import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
+import VolteLineDialog from './VolteLineDialog'
 import LineDetailsDialog, { type LineDetailTab } from './LineDetailsDialog'
 import DataProxyDialog from './DataProxyDialog'
 import { formatBytes } from '../Dashboard/utils'
@@ -133,6 +134,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
   const [networkControls, setNetworkControls] = useState<LineNetworkControlsResponse[]>([])
   const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
   const [editingVowifiLine, setEditingVowifiLine] = useState<VowifiLineConfigResponse | null>(null)
+  const [editingVolteLine, setEditingVolteLine] = useState<VolteLineControlResponse | null>(null)
   const [editingDataLineId, setEditingDataLineId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [savingKey, setSavingKey] = useState<string | null>(null)
@@ -298,6 +300,12 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
     setVowifiLines((current) => current.map((line) => line.line_id === updated.line_id ? updated : line))
     setEditingVowifiLine(updated)
     setSuccess(`${shortLineId(updated.line_id)} 的 VoWiFi 配置已保存`)
+  }
+
+  const handleVolteSaved = (updated: VolteLineControlResponse) => {
+    setLines((current) => current.map((line) => line.modem.line_id === updated.modem.line_id ? updated : line))
+    setEditingVolteLine(updated)
+    setSuccess(`${shortLineId(updated.modem.line_id)} 的 VoLTE 地址族已保存`)
   }
 
   const retryLine = async (lineId: string) => {
@@ -616,6 +624,14 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                             </span>
                           </Tooltip>
                         )}
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => setEditingVolteLine(line)}
+                          disabled={savingKey !== null}
+                        >
+                          地址族
+                        </Button>
                         <Switch
                           checked={line.profile.volte_connection_enabled}
                           onChange={(_, enabled) => void toggleLine(line.modem.line_id, enabled)}
@@ -631,7 +647,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           <Typography variant="body2" fontWeight={600}>VoWiFi / WiFi Calling</Typography>
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
-                          {vowifiLine?.config.epdg_host || '使用运营商 profile ePDG'}
+                          {vowifiLine?.config.profile_id ? `指定 profile ${vowifiLine.config.profile_id}` : '自动匹配运营商 profile'}
                           {vowifiLine?.config.dns_server ? ` · DNS ${vowifiLine.config.dns_server}` : ''}
                         </Typography>
                       </Box>
@@ -704,6 +720,13 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
         line={editingVowifiLine}
         onClose={() => setEditingVowifiLine(null)}
         onSaved={handleVowifiSaved}
+      />
+      <VolteLineDialog
+        open={editingVolteLine !== null}
+        lineId={editingVolteLine?.modem.line_id ?? null}
+        families={editingVolteLine?.profile.volte_ip_families ?? null}
+        onClose={() => setEditingVolteLine(null)}
+        onSaved={handleVolteSaved}
       />
       <DataProxyDialog
         open={editingDataLineId !== null}

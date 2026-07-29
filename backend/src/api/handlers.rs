@@ -3405,6 +3405,7 @@ async fn send_sms_over_volte_path(
                 &device,
                 &line.volte,
                 &config,
+                profile.volte_ip_families.as_deref(),
                 profile.roaming_allowed,
                 data_slot_mode,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,
@@ -4274,11 +4275,6 @@ async fn current_vowifi_profile_match(app: &AppState) -> VowifiProfileMatchRespo
             .get_line_profile(&primary.binding().line_id)
             .vowifi;
         if let Some(epdg) = response.epdg.as_mut() {
-            if !line_config.epdg_host.is_empty() {
-                epdg.host = line_config.epdg_host;
-                epdg.port = line_config.epdg_port;
-                epdg.source = "line_override".to_string();
-            }
             if !line_config.dns_server.is_empty() {
                 epdg.dns_server = Some(line_config.dns_server);
             }
@@ -5006,25 +5002,10 @@ async fn connect_vowifi_on_line(
     }
     {
         let line_id = scope.line_id().to_string();
-        let mut line_config = app.config_manager.get_line_profile(&line_id).vowifi;
-        if line_config.epdg_host.is_empty() {
-            let snapshot = scope.runtime().snapshot().await;
-            if let Some(profile) = snapshot.profile.profile {
-                if let Some(external) = profile_store(app)
-                    .list_as_external()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|item| {
-                        item.profile_id == profile.profile_id
-                            || item.mcc == profile.mcc && item.mnc == profile.mnc
-                    })
-                {
-                    line_config.epdg_host = external.epdg_host;
-                    line_config.epdg_port = external.epdg_port;
-                    line_config.dns_server = external.dns_server.unwrap_or_default();
-                }
-            }
-        }
+        // The ePDG endpoint now comes solely from the resolved carrier profile
+        // (auto-matched or pinned via `profile_id`); the line only carries DNS and
+        // proxy overrides, so this is applied as-is.
+        let line_config = app.config_manager.get_line_profile(&line_id).vowifi;
         if let Err(error) =
             crate::connectivity::modems::softstack::vowifi::live::configure_live_network_overrides(&line_id, &line_config)
         {
@@ -5533,6 +5514,71 @@ pub async fn set_volte_line_connection_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         ),
     }
+}
+
+/// Body for `PUT /api/volte/lines/{line_id}/ip-families`.
+///
+/// `families` is the ordered attempt list (`["ipv4","ipv6"]`, `["ipv6"]`, …).
+/// `null` (or an absent field) clears the per-line override so the line follows
+/// the global `ip_family_preference` default again.
+#[derive(Debug, serde::Deserialize)]
+pub struct SetVolteIpFamiliesRequest {
+    #[serde(default)]
+    pub families: Option<Vec<crate::platform::config::VolteIpFamily>>,
+}
+
+/// PUT /api/volte/lines/{line_id}/ip-families
+///
+/// Persist this line's ordered IMS address-family list. If the line is currently
+/// connected, restart it so the new order takes effect immediately.
+pub async fn set_volte_line_ip_families_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<SetVolteIpFamiliesRequest>,
+) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let profile = match app
+        .config_manager
+        .set_line_volte_ip_families(&line_id, payload.families)
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            )
+        }
+    };
+    // The family order is only consulted when a session is (re)established, so an
+    // already-registered line has to be restarted for the change to take effect.
+    if profile.volte_connection_enabled && line.volte.status().await.registered {
+        {
+            let _bearer_guard = line.bearer_operation_lock.lock().await;
+            let _guard = line.volte_connect_lock.lock().await;
+            crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
+                &line.volte_live,
+                &line.volte,
+                "volte_ip_families_changed",
+            )
+            .await;
+        }
+        start_line_volte_restore(app.clone(), Arc::clone(&line), "ip_families_changed").await;
+    }
+    let response = VolteLineControlResponse {
+        modem: line.binding(),
+        profile: profile.redacted(),
+        runtime: line.volte.status().await,
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", response)),
+    )
 }
 
 /// Start a fresh five-attempt recovery batch without changing the persisted
@@ -6666,6 +6712,7 @@ async fn run_line_volte_restore_batch(
                 &device,
                 &line.volte,
                 &config,
+                profile.volte_ip_families.as_deref(),
                 profile.roaming_allowed,
                 data_slot_mode,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,

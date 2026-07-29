@@ -1231,6 +1231,10 @@ async fn main() -> Result<()> {
             post(retry_volte_line_handler).options(options_handler),
         )
         .route(
+            "/api/volte/lines/{line_id}/ip-families",
+            post(set_volte_line_ip_families_handler).options(options_handler),
+        )
+        .route(
             "/api/sim/slots",
             get(get_standalone_sim_slots_handler)
                 .post(set_standalone_sim_slots_handler)
