@@ -33,16 +33,17 @@ export interface ChangePasswordRequest {
   new_password: string
 }
 
-export type WorkMode = 'sim' | 'esim'
-
-export interface WorkModeResponse {
-  mode: WorkMode
-  worker_running: boolean
-}
-
-export interface WorkModeRequest {
-  mode: WorkMode
-  confirm: boolean
+/** Per-line eSIM (eUICC) management control and detection state. */
+export interface LineEsimControlResponse {
+  line_id: string
+  /** `null` = auto (follow detection); `true`/`false` = explicit override. */
+  esim_control: boolean | null
+  sim_type: string
+  esim_status: string
+  /** Whether the discovered SIM advertises a eUICC chip. */
+  euicc_detected: boolean
+  /** Effective result: may this line run lpac eSIM operations right now? */
+  esim_enabled: boolean
 }
 
 export interface EsimCommandResponse {
@@ -450,6 +451,12 @@ export interface ModemBinding {
   operator_id: string
   state: string
   present: boolean
+  /** ModemManager SimType: "physical" | "esim" | "unknown". */
+  sim_type?: string
+  /** ModemManager EsimStatus: "none" | "no-profiles" | "with-profiles" | "unknown". */
+  esim_status?: string
+  /** "baseband" for a cellular modem line, "reader" for a standalone SIM reader. */
+  line_kind?: string
 }
 
 export interface VolteConnectionAttempt {
@@ -609,6 +616,12 @@ export interface LineProfileConfig {
    * "only that family".
    */
   volte_ip_families?: VolteIpFamily[] | null
+  /**
+   * Per-line eSIM management override. `null`/undefined = auto (managed only
+   * when the SIM reports a eUICC chip), `true` = force eSIM controls on,
+   * `false` = treat as a plain SIM (no lpac calls).
+   */
+  esim_control?: boolean | null
 }
 
 export interface LineDataProxyConfig {

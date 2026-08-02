@@ -11,8 +11,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::api::models::WorkMode;
-
 /// Webhook 配置
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebhookConfig {
@@ -352,7 +350,6 @@ pub fn default_device_status_items() -> Vec<String> {
         "device_model",
         "system_version",
         "uptime",
-        "work_mode",
         "sim_present",
         "sim_operator",
         "cellular_registration",
@@ -3002,6 +2999,14 @@ pub struct LineProfileConfig {
     /// every SIM is on the same carrier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apn: Option<ApnConfig>,
+    /// Per-line eSIM (eUICC) management control. `None` means "auto": eSIM
+    /// management is offered only when the line's SIM reports a eUICC chip
+    /// (`esim_status`/`sim_type`). `Some(true)` forces eSIM management on even
+    /// when detection is inconclusive (e.g. a reader that cannot report
+    /// EsimStatus but is known to hold an eUICC), and `Some(false)` forces the
+    /// line to be treated as a plain SIM so no lpac calls are ever issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esim_control: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3102,6 +3107,7 @@ impl LineProfileConfig {
             sms_path: None,
             voice_path: None,
             apn: None,
+            esim_control: None,
         }
     }
 
@@ -3516,8 +3522,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub apn: ApnConfig,
     #[serde(default)]
-    pub work_mode: WorkMode,
-    #[serde(default)]
     pub esim: EsimConfig,
     #[serde(default)]
     pub automation: AutomationConfig,
@@ -3550,7 +3554,6 @@ impl Default for AppConfig {
             roaming_allowed: default_roaming_allowed(),
             data_enabled: default_data_enabled(),
             apn: ApnConfig::default(),
-            work_mode: WorkMode::default(),
             esim: EsimConfig::default(),
             automation: AutomationConfig::default(),
             vowifi: VowifiConfig::default(),
@@ -3832,10 +3835,6 @@ impl ConfigManager {
 
     pub fn get_apn_config(&self) -> ApnConfig {
         self.config.read().unwrap().apn.clone()
-    }
-
-    pub fn get_work_mode(&self) -> WorkMode {
-        self.config.read().unwrap().work_mode
     }
 
     pub fn get_esim_config(&self) -> EsimConfig {
@@ -4147,6 +4146,43 @@ impl ConfigManager {
                 return Err("line_disabled".to_string());
             }
             profile.volte_connection_enabled = enabled;
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    /// Set this line's eSIM management override. `None` returns the line to the
+    /// automatic policy (managed only when the SIM reports a eUICC chip);
+    /// `Some(true)` force-enables the lpac eSIM controls even when auto-detection
+    /// is uncertain, and `Some(false)` treats the line as a plain SIM regardless.
+    pub fn set_line_esim_control(
+        &self,
+        line_id: &str,
+        control: Option<bool>,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        let next = {
+            let mut config = self.config.write().unwrap();
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            profile.esim_control = control;
             let next = profile.clone();
             config
                 .line_profiles
@@ -4787,14 +4823,6 @@ impl ConfigManager {
         {
             let mut c = self.config.write().unwrap();
             c.apn = apn;
-        }
-        self.save()
-    }
-
-    pub fn set_work_mode(&self, mode: WorkMode) -> Result<(), String> {
-        {
-            let mut c = self.config.write().unwrap();
-            c.work_mode = mode;
         }
         self.save()
     }

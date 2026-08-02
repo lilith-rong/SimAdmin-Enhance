@@ -143,6 +143,51 @@ fn esim_error_response<T: Default>(error: EsimApiError) -> (StatusCode, Json<Api
     (status, Json(ApiResponse::<T>::error(error.message())))
 }
 
+/// Decide whether a line may run eSIM/lpac operations.
+///
+/// `Some(false)` on the profile forces the line to behave as a plain SIM, so no
+/// lpac command is ever issued. `Some(true)` force-enables management even when
+/// the SIM cannot advertise a eUICC (e.g. a bare reader). `None` is the auto
+/// policy: management is offered only when the line's SIM reports a eUICC chip
+/// through ModemManager (`sim_type`/`esim_status`), which is a cheap signal that
+/// costs no extra lpac probe.
+fn line_reports_euicc(binding: &crate::hardware::cellular::modem_manager::ModemBinding) -> bool {
+    binding.sim_type == "esim"
+        || matches!(binding.esim_status.as_str(), "no-profiles" | "with-profiles")
+}
+
+/// Returns `Ok(())` when the named line is allowed to run eSIM operations, or an
+/// `EsimApiError::Disabled` describing why not. A missing `line_id` keeps the
+/// legacy single-reader behaviour (allowed) so older clients still work.
+async fn resolve_line_esim_gate(app: &AppState, line_id: Option<&str>) -> Result<(), EsimApiError> {
+    let Some(line_id) = line_id.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    match app.config_manager.get_line_profile(line_id).esim_control {
+        Some(false) => Err(EsimApiError::Disabled),
+        Some(true) => Ok(()),
+        None => {
+            // The registry is the only place that knows what the card reported.
+            // Refresh when the line is not yet known (first call after boot, a
+            // hotplug, or a newly configured standalone reader) so the automatic
+            // policy does not deny a line that actually holds a eUICC.
+            let mut line = app.line_registry.get(line_id).await;
+            if line.is_none() {
+                let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+                line = app.line_registry.get(line_id).await;
+            }
+            let reports_euicc = line
+                .map(|line| line_reports_euicc(&line.binding()))
+                .unwrap_or(false);
+            if reports_euicc {
+                Ok(())
+            } else {
+                Err(EsimApiError::Disabled)
+            }
+        }
+    }
+}
+
 fn esim_command_succeeded(response: &EsimCommandResponse) -> bool {
     response.code == 0
         && (response.status.is_empty()
@@ -351,63 +396,7 @@ fn cached_profiles_requested(query: &std::collections::HashMap<String, String>) 
         .unwrap_or(false)
 }
 
-// ============ 工作模式 / eSIM ============
-
-/// GET /api/work-mode
-pub async fn get_work_mode_handler(State(app): State<AppState>) -> impl IntoResponse {
-    let mode = app.config_manager.get_work_mode();
-    let worker_running = app.esim_supervisor.worker_running().await;
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message(
-            "Success",
-            WorkModeResponse {
-                mode,
-                worker_running,
-            },
-        )),
-    )
-}
-
-/// POST /api/work-mode
-pub async fn set_work_mode_handler(
-    State(app): State<AppState>,
-    Json(payload): Json<WorkModeRequest>,
-) -> impl IntoResponse {
-    if !payload.confirm {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<WorkModeResponse>::error(
-                "Changing work mode requires confirm=true",
-            )),
-        );
-    }
-
-    let previous_mode = app.config_manager.get_work_mode();
-    match app.esim_supervisor.switch_mode(payload.mode).await {
-        Ok(data) => {
-            if previous_mode != data.mode {
-                app.system_event_emitter
-                    .emit_code(
-                        system_event_codes::ESIM_WORK_MODE_CHANGED,
-                        system_event_severity::INFO,
-                        system_event_status::CHANGED,
-                        "work_mode",
-                        format!("工作模式从 {} 切换为 {}", previous_mode, data.mode),
-                    )
-                    .await;
-            }
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message("Work mode updated", data)),
-            )
-        }
-        Err(err) => (
-            StatusCode::OK,
-            Json(ApiResponse::<WorkModeResponse>::error(err)),
-        ),
-    }
-}
+// ============ eSIM ============
 
 /// GET /api/esim/lpac/status
 pub async fn get_esim_lpac_status_handler(State(app): State<AppState>) -> impl IntoResponse {
@@ -491,6 +480,9 @@ pub async fn get_esim_euicc_handler(
     State(app): State<AppState>,
     Query(query): Query<LineScopedQuery>,
 ) -> impl IntoResponse {
+    if let Err(err) = resolve_line_esim_gate(&app, query.line_id.as_deref()).await {
+        return esim_error_response::<EsimEuiccInfo>(err);
+    }
     match app
         .esim_supervisor
         .get_euicc_info_for_line(query.line_id.as_deref())
@@ -530,6 +522,9 @@ pub async fn get_esim_profiles_handler(
     }
 
     let line_id = query.get("line_id").map(String::as_str);
+    if let Err(err) = resolve_line_esim_gate(&app, line_id).await {
+        return esim_error_response::<EsimProfilesResponse>(err);
+    }
     match app.esim_supervisor.get_profiles_for_line(line_id).await {
         Ok(mut data) => {
             hydrate_profiles_from_cache(&app.database, &mut data.profiles);
@@ -579,6 +574,9 @@ pub async fn enable_esim_profile_handler(
     Path(iccid): Path<String>,
     Query(query): Query<LineScopedQuery>,
 ) -> impl IntoResponse {
+    if let Err(err) = resolve_line_esim_gate(&app, query.line_id.as_deref()).await {
+        return esim_error_response::<EsimCommandResponse>(err).into_response();
+    }
     let event_entity = mask_identifier(&iccid);
     let bg_line_id = query.line_id.clone();
     let vowifi_before_switch = app.config_manager.get_vowifi_config();
@@ -722,6 +720,7 @@ pub async fn enable_esim_profile_handler(
             success_resp,
         )),
     )
+        .into_response()
 }
 
 /// POST /api/esim/profiles/{iccid}/rename
@@ -731,6 +730,9 @@ pub async fn rename_esim_profile_handler(
     Query(query): Query<LineScopedQuery>,
     Json(payload): Json<EsimRenameRequest>,
 ) -> impl IntoResponse {
+    if let Err(err) = resolve_line_esim_gate(&app, query.line_id.as_deref()).await {
+        return esim_error_response::<EsimCommandResponse>(err);
+    }
     let name = payload.name.trim().to_string();
     if name.is_empty() {
         return (
@@ -759,6 +761,9 @@ pub async fn delete_esim_profile_handler(
     Path(iccid): Path<String>,
     Query(query): Query<LineScopedQuery>,
 ) -> impl IntoResponse {
+    if let Err(err) = resolve_line_esim_gate(&app, query.line_id.as_deref()).await {
+        return esim_error_response::<EsimCommandResponse>(err);
+    }
     match app
         .esim_supervisor
         .delete_profile(query.line_id.as_deref(), iccid.clone())
@@ -815,6 +820,9 @@ pub async fn download_esim_profile_handler(
     Json(payload): Json<EsimDownloadRequest>,
 ) -> impl IntoResponse {
     let line_id = query.line_id.as_deref();
+    if let Err(err) = resolve_line_esim_gate(&app, line_id).await {
+        return esim_error_response::<EsimCommandResponse>(err);
+    }
     let smdp = payload.smdp.trim().to_string();
     let matching_id = payload.matching_id.trim().to_string();
     if smdp.is_empty() || matching_id.is_empty() {
@@ -2508,6 +2516,21 @@ async fn start_line_data_runtime_locked(
     {
         return Err("cellular_data_roaming_forbidden".to_string());
     }
+
+    // Preserve an ordinary-data bearer that is already active on qmi0. Beta8
+    // moves IMS to DATA6 in this case; replacing the data bearer would discard
+    // the observed slot state before the VoLTE allocator can act on it.
+    if let Some(interface) =
+        modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+            .await
+            .map_err(|error| error.to_string())?
+    {
+        line.data_proxy
+            .start(&interface, &profile.data_proxy)
+            .await?;
+        return Ok(());
+    }
+
     let configured_apn = app.config_manager.get_line_apn_config(&binding.line_id);
     let apn = modem_manager::resolve_data_apn_config(
         app.dbus_conn.as_ref(),
@@ -2593,66 +2616,70 @@ async fn stop_line_data_runtime_locked(
     }
 }
 
-/// Prepare beta2's viable allocation on the reference hardware: normal data on
-/// DATA6 and IMS on the primary QMI endpoint. The caller must hold this line's
-/// `bearer_operation_lock` until IMS activation has completed.
+/// Prepare beta8's dynamic allocation. Existing qmi0 data is preserved and IMS
+/// moves to DATA6; otherwise ordinary data is prepared on DATA6 and IMS stays on
+/// qmi0. The caller must hold `bearer_operation_lock` through IMS activation.
 async fn prepare_line_data_slot_for_volte(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
     profile: &LineProfileConfig,
-) -> crate::connectivity::modems::softstack::volte::data_slot::DataSlotMode {
-    use crate::connectivity::modems::softstack::volte::data_slot::{select_data_slot_mode, DataSlotInputs, DataSlotMode};
+) -> Result<
+    crate::connectivity::modems::softstack::volte::data_slot::DataSlotMode,
+    crate::connectivity::modems::softstack::volte::VolteError,
+> {
+    use crate::connectivity::modems::softstack::volte::data_slot::{
+        select_data_slot_mode, DataSlotInputs, DataSlotMode,
+    };
 
     if !profile.data_connection_enabled {
-        return DataSlotMode::PrimaryImsOnly;
+        return Ok(DataSlotMode::PrimaryImsOnly);
     }
 
     let binding = line.binding();
-    let primary_data_active =
+    let primary_data_interface =
         modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
             .await
-            .unwrap_or(None)
-            .is_some();
-    if primary_data_active {
-        // A legacy/NetworkManager Internet bearer occupies the slot IMS needs.
-        // Disconnect only non-IMS bearers before moving data to DATA6.
-        if let Err(error) =
-            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await
-        {
-            warn!(line_id = %binding.line_id, error = %error, "Failed to release primary data slot before VoLTE");
-        }
-    }
+            .unwrap_or(None);
+    let primary_data_active = primary_data_interface.is_some();
+    let mut secondary_data_active = line.secondary_data.interface().await.is_some();
 
-    let data_start_error = start_line_data_runtime_locked(app, line, profile)
-        .await
-        .err();
-    let secondary_data_active = line.secondary_data.interface().await.is_some();
-    if let Some(error) = data_start_error {
-        line.data_proxy.record_error(error.clone()).await;
-        if !secondary_data_active {
-            warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; continuing with IMS-only allocation");
-            return DataSlotMode::PrimaryImsOnly;
+    if !primary_data_active {
+        let data_start_error = start_line_data_runtime_locked(app, line, profile)
+            .await
+            .err();
+        secondary_data_active = line.secondary_data.interface().await.is_some();
+        if let Some(error) = data_start_error {
+            line.data_proxy.record_error(error.clone()).await;
+            if secondary_data_active {
+                // The DATA6 bearer can be healthy even when the local proxy
+                // listener fails. Keep the real allocation in that case.
+                warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
+            } else {
+                warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; VoLTE allocation will use the observed slot state");
+            }
         }
-        // The DATA6 bearer can be healthy even when the local proxy listener
-        // fails (for example, because its configured port is occupied). Keep
-        // the real slot allocation so IMS is never moved back onto MM by this
-        // unrelated listener error.
-        warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
+    } else if let Some(interface) = primary_data_interface.as_deref() {
+        if let Err(error) = line.data_proxy.start(interface, &profile.data_proxy).await {
+            line.data_proxy.record_error(error.clone()).await;
+            warn!(line_id = %binding.line_id, error = %error, "Primary data is active but its local proxy is unavailable");
+        }
     }
 
     let inputs = DataSlotInputs {
         data_requested: true,
-        primary_data_active: false,
+        primary_data_active,
         secondary_data_active,
-        secondary_endpoint_available: binding.qmi_device.is_some(),
+        secondary_endpoint_available: secondary_data_active || binding.qmi_device.is_some(),
     };
     match select_data_slot_mode(inputs) {
-        Ok(mode) => mode,
+        Ok(mode) => {
+            info!(line_id = %binding.line_id, mode = mode.as_str(), allocation = mode.allocation_message(), "VoLTE/data slot allocation selected");
+            Ok(mode)
+        }
         Err(error) => {
             line.data_proxy.record_error(error.to_string()).await;
             warn!(line_id = %binding.line_id, error = %error, "VoLTE/data slot allocation failed");
-            DataSlotMode::PrimaryImsOnly
+            Err(error)
         }
     }
 }
@@ -3397,7 +3424,9 @@ async fn send_sms_over_volte_path(
         let device = crate::connectivity::modems::softstack::volte::live::VolteDeviceBinding::from_modem(&binding)
             .map_err(|error| error.to_string())?;
         let _bearer_guard = line.bearer_operation_lock.lock().await;
-        let data_slot_mode = prepare_line_data_slot_for_volte(app, &line, &profile).await;
+        let data_slot_mode = prepare_line_data_slot_for_volte(app, &line, &profile)
+            .await
+            .map_err(|error| error.to_string())?;
         let _guard = line.volte_connect_lock.lock().await;
         if !line.volte.status().await.registered {
             crate::connectivity::modems::softstack::volte::live::connect_live_for_line(
@@ -5383,6 +5412,103 @@ pub async fn set_standalone_sim_slots_handler(
     }
 }
 
+/// One line's eSIM management state: the persisted override plus whether the
+/// hardware actually reports a eUICC, so the UI can render the "auto" case
+/// without paying for an lpac probe on every refresh.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct LineEsimControlResponse {
+    pub line_id: String,
+    /// `None` = auto (follow detection), `Some(true/false)` = explicit override.
+    pub esim_control: Option<bool>,
+    /// ModemManager's view of the card: "physical" / "esim" / "unknown".
+    pub sim_type: String,
+    /// "none" / "no-profiles" / "with-profiles" / "unknown".
+    pub esim_status: String,
+    /// Whether the discovered SIM advertises a eUICC chip.
+    pub euicc_detected: bool,
+    /// Effective result: may this line run lpac eSIM operations right now?
+    pub esim_enabled: bool,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LineEsimControlRequest {
+    /// Omit or send `null` to return the line to automatic detection.
+    #[serde(default)]
+    pub esim_control: Option<bool>,
+}
+
+fn build_line_esim_control_response(
+    line_id: &str,
+    esim_control: Option<bool>,
+    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+) -> LineEsimControlResponse {
+    let euicc_detected = line_reports_euicc(binding);
+    LineEsimControlResponse {
+        line_id: line_id.to_string(),
+        esim_control,
+        sim_type: binding.sim_type.clone(),
+        esim_status: binding.esim_status.clone(),
+        euicc_detected,
+        esim_enabled: esim_control.unwrap_or(euicc_detected),
+    }
+}
+
+/// GET /api/modem/lines/{line_id}/esim-control
+pub async fn get_line_esim_control_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<LineEsimControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let esim_control = app.config_manager.get_line_profile(&line_id).esim_control;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_line_esim_control_response(&line_id, esim_control, &line.binding()),
+        )),
+    )
+}
+
+/// POST /api/modem/lines/{line_id}/esim-control
+pub async fn set_line_esim_control_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<LineEsimControlRequest>,
+) -> (StatusCode, Json<ApiResponse<LineEsimControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let profile = match app
+        .config_manager
+        .set_line_esim_control(&line_id, payload.esim_control)
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "eSIM control updated",
+            build_line_esim_control_response(&line_id, profile.esim_control, &line.binding()),
+        )),
+    )
+}
+
 fn build_volte_line_response(
     app: &AppState,
     status: crate::services::line_registry::LineRuntimeStatus,
@@ -6702,24 +6828,28 @@ async fn run_line_volte_restore_batch(
 
         let result = {
             let _bearer_guard = line.bearer_operation_lock.lock().await;
-            let data_slot_mode = prepare_line_data_slot_for_volte(app, line, &profile).await;
-            let _guard = line.volte_connect_lock.lock().await;
-            if line.volte.status().await.registered {
-                return;
+            match prepare_line_data_slot_for_volte(app, line, &profile).await {
+                Ok(data_slot_mode) => {
+                    let _guard = line.volte_connect_lock.lock().await;
+                    if line.volte.status().await.registered {
+                        return;
+                    }
+                    crate::connectivity::modems::softstack::volte::live::connect_live_for_line(
+                        &line.volte_live,
+                        &device,
+                        &line.volte,
+                        &config,
+                        profile.volte_ip_families.as_deref(),
+                        profile.roaming_allowed,
+                        data_slot_mode,
+                        app.config_manager.get_sms_path_policy().dedupe_enabled,
+                        Arc::clone(&app.database),
+                        Arc::clone(&app.notification_sender),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
             }
-            crate::connectivity::modems::softstack::volte::live::connect_live_for_line(
-                &line.volte_live,
-                &device,
-                &line.volte,
-                &config,
-                profile.volte_ip_families.as_deref(),
-                profile.roaming_allowed,
-                data_slot_mode,
-                app.config_manager.get_sms_path_policy().dedupe_enabled,
-                Arc::clone(&app.database),
-                Arc::clone(&app.notification_sender),
-            )
-            .await
         };
         match result {
             Ok(_) => {

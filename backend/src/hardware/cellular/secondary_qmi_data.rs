@@ -2,43 +2,33 @@
 //!
 //! The MSM8916 firmware cannot keep IMS and Internet bearers alive through the
 //! same ModemManager data slot: starting one regularly deactivates the other.
-//! IMS therefore stays on the primary QMI port and this runtime keeps a
-//! `qmicli --wds-follow-network` process alive on DATA6 for user data.
+//! When IMS uses the primary QMI port, this runtime keeps a
+//! retained WDS CID alive through qmi-proxy on DATA6 for user data. If an
+//! ordinary-data bearer already exists on qmi0, the allocator leaves it there
+//! and moves IMS to DATA6 instead, so this runtime is not started.
 
-use std::{net::IpAddr, process::Stdio, time::Duration};
+use std::{net::IpAddr, time::Duration};
 
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
-    sync::{mpsc, Mutex},
-    task::JoinHandle,
-};
-use tracing::{debug, info, warn};
+use tokio::{process::Command, sync::Mutex};
+use tracing::{info, warn};
 
 use crate::platform::config::ApnConfig;
 
 use super::{
     qmi_netdev::{self, NetdevConfig, ResolvedNetdev},
     qmi_wds,
-    secondary_qmi::{self, SecondaryQmiEndpoint, QMI_OPEN_NET_ARG},
+    secondary_qmi::{self, SecondaryQmiEndpoint},
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(65);
 const CONTEXT_RETRIES: usize = 12;
 
 struct SecondaryDataSession {
-    holder: FollowProcess,
+    client_id: String,
+    packet_data_handle: String,
     endpoint: SecondaryQmiEndpoint,
     netdev: ResolvedNetdev,
     netdev_config: NetdevConfig,
-}
-
-struct FollowProcess {
-    child: Child,
-    stdout_task: JoinHandle<()>,
-    stderr_task: JoinHandle<()>,
-    client_id: String,
-    packet_data_handle: String,
 }
 
 #[derive(Default)]
@@ -62,8 +52,8 @@ impl SecondaryDataRuntime {
         apn: &ApnConfig,
     ) -> Result<String, String> {
         let mut guard = self.session.lock().await;
-        if let Some(session) = guard.as_mut() {
-            if session.holder.child.try_wait().ok().flatten().is_none() {
+        if let Some(session) = guard.as_ref() {
+            if retained_session_is_active(session).await {
                 return Ok(session.netdev.interface.clone());
             }
         }
@@ -71,7 +61,7 @@ impl SecondaryDataRuntime {
             stop_session(session).await;
         }
 
-        let endpoint = secondary_qmi::ensure_endpoint(primary_qmi)
+        let endpoint = secondary_qmi::runtime_endpoint(primary_qmi)
             .await
             .map_err(|error| format!("cellular_secondary_qmi_unavailable:{error}"))?;
         let apn_name = normalized_data_apn(&apn.apn)?;
@@ -117,12 +107,12 @@ async fn start_family(
     apn_name: &str,
     family: u8,
 ) -> Result<SecondaryDataSession, String> {
-    let mut holder = spawn_follow_process(endpoint, apn, apn_name, family).await?;
+    let retained = start_retained_session(endpoint, apn, apn_name, family).await?;
 
-    let settings = match wait_for_current_settings(endpoint, &holder.client_id, family).await {
+    let settings = match wait_for_current_settings(endpoint, &retained.client_id, family).await {
         Ok(settings) => settings,
         Err(error) => {
-            stop_holder(&mut holder, endpoint).await;
+            stop_retained_session(endpoint, &retained).await;
             return Err(error);
         }
     };
@@ -132,153 +122,133 @@ async fn start_family(
     let netdev = match qmi_netdev::resolve(&baseband, &settings).await {
         Ok(netdev) => netdev,
         Err(error) => {
-            stop_holder(&mut holder, endpoint).await;
+            stop_retained_session(endpoint, &retained).await;
             return Err(format!("cellular_data_netdev_unresolved:{error}"));
         }
     };
     if let Err(error) = qmi_netdev::install_default_route(&netdev.interface, &settings).await {
         qmi_netdev::teardown(&netdev.interface, &settings).await;
-        stop_holder(&mut holder, endpoint).await;
+        stop_retained_session(endpoint, &retained).await;
         return Err(format!("cellular_data_policy_route_failed:{error}"));
     }
 
     Ok(SecondaryDataSession {
-        holder,
+        client_id: retained.client_id,
+        packet_data_handle: retained.packet_data_handle,
         endpoint: endpoint.clone(),
         netdev,
         netdev_config: settings,
     })
 }
 
-async fn spawn_follow_process(
+struct RetainedSession {
+    client_id: String,
+    packet_data_handle: String,
+}
+
+async fn start_retained_session(
     endpoint: &SecondaryQmiEndpoint,
     apn: &ApnConfig,
     apn_name: &str,
     family: u8,
-) -> Result<FollowProcess, String> {
+) -> Result<RetainedSession, String> {
     let action = start_action(apn, apn_name, family)?;
-    let mut child = Command::new("qmicli")
-        .args([
-            "--verbose",
-            "-d",
-            endpoint.device_path.as_str(),
-            // The holder and settings reader are separate processes. They must
-            // share QMUX through qmi-proxy or the retained WDS CID is not
-            // addressable by the settings reader.
-            "--device-open-proxy",
-            QMI_OPEN_NET_ARG,
-            "--client-no-release-cid",
-            action.as_str(),
-            "--wds-follow-network",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("secondary_qmi_data_spawn_failed:{error}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "secondary_qmi_data_stdout_missing".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "secondary_qmi_data_stderr_missing".to_string())?;
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let stdout_task = spawn_line_reader(stdout, tx.clone());
-    let stderr_task = spawn_line_reader(stderr, tx);
-
-    let started = tokio::time::timeout(START_TIMEOUT, async {
-        let mut transcript = Vec::new();
-        let mut client_id = None;
-        let mut packet_data_handle = None;
-        while let Some(line) = rx.recv().await {
-            let line = line.trim().to_string();
-            if !line.is_empty() {
-                transcript.push(line.clone());
-            }
-            client_id = client_id.or_else(|| parse_verbose_wds_client_id(&line));
-            packet_data_handle =
-                packet_data_handle.or_else(|| qmi_wds::parse_packet_data_handle(&line));
-            if line.contains("Network started") {
-                let client_id = client_id.ok_or_else(|| {
-                    format!("secondary_qmi_data_cid_missing:{}", transcript.join(" "))
-                })?;
-                // qmicli normally prints the handle on the next line.
-                while packet_data_handle.is_none() {
-                    let Some(next) = rx.recv().await else {
-                        break;
-                    };
-                    let next = next.trim().to_string();
-                    if !next.is_empty() {
-                        transcript.push(next.clone());
-                    }
-                    packet_data_handle = qmi_wds::parse_packet_data_handle(&next);
-                }
-                let packet_data_handle = packet_data_handle.ok_or_else(|| {
-                    format!("secondary_qmi_data_handle_missing:{}", transcript.join(" "))
-                })?;
-                return Ok((client_id, packet_data_handle));
-            }
-            if line.starts_with("error:") {
-                return Err(transcript.join(" "));
-            }
-        }
-        Err(transcript.join(" "))
-    })
-    .await;
-
-    match started {
-        Ok(Ok((client_id, packet_data_handle))) => Ok(FollowProcess {
-            child,
-            stdout_task,
-            stderr_task,
-            client_id,
-            packet_data_handle,
-        }),
-        Ok(Err(error)) => {
-            stop_process(&mut child).await;
-            stdout_task.abort();
-            stderr_task.abort();
-            Err(format!("secondary_qmi_data_start_failed:{error}"))
-        }
-        Err(_) => {
-            stop_process(&mut child).await;
-            stdout_task.abort();
-            stderr_task.abort();
-            Err("secondary_qmi_data_start_timeout".to_string())
-        }
+    let family_action = format!("--wds-set-ip-family={family}");
+    let allocation = run_qmicli(&retained_allocate_args(endpoint.device_path.as_str())).await?;
+    let allocation_text = output_text(&allocation);
+    if !allocation.status.success() {
+        return Err(format!(
+            "secondary_qmi_data_cid_allocate_failed:{}",
+            compact(&allocation_text)
+        ));
     }
-}
+    let client_id = secondary_qmi::parse_wds_client_id(&allocation_text).ok_or_else(|| {
+        format!(
+            "secondary_qmi_data_cid_missing:{}",
+            compact(&allocation_text)
+        )
+    })?;
 
-fn spawn_line_reader<R>(reader: R, tx: mpsc::UnboundedSender<String>) -> JoinHandle<()>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = tx.send(line);
+    if let Err(error) = run_retained_action(
+        endpoint,
+        &client_id,
+        &family_action,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        release_retained_client(endpoint, &client_id).await;
+        return Err(error);
+    }
+    let output = match run_retained_action(endpoint, &client_id, &action, START_TIMEOUT).await {
+        Ok(output) => output,
+        Err(error) => {
+            release_retained_client(endpoint, &client_id).await;
+            return Err(error);
         }
+    };
+    let text = output_text(&output);
+    let packet_data_handle = qmi_wds::parse_packet_data_handle(&text)
+        .ok_or_else(|| format!("secondary_qmi_data_handle_missing:{}", compact(&text)));
+    let packet_data_handle = match packet_data_handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            release_retained_client(endpoint, &client_id).await;
+            return Err(error);
+        }
+    };
+    Ok(RetainedSession {
+        client_id,
+        packet_data_handle,
     })
 }
 
-fn parse_verbose_wds_client_id(line: &str) -> Option<String> {
-    let marker = "client with ID '";
-    if line.contains("registered 'wds'") {
-        let value = line.split_once(marker)?.1.split_once('\'')?.0;
-        if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
-            return Some(value.to_string());
-        }
+fn retained_allocate_args(device: &str) -> Vec<&str> {
+    vec![
+        "--verbose",
+        "-d",
+        device,
+        "--device-open-qmi",
+        "--device-open-proxy",
+        secondary_qmi::QMI_OPEN_NET_ARG,
+        "--client-no-release-cid",
+        "--wds-noop",
+    ]
+}
+
+fn retained_action_args<'a>(device: &'a str, cid: &'a str, action: &'a str) -> Vec<&'a str> {
+    vec![
+        "-d",
+        device,
+        "--device-open-qmi",
+        "--device-open-proxy",
+        secondary_qmi::QMI_OPEN_NET_ARG,
+        cid,
+        "--client-no-release-cid",
+        action,
+    ]
+}
+
+async fn run_retained_action(
+    endpoint: &SecondaryQmiEndpoint,
+    client_id: &str,
+    action: &str,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let cid = format!("--client-cid={client_id}");
+    let output = run_qmicli_with_timeout(
+        &retained_action_args(endpoint.device_path.as_str(), cid.as_str(), action),
+        timeout,
+    )
+    .await?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!(
+            "secondary_qmi_data_action_failed:{}",
+            compact(&output_text(&output))
+        ))
     }
-    if line.contains("service = 'wds'") {
-        let value = line.split_once("cid = '")?.1.split_once('\'')?.0;
-        if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
-            return Some(value.to_string());
-        }
-    }
-    None
 }
 
 async fn wait_for_current_settings(
@@ -313,8 +283,9 @@ async fn read_current_settings(
     let output = run_qmicli(&[
         "-d",
         endpoint.device_path.as_str(),
+        "--device-open-qmi",
         "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
+        secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--client-no-release-cid",
         "--wds-get-current-settings",
@@ -411,43 +382,84 @@ fn start_action(apn: &ApnConfig, apn_name: &str, family: u8) -> Result<String, S
 }
 
 async fn stop_session(mut session: SecondaryDataSession) {
-    stop_holder(&mut session.holder, &session.endpoint).await;
+    let retained = RetainedSession {
+        client_id: std::mem::take(&mut session.client_id),
+        packet_data_handle: std::mem::take(&mut session.packet_data_handle),
+    };
+    stop_retained_session(&session.endpoint, &retained).await;
     qmi_netdev::teardown(&session.netdev.interface, &session.netdev_config).await;
     info!(interface = %session.netdev.interface, "Secondary DATA QMI bearer deactivated");
 }
 
-async fn stop_holder(holder: &mut FollowProcess, endpoint: &SecondaryQmiEndpoint) {
-    stop_process(&mut holder.child).await;
-    holder.stdout_task.abort();
-    holder.stderr_task.abort();
-
-    let cid = format!("--client-cid={}", holder.client_id);
-    let stop = format!("--wds-stop-network={}", holder.packet_data_handle);
+async fn stop_retained_session(endpoint: &SecondaryQmiEndpoint, session: &RetainedSession) {
+    let cid = format!("--client-cid={}", session.client_id);
+    let stop = format!("--wds-stop-network={}", session.packet_data_handle);
     let _ = run_qmicli(&[
         "-d",
         endpoint.device_path.as_str(),
+        "--device-open-qmi",
         "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
+        secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--client-no-release-cid",
         stop.as_str(),
     ])
     .await;
+    release_retained_client(endpoint, &session.client_id).await;
+}
+
+async fn release_retained_client(endpoint: &SecondaryQmiEndpoint, client_id: &str) {
+    let cid = format!("--client-cid={client_id}");
     // Omitting --client-no-release-cid makes qmicli return the retained WDS CID.
     let _ = run_qmicli(&[
         "-d",
         endpoint.device_path.as_str(),
+        "--device-open-qmi",
         "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
+        secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--wds-noop",
     ])
     .await;
 }
 
+async fn retained_session_is_active(session: &SecondaryDataSession) -> bool {
+    let cid = format!("--client-cid={}", session.client_id);
+    let Ok(output) = run_qmicli(&[
+        "-d",
+        session.endpoint.device_path.as_str(),
+        "--device-open-qmi",
+        "--device-open-proxy",
+        secondary_qmi::QMI_OPEN_NET_ARG,
+        cid.as_str(),
+        "--client-no-release-cid",
+        "--wds-get-packet-service-status",
+    ])
+    .await
+    else {
+        return false;
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.status.success()
+        && text
+            .lines()
+            .any(|line| line.to_ascii_lowercase().contains("connection status: 'connected'"))
+}
+
 async fn run_qmicli(args: &[&str]) -> Result<std::process::Output, String> {
+    run_qmicli_with_timeout(args, Duration::from_secs(20)).await
+}
+
+async fn run_qmicli_with_timeout(
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     tokio::time::timeout(
-        Duration::from_secs(20),
+        timeout,
         Command::new("qmicli").args(args).output(),
     )
     .await
@@ -455,26 +467,16 @@ async fn run_qmicli(args: &[&str]) -> Result<std::process::Output, String> {
     .map_err(|error| format!("secondary_qmi_data_command_spawn_failed:{error}"))
 }
 
-async fn stop_process(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        let _ = Command::new("kill")
-            .args(["-INT", &pid.to_string()])
-            .status()
-            .await;
-        if tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .is_ok()
-        {
-            return;
-        }
-    }
-    if let Err(error) = child.kill().await {
-        debug!(error = %error, "Killing secondary DATA holder failed");
-    }
-}
-
 fn compact(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn output_text(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 #[cfg(test)]
@@ -484,11 +486,18 @@ mod tests {
     #[test]
     fn parses_reference_wds_client_id() {
         let line = "[Debug] [/dev/wwan0qmi1] registered 'wds' (version unknown) client with ID '5'";
-        assert_eq!(parse_verbose_wds_client_id(line).as_deref(), Some("5"));
+        assert_eq!(
+            secondary_qmi::parse_wds_client_id(line).as_deref(),
+            Some("5")
+        );
         let allocation = "translated = [ service = 'wds' cid = '17' ]";
         assert_eq!(
-            parse_verbose_wds_client_id(allocation).as_deref(),
+            secondary_qmi::parse_wds_client_id(allocation).as_deref(),
             Some("17")
+        );
+        assert_eq!(
+            secondary_qmi::parse_wds_client_id("CID: '23'").as_deref(),
+            Some("23")
         );
     }
 
@@ -509,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn command_keeps_the_session_in_one_process() {
+    fn retained_start_matches_beta8_open_and_cid_contract() {
         let apn = ApnConfig {
             apn: "internet".to_string(),
             protocol: "dual".to_string(),
@@ -518,7 +527,24 @@ mod tests {
             auth_method: "chap".to_string(),
         };
         let action = start_action(&apn, "internet", 4).unwrap();
+        let family = "--wds-set-ip-family=4";
+        let allocation = retained_allocate_args("/dev/wwan0at2");
+        let cid = "--client-cid=17";
+        let family_args = retained_action_args("/dev/wwan0at2", cid, family);
+        let start_args = retained_action_args("/dev/wwan0at2", cid, &action);
         assert!(action.contains("--wds-start-network=apn=internet,ip-type=4"));
         assert!(action.contains(",auth=CHAP"));
+        assert!(allocation.contains(&"--wds-noop"));
+        assert!(allocation.contains(&"--client-no-release-cid"));
+        assert!(allocation.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(family_args.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(start_args.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(family_args.contains(&family));
+        assert!(family_args.contains(&cid));
+        assert!(!family_args.contains(&action.as_str()));
+        assert!(start_args.contains(&action.as_str()));
+        assert!(start_args.contains(&cid));
+        assert!(!start_args.contains(&family));
+        assert!(!start_args.contains(&"--wds-follow-network"));
     }
 }
