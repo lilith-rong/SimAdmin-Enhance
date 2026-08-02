@@ -54,7 +54,9 @@ pub fn parse_ef_ad_mnc_length(output: &str) -> Option<usize> {
         if octets.len() < 4
             || !octets
                 .iter()
-                .all(|octet| octet.len() == 2 && octet.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .all(|octet| {
+                    octet.len() == 2 && octet.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
         {
             continue;
         }
