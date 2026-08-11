@@ -1,0 +1,21 @@
+meta {
+  name: set_vowifi_line_connection
+  type: http
+  seq: 143
+}
+
+post {
+  url: {{base_url}}/api/vowifi/lines/{{line_id}}/connection
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "enabled": true
+  }
+}
+
+settings {
+  encodeUrl: true
+}

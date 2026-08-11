@@ -1,15 +1,19 @@
 //! 配置管理模块
 //!
-//! 使用 JSON 文件存储用户配置，支持热更新
+//! User configuration with an in-memory typed view and durable persistence.
+//!
+//! Production stores the canonical `AppConfig` document in SQLite. JSON is
+//! retained only as an internal test backend and is never imported at startup.
 
+use rusqlite::{params, Connection as SqliteConnection, OptionalExtension, TransactionBehavior};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Webhook 配置
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,6 +243,7 @@ pub enum NotificationChannel {
 #[serde(rename_all = "snake_case")]
 pub enum NotificationEventType {
     Sms,
+    Call,
     Ddns,
     VersionUpdate,
     SystemEvent,
@@ -828,9 +833,11 @@ struct LegacyChannelMigration {
     enabled: bool,
     config: Value,
     forward_sms: bool,
+    forward_calls: bool,
     forward_ddns: bool,
     forward_updates: bool,
     sms_template: String,
+    call_template: String,
     ddns_template: String,
     update_template: String,
 }
@@ -860,6 +867,13 @@ impl NotificationConfig {
         );
         push_legacy_rule(
             &mut rules,
+            NotificationEventType::Call,
+            "默认通话转发",
+            "legacy-call",
+            &migrations,
+        );
+        push_legacy_rule(
+            &mut rules,
             NotificationEventType::Ddns,
             "默认 DDNS 转发",
             "legacy-ddns",
@@ -880,13 +894,6 @@ impl NotificationConfig {
             log_cleanup: NotificationLogCleanupConfig::default(),
         }
     }
-
-    pub fn first_webhook_config(&self) -> Option<WebhookConfig> {
-        self.channels
-            .iter()
-            .find(|channel| channel.channel_type == NotificationChannel::Webhook)
-            .and_then(|channel| serde_json::from_value(channel.config.clone()).ok())
-    }
 }
 
 fn channel_label(channel: NotificationChannel) -> &'static str {
@@ -904,7 +911,46 @@ fn channel_label(channel: NotificationChannel) -> &'static str {
 }
 
 fn config_value<T: Serialize>(config: &T) -> Value {
-    serde_json::to_value(config).unwrap_or(Value::Object(Default::default()))
+    let mut value = serde_json::to_value(config).unwrap_or(Value::Object(Default::default()));
+    strip_legacy_channel_fields(&mut value);
+    value
+}
+
+fn strip_legacy_channel_fields(value: &mut Value) -> bool {
+    const LEGACY_FIELDS: [&str; 9] = [
+        "enabled",
+        "forward_sms",
+        "forward_calls",
+        "forward_ddns",
+        "forward_updates",
+        "sms_template",
+        "call_template",
+        "ddns_template",
+        "update_template",
+    ];
+
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for field in LEGACY_FIELDS {
+        changed |= object.remove(field).is_some();
+    }
+    if let Some(common) = object.get_mut("common").and_then(Value::as_object_mut) {
+        for field in LEGACY_FIELDS {
+            changed |= common.remove(field).is_some();
+        }
+        if common.is_empty() {
+            object.remove("common");
+        }
+    }
+    changed
+}
+
+fn strip_legacy_notification_channel_fields(config: &mut NotificationConfig) -> bool {
+    config.channels.iter_mut().fold(false, |changed, channel| {
+        strip_legacy_channel_fields(&mut channel.config) || changed
+    })
 }
 
 fn legacy_channel_migrations(legacy: &LegacyNotificationConfig) -> Vec<LegacyChannelMigration> {
@@ -918,11 +964,16 @@ fn legacy_channel_migrations(legacy: &LegacyNotificationConfig) -> Vec<LegacyCha
             enabled: legacy.webhook.enabled,
             config: config_value(&legacy.webhook),
             forward_sms: legacy.webhook.forward_sms,
+            forward_calls: legacy.webhook.forward_calls,
             forward_ddns: legacy.webhook.forward_ddns,
             forward_updates: legacy.webhook.forward_updates,
             sms_template: webhook_text_template(
                 &legacy.webhook.sms_template,
                 &default_rule_template(NotificationEventType::Sms),
+            ),
+            call_template: webhook_text_template(
+                &legacy.webhook.call_template,
+                &default_rule_template(NotificationEventType::Call),
             ),
             ddns_template: webhook_text_template(
                 &legacy.webhook.ddns_template,
@@ -1035,9 +1086,11 @@ fn push_message_channel_migration<T: Serialize>(
         enabled: common.enabled,
         config: config_value(config),
         forward_sms: common.forward_sms,
+        forward_calls: common.forward_calls,
         forward_ddns: common.forward_ddns,
         forward_updates: common.forward_updates,
         sms_template: non_empty_template(&common.sms_template, NotificationEventType::Sms),
+        call_template: non_empty_template(&common.call_template, NotificationEventType::Call),
         ddns_template: non_empty_template(&common.ddns_template, NotificationEventType::Ddns),
         update_template: non_empty_template(
             &common.update_template,
@@ -1057,6 +1110,7 @@ fn push_legacy_rule(
         .iter()
         .filter(|channel| match event_type {
             NotificationEventType::Sms => channel.forward_sms,
+            NotificationEventType::Call => channel.forward_calls,
             NotificationEventType::Ddns => channel.forward_ddns,
             NotificationEventType::VersionUpdate => channel.forward_updates,
             NotificationEventType::SystemEvent => false,
@@ -1072,6 +1126,7 @@ fn push_legacy_rule(
         .first()
         .map(|channel| match event_type {
             NotificationEventType::Sms => channel.sms_template.clone(),
+            NotificationEventType::Call => channel.call_template.clone(),
             NotificationEventType::Ddns => channel.ddns_template.clone(),
             NotificationEventType::VersionUpdate => channel.update_template.clone(),
             NotificationEventType::SystemEvent => String::new(),
@@ -1133,6 +1188,9 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
         NotificationEventType::Sms => {
             "📱 短信通知\nSIM通道: {{SIM通道}}\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}".to_string()
         }
+        NotificationEventType::Call => {
+            "📞 通话通知\n线路: {{线路ID}}\n号码: {{电话号码}}\n方向: {{方向}}\n时间: {{开始时间}}\n时长: {{时长}} 秒\n已接听: {{已接听}}".to_string()
+        }
         NotificationEventType::Ddns => {
             "DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}".to_string()
         }
@@ -1146,7 +1204,7 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
             "设备状态报告\n【{{状态分类}}】\n{{状态内容}}\n\n时间: {{时间}}".to_string()
         }
         NotificationEventType::Automation => {
-            "🤖 自动化事件通知\n任务名称: {{任务名称}}\n任务类型: {{任务类型}}\n执行状态: {{任务状态}}\n详情: {{任务详情}}\n时间: {{触发时间}}\n来源: {{本机号码}}".to_string()
+            "🤖 自动化事件通知\n线路: {{线路ID}}\n任务名称: {{任务名称}}\n任务类型: {{任务类型}}\n执行状态: {{任务状态}}\n详情: {{任务详情}}\n时间: {{触发时间}}\n来源: {{本机号码}}".to_string()
         }
     }
 }
@@ -1232,9 +1290,9 @@ pub struct AutomationTask {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub trigger: AutomationTrigger,
-    /// SIM-dependent actions may pin execution to a persistent modem/SIM line
-    /// or an external reader reservation. Legacy tasks without a target use
-    /// the primary modem line for compatibility.
+    /// SIM-dependent actions must pin execution to a persistent modem/SIM line
+    /// or an external reader reservation. An absent target is valid only for
+    /// device-wide actions such as rebooting the host.
     #[serde(default)]
     pub target: Option<AutomationTarget>,
     pub action: AutomationAction,
@@ -1313,6 +1371,45 @@ mod tests {
         assert!(config.line_profiles.is_empty());
         assert!(config.modem_slots.is_empty());
         assert!(LineProfileConfig::for_line("line-test").enabled);
+    }
+
+    #[test]
+    fn sim_dependent_automation_requires_an_explicit_target() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-automation-target-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let mut task = AutomationTask {
+            id: "task-a".to_string(),
+            name: "restart".to_string(),
+            enabled: true,
+            trigger: AutomationTrigger::Interval {
+                interval_value: 1,
+                interval_unit: "hours".to_string(),
+            },
+            target: None,
+            action: AutomationAction::RestartBaseband,
+        };
+        assert_eq!(
+            manager
+                .set_automation_config(AutomationConfig {
+                    enabled: true,
+                    tasks: vec![task.clone()],
+                })
+                .unwrap_err(),
+            "automation_target_line_required"
+        );
+
+        task.action = AutomationAction::RebootDevice { delay_seconds: 0 };
+        manager
+            .set_automation_config(AutomationConfig {
+                enabled: true,
+                tasks: vec![task],
+            })
+            .expect("device-wide reboot does not need a line");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1466,20 +1563,60 @@ mod tests {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         let manager = ConfigManager::new(path.clone());
-        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let line_a = "line-0123456789abcdef0123456789abcdef";
+        let line_b = "line-fedcba9876543210fedcba9876543210";
         let profile = manager
-            .set_line_volte_connection_enabled(line_id, true)
+            .set_line_volte_connection_enabled(line_a, true)
             .unwrap();
         assert!(profile.volte_connection_enabled);
-        assert!(!manager.get_volte_config().feature_enabled);
+        assert!(!manager.get_line_profile(line_b).volte_connection_enabled);
 
         let reloaded = ConfigManager::new(path.clone());
-        assert!(reloaded.get_line_profile(line_id).volte_connection_enabled);
+        assert!(reloaded.get_line_profile(line_a).volte_connection_enabled);
+        assert!(!reloaded.get_line_profile(line_b).volte_connection_enabled);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn line_path_policies_and_apn_inherit_globals_until_overridden() {
+    fn per_line_media_config_is_explicit_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-line-media-migration-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let mut config = AppConfig::default();
+        let mut profile = LineProfileConfig::for_line(line_id);
+        profile.volte_voice_enabled = false;
+        profile.ims_video.video_payload_type = 111;
+        config.line_profiles.push(profile);
+        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let manager = ConfigManager::new(path.clone());
+        assert!(!manager
+            .reconcile_line_profiles(&[line_id.to_string()])
+            .unwrap());
+        let profile = manager.get_line_profile(line_id);
+        assert!(!profile.volte_voice_enabled);
+        assert_eq!(profile.ims_video.video_payload_type, 111);
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["line_profiles"][0]["volte_voice_enabled"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            persisted["line_profiles"][0]["ims_video"]["video_payload_type"],
+            serde_json::Value::from(111)
+        );
+
+        let _ = std::fs::remove_file(path.with_extension("bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn line_path_policies_and_apn_are_independent() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-policy-{}-{}.json",
             std::process::id(),
@@ -1489,15 +1626,12 @@ mod tests {
         let line_a = "line-0123456789abcdef0123456789abcdef";
         let line_b = "line-fedcba9876543210fedcba9876543210";
 
-        // No override yet: both lines see the global policy and APN.
+        // Each newly discovered line receives its own canonical values.
         assert_eq!(
             manager.get_line_sms_path_policy(line_a).priority,
-            manager.get_sms_path_policy().priority
+            SmsPathPolicy::default().priority
         );
-        assert_eq!(
-            manager.get_line_apn_config(line_a),
-            manager.get_apn_config()
-        );
+        assert_eq!(manager.get_line_apn_config(line_a), ApnConfig::default());
 
         // Overriding line A must not move line B.
         let vowifi_enabled = |policy: SmsPathPolicy| {
@@ -1506,39 +1640,69 @@ mod tests {
                 .iter()
                 .any(|layer| layer.kind == AccessPathKind::Vowifi && layer.enabled)
         };
-        let mut only_volte = manager.get_sms_path_policy();
+        let mut only_volte = SmsPathPolicy::default();
         for layer in &mut only_volte.priority {
             if layer.kind == AccessPathKind::Vowifi {
                 layer.enabled = false;
             }
         }
         manager
-            .set_line_sms_path_policy(line_a, Some(only_volte))
+            .set_line_sms_path_policy(line_a, only_volte)
             .unwrap();
         assert!(!vowifi_enabled(manager.get_line_sms_path_policy(line_a)));
         assert!(vowifi_enabled(manager.get_line_sms_path_policy(line_b)));
-        assert!(vowifi_enabled(manager.get_sms_path_policy()));
 
-        let mut line_apn = manager.get_apn_config();
+        let mut only_volte_voice = VoicePathPolicy::default();
+        for layer in &mut only_volte_voice.priority {
+            if layer.kind == AccessPathKind::Vowifi {
+                layer.enabled = false;
+            }
+        }
+        manager
+            .set_line_voice_path_policy(line_a, only_volte_voice)
+            .unwrap();
+        let voice_vowifi_enabled = |policy: VoicePathPolicy| {
+            policy
+                .priority
+                .iter()
+                .any(|layer| layer.kind == AccessPathKind::Vowifi && layer.enabled)
+        };
+        assert!(!voice_vowifi_enabled(
+            manager.get_line_voice_path_policy(line_a)
+        ));
+        assert!(voice_vowifi_enabled(
+            manager.get_line_voice_path_policy(line_b)
+        ));
+
+        let mut line_apn = ApnConfig::default();
         line_apn.apn = "line-a-apn".to_string();
-        manager.set_line_apn_config(line_a, Some(line_apn)).unwrap();
+        manager.set_line_apn_config(line_a, line_apn).unwrap();
         assert_eq!(manager.get_line_apn_config(line_a).apn, "line-a-apn");
-        assert_eq!(
-            manager.get_line_apn_config(line_b),
-            manager.get_apn_config()
-        );
+        assert_eq!(manager.get_line_apn_config(line_b), ApnConfig::default());
 
-        // Overrides survive a reload, and clearing one falls back to the global.
+        // Explicit values survive a reload; submitting the initial policy only
+        // changes this line.
         let reloaded = ConfigManager::new(path.clone());
         assert!(!vowifi_enabled(reloaded.get_line_sms_path_policy(line_a)));
-        reloaded.set_line_sms_path_policy(line_a, None).unwrap();
+        assert!(!voice_vowifi_enabled(
+            reloaded.get_line_voice_path_policy(line_a)
+        ));
+        reloaded
+            .set_line_sms_path_policy(line_a, SmsPathPolicy::default())
+            .unwrap();
+        reloaded
+            .set_line_voice_path_policy(line_a, VoicePathPolicy::default())
+            .unwrap();
         assert!(vowifi_enabled(reloaded.get_line_sms_path_policy(line_a)));
+        assert!(voice_vowifi_enabled(
+            reloaded.get_line_voice_path_policy(line_a)
+        ));
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn per_line_vowifi_overrides_and_standalone_slots_persist() {
+    fn per_line_vowifi_runtime_intent_and_standalone_slots_persist() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-vowifi-{}-{}.json",
             std::process::id(),
@@ -1551,28 +1715,13 @@ mod tests {
                 line_id,
                 LineVowifiConfig {
                     enabled: true,
-                    dns_server: "1.1.1.1".to_string(),
-                    profile_id: Some("gb_ee_23433".to_string()),
+                    proxy_mode: VowifiProxyMode::Socks5UdpAssociate,
+                    proxy_endpoint: "socks5://127.0.0.1:1080".to_string(),
                     ..LineVowifiConfig::default()
                 },
             )
             .unwrap();
         assert!(profile.vowifi.enabled);
-        assert_eq!(profile.vowifi.profile_id.as_deref(), Some("gb_ee_23433"));
-        assert!(manager.get_vowifi_config().feature_enabled);
-
-        assert_eq!(
-            manager
-                .set_line_vowifi_config(
-                    line_id,
-                    LineVowifiConfig {
-                        dns_server: "not-an-ip".to_string(),
-                        ..LineVowifiConfig::default()
-                    },
-                )
-                .unwrap_err(),
-            "vowifi_dns_server_invalid"
-        );
 
         let slots = manager
             .set_standalone_sim_slots(vec![StandaloneSimSlotConfig {
@@ -1587,8 +1736,8 @@ mod tests {
         let reloaded = ConfigManager::new(path.clone());
         assert_eq!(reloaded.get_standalone_sim_slots().len(), 1);
         assert_eq!(
-            reloaded.get_line_profile(line_id).vowifi.dns_server,
-            "1.1.1.1"
+            reloaded.get_line_profile(line_id).vowifi.proxy_endpoint,
+            "socks5://127.0.0.1:1080"
         );
         let _ = std::fs::remove_file(path);
     }
@@ -1708,45 +1857,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Nothing writes `vowifi-profiles.conf` any more, but the parser has to keep
-    /// reading every shape that was ever written so the one-time migration into
-    /// the carrier profile database does not drop an operator's overrides.
     #[test]
-    fn legacy_vowifi_profiles_parser_reads_both_historical_layouts() {
-        let profile = ExternalVowifiProfile {
-            profile_id: "custom-au".to_string(),
-            mcc: "505".to_string(),
-            mnc: "01".to_string(),
-            epdg_host: "epdg.example.test".to_string(),
-            epdg_port: 4500,
-            ip_stack: "ipv6".to_string(),
-            apn: Some("ims".to_string()),
-            dns_server: None,
-        };
+    fn disabled_line_rejects_data_connection_intent() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-disabled-line-data-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        manager
+            .update_line_profile(line_id, |profile| profile.enabled = false)
+            .unwrap();
 
-        // Versioned object form, with the comment header the writer used to emit.
-        let versioned = format!(
-            "# SimAdmin custom VoWiFi/ePDG profiles\n{}\n",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": 1,
-                "profiles": [profile.clone()],
-            }))
-            .unwrap()
-        );
         assert_eq!(
-            parse_external_vowifi_profiles(&versioned),
-            vec![profile.clone()]
+            manager
+                .set_line_data_connection_enabled(line_id, true)
+                .unwrap_err(),
+            "line_disabled"
         );
-
-        // Older split-marker form with a bare array.
-        let legacy = format!(
-            "# --- BUILTIN PROFILES (READ ONLY) ---\nignored\n# --- CUSTOM PROFILES ---\n{}",
-            serde_json::to_string(&vec![profile.clone()]).unwrap()
-        );
-        assert_eq!(parse_external_vowifi_profiles(&legacy), vec![profile]);
-
-        // A missing or unreadable file yields nothing rather than failing.
-        assert!(parse_external_vowifi_profiles("").is_empty());
+        assert!(!manager.get_line_profile(line_id).data_connection_enabled);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1827,16 +1958,23 @@ mod tests {
 
     #[test]
     fn sms_path_policy_deserializes_from_partial_json() {
-        // Old config with no sms_path at all → default.
-        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.sms_path, SmsPathPolicy::default());
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let cfg: AppConfig = serde_json::from_str(&format!(
+            r#"{{"line_profiles":[{{"line_id":"{line_id}"}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(cfg.line_profiles[0].sms_path, SmsPathPolicy::default());
 
-        // Partial sms_path: only priority given, other fields defaulted.
-        let json = r#"{"sms_path":{"priority":[{"kind":"cs","enabled":true}]}}"#;
-        let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.sms_path.dedupe_enabled);
-        assert_eq!(cfg.sms_path.priority.len(), 1);
-        assert_eq!(cfg.sms_path.priority[0].kind, AccessPathKind::Cs);
+        let json = format!(
+            r#"{{"line_profiles":[{{"line_id":"{line_id}","sms_path":{{"priority":[{{"kind":"cs","enabled":true}}]}}}}]}}"#
+        );
+        let cfg: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(cfg.line_profiles[0].sms_path.dedupe_enabled);
+        assert_eq!(cfg.line_profiles[0].sms_path.priority.len(), 1);
+        assert_eq!(
+            cfg.line_profiles[0].sms_path.priority[0].kind,
+            AccessPathKind::Cs
+        );
     }
 
     #[test]
@@ -1860,29 +1998,66 @@ mod tests {
 
     #[test]
     fn voice_path_policy_is_independent_and_normalized() {
+        let line_id = "line-0123456789abcdef0123456789abcdef";
         let config: AppConfig = serde_json::from_str(
-            r#"{"sms_path":{"priority":[{"kind":"cs","enabled":true}]},"voice_path":{"priority":[{"kind":"volte","enabled":false}]}}"#,
+            &format!(r#"{{"line_profiles":[{{"line_id":"{line_id}","sms_path":{{"priority":[{{"kind":"cs","enabled":true}}]}},"voice_path":{{"priority":[{{"kind":"cs","enabled":true}},{{"kind":"volte","enabled":false}}]}}}}]}}"#),
         )
         .unwrap();
 
-        assert_eq!(config.sms_path.priority[0].kind, AccessPathKind::Cs);
-        let voice = config.voice_path.normalized();
-        assert_eq!(voice.priority.len(), 3);
+        assert_eq!(
+            config.line_profiles[0].sms_path.priority[0].kind,
+            AccessPathKind::Cs
+        );
+        let voice = config.line_profiles[0].voice_path.clone().normalized();
+        assert_eq!(voice.priority.len(), 2);
         assert_eq!(voice.priority[0].kind, AccessPathKind::Volte);
         assert!(!voice.priority[0].enabled);
+        assert!(voice
+            .priority
+            .iter()
+            .all(|layer| layer.kind != AccessPathKind::Cs));
         assert!(voice.gateway_mode);
     }
 
     #[test]
-    fn legacy_voice_services_config_is_ignored_and_not_serialized() {
-        let config: AppConfig = serde_json::from_str(
+    fn voice_path_setter_rejects_cs_trunk_configuration() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-voice-cs-policy-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let policy = VoicePathPolicy {
+            priority: vec![PathLayerConfig {
+                kind: AccessPathKind::Cs,
+                enabled: true,
+            }],
+            gateway_mode: true,
+        };
+
+        assert_eq!(
+            manager
+                .set_line_voice_path_policy(line_id, policy)
+                .unwrap_err(),
+            "voice_cs_trunk_backend_unavailable"
+        );
+        assert_eq!(
+            manager.get_line_voice_path_policy(line_id),
+            VoicePathPolicy::default()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_legacy_voice_services_config_is_rejected() {
+        let error = serde_json::from_str::<AppConfig>(
             r#"{"voice_services":{"feature_enabled":true,"delegate_to_asterisk":true,"marketing_keywords":["推销"]}}"#,
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert!(config.voice_path.gateway_mode);
-        let serialized = serde_json::to_value(config).unwrap();
-        assert!(serialized.get("voice_services").is_none());
+        assert!(error.to_string().contains("unknown field `voice_services`"));
     }
 
     #[test]
@@ -1901,6 +2076,7 @@ mod tests {
         legacy.webhook.enabled = true;
         legacy.webhook.url = "https://example.com/hook".to_string();
         legacy.webhook.forward_sms = true;
+        legacy.webhook.forward_calls = true;
         legacy.webhook.forward_ddns = false;
         legacy.webhook.forward_updates = true;
 
@@ -1919,6 +2095,11 @@ mod tests {
             .iter()
             .any(|rule| rule.event_type == NotificationEventType::Sms
                 && rule.channel_ids == vec!["webhook-1".to_string()]));
+        assert!(migrated
+            .rules
+            .iter()
+            .any(|rule| rule.event_type == NotificationEventType::Call
+                && rule.channel_ids == vec!["webhook-1".to_string()]));
         assert!(!migrated
             .rules
             .iter()
@@ -1927,78 +2108,125 @@ mod tests {
             .rules
             .iter()
             .any(|rule| rule.event_type == NotificationEventType::VersionUpdate));
+        let channel_config = migrated.channels[0].config.as_object().unwrap();
+        assert_eq!(
+            channel_config.get("url").and_then(Value::as_str),
+            Some("https://example.com/hook")
+        );
+        for retired in [
+            "enabled",
+            "forward_sms",
+            "forward_calls",
+            "forward_ddns",
+            "forward_updates",
+            "sms_template",
+            "call_template",
+            "ddns_template",
+            "update_template",
+        ] {
+            assert!(
+                channel_config.get(retired).is_none(),
+                "retired field {retired}"
+            );
+        }
     }
 
     #[test]
-    fn vowifi_config_defaults_to_quiet_mode() {
-        let config = AppConfig::default();
-
-        assert!(!config.vowifi.feature_enabled);
-        assert!(!config.vowifi.connection_enabled);
-        assert_eq!(config.vowifi.auto_restore_initial_delay_secs, 60);
-        assert_eq!(config.vowifi.auto_restore_attempts, 3);
-        assert_eq!(config.vowifi.auto_restore_retry_delay_secs, 30);
+    fn line_auto_restore_defaults_are_explicit() {
+        let profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        assert_eq!(profile.volte_auto_restore, AutoRestoreConfig::default());
+        assert_eq!(profile.vowifi.auto_restore, AutoRestoreConfig::default());
     }
 
     #[test]
-    fn volte_ip_family_preference_round_trips() {
-        let defaulted: VolteConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(
-            defaulted.ip_family_preference,
-            VolteIpFamilyPreference::Ipv4First
-        );
-
-        let configured: VolteConfig =
-            serde_json::from_str(r#"{"ip_family_preference":"ipv4_first"}"#).unwrap();
-        assert_eq!(
-            configured.ip_family_preference,
-            VolteIpFamilyPreference::Ipv4First
-        );
-        // The preference is now honored by the connect flow, so it must survive a
-        // serialize/deserialize round-trip and stay visible to the config UI.
-        assert_eq!(
-            serde_json::to_value(configured)
-                .unwrap()
-                .get("ip_family_preference")
-                .and_then(|value| value.as_str()),
-            Some("ipv4_first")
-        );
+    fn line_volte_ip_families_round_trip() {
+        let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        assert_eq!(profile.volte_ip_families, default_line_volte_ip_families());
+        profile.volte_ip_families = vec![VolteIpFamily::Ipv6];
+        let round_trip: LineProfileConfig =
+            serde_json::from_value(serde_json::to_value(profile).unwrap()).unwrap();
+        assert_eq!(round_trip.volte_ip_families, vec![VolteIpFamily::Ipv6]);
     }
 
     #[test]
-    fn vowifi_connection_intent_requires_feature_switch() {
+    fn removed_global_root_keys_are_rejected() {
+        for legacy_field in [
+            "webhook",
+            "vowifi",
+            "volte",
+            "roaming_allowed",
+            "data_enabled",
+            "apn",
+            "vilte",
+            "sms_path",
+            "voice_path",
+        ] {
+            let error = serde_json::from_str::<AppConfig>(&format!(r#"{{"{legacy_field}":null}}"#))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{legacy_field}`")),
+                "removed global field {legacy_field} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_root_settings_block_config_load_without_rewriting_file() {
         let path = std::env::temp_dir().join(format!(
-            "simadmin-vowifi-config-{}-{}.json",
+            "simadmin_invalid_root_config_{}_{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let original = r#"{"volte":{"enabled":true}}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let error = match ConfigManager::try_new(path.clone()) {
+            Ok(_) => panic!("removed root setting must block configuration load"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unknown field `volte`"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("tmp"));
+        let _ = std::fs::remove_file(path.with_extension("bak"));
+    }
+
+    #[test]
+    fn old_line_config_version_blocks_load_without_rewriting_file() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-old-line-config-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let manager = ConfigManager::new(path.clone());
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let mut config = AppConfig::default();
+        config.line_config_version = 1;
+        config
+            .line_profiles
+            .push(LineProfileConfig::for_line(line_id));
+        let original = serde_json::to_vec_pretty(&config).unwrap();
+        std::fs::write(&path, &original).unwrap();
 
-        assert_eq!(
-            manager.set_vowifi_connection_enabled(true).unwrap_err(),
-            "vowifi_feature_disabled"
-        );
+        let error = match ConfigManager::try_new(path.clone()) {
+            Ok(_) => panic!("old line config version must block configuration load"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Unsupported line config version 1"));
+        assert!(error.contains(&format!("expected {CURRENT_LINE_CONFIG_VERSION}")));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
 
-        let enabled = manager.set_vowifi_feature_enabled(true).unwrap();
-        assert!(enabled.feature_enabled);
-        assert!(!enabled.connection_enabled);
-
-        let connected = manager.set_vowifi_connection_enabled(true).unwrap();
-        assert!(connected.feature_enabled);
-        assert!(connected.connection_enabled);
-
-        let disabled = manager.set_vowifi_feature_enabled(false).unwrap();
-        assert!(!disabled.feature_enabled);
-        assert!(!disabled.connection_enabled);
-
+        let _ = std::fs::remove_file(path.with_extension("bak"));
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn vilte_feature_requires_volte_voice() {
+    fn per_line_voice_and_ims_video_are_isolated_and_persist() {
         let path = std::env::temp_dir().join(format!(
             "simadmin_vilte_gate_{}_{}.json",
             std::process::id(),
@@ -2008,52 +2236,128 @@ mod tests {
                 .as_nanos()
         ));
         let manager = ConfigManager::new(path.clone());
+        let line_a = "line-0123456789abcdef0123456789abcdef";
+        let line_b = "line-fedcba9876543210fedcba9876543210";
 
-        // Without VoLTE voice, enabling ViLTE is rejected.
+        manager.set_line_volte_voice_enabled(line_a, false).unwrap();
         assert_eq!(
-            manager.set_vilte_feature_enabled(true).unwrap_err(),
+            manager
+                .set_line_ims_video_volte_enabled(line_a, true)
+                .unwrap_err(),
             "volte_voice_disabled"
         );
 
-        // Turn on VoLTE feature then voice, then ViLTE is allowed.
-        manager.set_volte_feature_enabled(true).unwrap();
-        manager.set_volte_voice_enabled(true).unwrap();
-        let vilte = manager.set_vilte_feature_enabled(true).unwrap();
-        assert!(vilte.feature_enabled);
-        assert_eq!(vilte.codec, "h264");
+        manager.set_line_volte_voice_enabled(line_b, true).unwrap();
+        let ims_video = manager
+            .set_line_ims_video_volte_enabled(line_b, true)
+            .unwrap();
+        assert!(ims_video.volte_enabled);
+        assert_eq!(ims_video.codec, "h264");
+        assert!(!manager.get_line_volte_voice_enabled(line_a));
+        assert!(manager.get_line_volte_voice_enabled(line_b));
+        assert!(!manager.get_line_ims_video_config(line_a).volte_enabled);
+        assert!(manager.get_line_ims_video_config(line_b).volte_enabled);
+
+        // VoWiFi gate is independent of the VoLTE voice gate.
+        assert_eq!(
+            manager
+                .set_line_ims_video_vowifi_enabled(line_b, true)
+                .unwrap_err(),
+            "vowifi_voice_disabled"
+        );
+        manager
+            .set_line_vowifi_connection_enabled(line_b, true)
+            .unwrap();
+        let vowifi_video = manager
+            .set_line_ims_video_vowifi_enabled(line_b, true)
+            .unwrap();
+        assert!(vowifi_video.vowifi_enabled);
+        assert!(vowifi_video.volte_enabled);
 
         assert_eq!(
             manager
-                .set_vilte_config(VilteConfig {
-                    codec: "vp8".to_string(),
-                    ..VilteConfig::default()
-                })
+                .set_line_ims_video_config(
+                    line_b,
+                    ImsVideoConfig {
+                        codec: "vp8".to_string(),
+                        ..ImsVideoConfig::default()
+                    },
+                )
                 .unwrap_err(),
             "vilte_codec_unsupported"
         );
         assert_eq!(
             manager
-                .set_vilte_config(VilteConfig {
-                    video_payload_type: 95,
-                    ..VilteConfig::default()
-                })
+                .set_line_ims_video_config(
+                    line_b,
+                    ImsVideoConfig {
+                        video_payload_type: 95,
+                        ..ImsVideoConfig::default()
+                    },
+                )
                 .unwrap_err(),
             "vilte_payload_type_invalid"
         );
 
-        // set_vilte_config forces feature off when voice is off.
-        manager.set_volte_voice_enabled(false).unwrap();
-        assert!(!manager.get_vilte_config().feature_enabled);
+        manager.set_line_volte_voice_enabled(line_b, false).unwrap();
+        assert!(!manager.get_line_ims_video_config(line_b).volte_enabled);
         let forced = manager
-            .set_vilte_config(VilteConfig {
-                feature_enabled: true,
-                ..VilteConfig::default()
-            })
+            .set_line_ims_video_config(
+                line_b,
+                ImsVideoConfig {
+                    volte_enabled: true,
+                    video_payload_type: 112,
+                    ..ImsVideoConfig::default()
+                },
+            )
             .unwrap();
         assert!(
-            !forced.feature_enabled,
-            "ViLTE must be forced off when VoLTE voice is disabled"
+            !forced.volte_enabled,
+            "VoLTE video must be forced off when VoLTE voice is disabled"
         );
+        assert_eq!(forced.video_payload_type, 112);
+
+        let reloaded = ConfigManager::new(path.clone());
+        assert!(!reloaded.get_line_volte_voice_enabled(line_a));
+        assert!(!reloaded.get_line_volte_voice_enabled(line_b));
+        assert_eq!(
+            reloaded
+                .get_line_ims_video_config(line_b)
+                .video_payload_type,
+            112
+        );
+        assert!(!reloaded.get_line_ims_video_config(line_a).volte_enabled);
+
+        let _ = std::fs::remove_file(path.with_extension("bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_vilte_schema_is_rejected_without_rewriting_source() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin_vilte_migration_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Old schema: `vilte.feature_enabled` under the per-line profile.
+        let json = format!(
+            r#"{{
+                "line_profiles": [{{
+                    "line_id": "line-0123456789abcdef0123456789abcdef",
+                    "volte_voice_enabled": true,
+                    "vilte": {{ "feature_enabled": true, "video_payload_type": 111 }}
+                }}]
+            }}"#
+        );
+        std::fs::write(&path, &json).unwrap();
+        let error = ConfigManager::try_new(path.clone())
+            .err()
+            .expect("legacy schema must be rejected");
+        assert!(error.contains("Unsupported line config version"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), json);
 
         let _ = std::fs::remove_file(path);
     }
@@ -2354,6 +2658,197 @@ mod tests {
         assert!(!off.trunk.enabled);
         let _ = std::fs::remove_file(path);
     }
+
+    fn sqlite_config_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "simadmin-config-sqlite-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn sqlite_config_persists_one_versioned_document() {
+        let dir = sqlite_config_test_dir("persist");
+        let path = dir.join("config.sqlite3");
+        let manager = ConfigManager::try_new(path.clone()).unwrap();
+        let mut security = manager.get_security();
+        security.session_ttl_seconds = 7_200;
+        manager.set_security(security).unwrap();
+        drop(manager);
+
+        let reloaded = ConfigManager::try_new(path.clone()).unwrap();
+        assert_eq!(reloaded.get_security().session_ttl_seconds, 7_200);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let connection = SqliteConnection::open(&path).unwrap();
+        let row: (u32, u32, i64) = connection
+            .query_row(
+                "SELECT storage_schema_version, line_config_version, COUNT(*)
+                 FROM app_config WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                CONFIG_STORAGE_SCHEMA_VERSION,
+                CURRENT_LINE_CONFIG_VERSION,
+                1
+            )
+        );
+        drop(connection);
+        drop(reloaded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_config_rejects_symlink_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = sqlite_config_test_dir("symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.sqlite3");
+        std::fs::write(&target, b"not a database").unwrap();
+        let path = dir.join("config.sqlite3");
+        symlink(&target, &path).unwrap();
+
+        let error = match ConfigManager::try_new(path) {
+            Ok(_) => panic!("symlink database must not be followed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Refusing symlink config database"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"not a database");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sqlite_config_ignores_sibling_json_and_uses_defaults() {
+        let dir = sqlite_config_test_dir("no-legacy-import");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_path = dir.join("config.json");
+        let sqlite_path = dir.join("config.sqlite3");
+        let mut legacy = AppConfig::default();
+        legacy.security.session_ttl_seconds = 9_000;
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        std::fs::write(&legacy_path, &original).unwrap();
+
+        let manager = ConfigManager::try_new(sqlite_path.clone()).unwrap();
+        assert_eq!(
+            manager.get_security().session_ttl_seconds,
+            AppConfig::default().security.session_ttl_seconds
+        );
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), original);
+        assert!(!legacy_path.with_extension("json.migrated.bak").exists());
+        assert!(sqlite_path.exists());
+        drop(manager);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sqlite_config_invalid_document_fails_closed() {
+        let dir = sqlite_config_test_dir("invalid");
+        let path = dir.join("config.sqlite3");
+        drop(ConfigManager::try_new(path.clone()).unwrap());
+        let connection = SqliteConnection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE app_config SET config_json = ?1 WHERE singleton = 1",
+                [r#"{"unknown_root_setting":true}"#],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match ConfigManager::try_new(path.clone()) {
+            Ok(_) => panic!("invalid SQLite config must not fall back to defaults"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unknown field `unknown_root_setting`"));
+        let connection = SqliteConnection::open(&path).unwrap();
+        let stored: String = connection
+            .query_row(
+                "SELECT config_json FROM app_config WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, r#"{"unknown_root_setting":true}"#);
+        drop(connection);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sqlite_config_unknown_storage_schema_fails_closed() {
+        let dir = sqlite_config_test_dir("schema");
+        let path = dir.join("config.sqlite3");
+        drop(ConfigManager::try_new(path.clone()).unwrap());
+        let connection = SqliteConnection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE app_config SET storage_schema_version = 999 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match ConfigManager::try_new(path.clone()) {
+            Ok(_) => panic!("unknown storage schema must not load"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Unsupported config storage schema version 999"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sqlite_config_and_sim_overrides_share_file_without_clobbering() {
+        use crate::connectivity::modems::ims::profile_override::{
+            ImsCommonOverride, SimBindingKey, SimOverride, SimOverrideStore,
+        };
+
+        let dir = sqlite_config_test_dir("shared");
+        let path = dir.join("config.sqlite3");
+        let manager = ConfigManager::try_new(path.clone()).unwrap();
+        let overrides = SimOverrideStore::sqlite(path.clone());
+        let binding = SimBindingKey::resolve(Some("8986001234567890123"), None).unwrap();
+        let override_ = SimOverride {
+            ims_common: ImsCommonOverride {
+                voicemail_number: Some("123".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        overrides.save(&binding, &override_).unwrap();
+        let mut security = manager.get_security();
+        security.session_ttl_seconds = 10_000;
+        manager.set_security(security).unwrap();
+        drop(manager);
+
+        let reloaded = ConfigManager::try_new(path.clone()).unwrap();
+        assert_eq!(reloaded.get_security().session_ttl_seconds, 10_000);
+        assert_eq!(
+            overrides
+                .load(&binding)
+                .unwrap()
+                .unwrap()
+                .ims_common
+                .voicemail_number
+                .as_deref(),
+            Some("123")
+        );
+        drop(reloaded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 fn default_ddns_provider() -> String {
@@ -2404,10 +2899,6 @@ fn default_ddns_ipv6_config() -> DdnsIpConfig {
 
 fn default_roaming_allowed() -> bool {
     true
-}
-
-fn default_data_enabled() -> bool {
-    false
 }
 
 fn default_password_min_length() -> u8 {
@@ -2477,48 +2968,6 @@ impl Default for EsimConfig {
     }
 }
 
-fn default_vowifi_auto_restore_initial_delay_secs() -> u64 {
-    60
-}
-
-fn default_vowifi_auto_restore_attempts() -> u8 {
-    3
-}
-
-fn default_vowifi_auto_restore_retry_delay_secs() -> u64 {
-    30
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VowifiConfig {
-    #[serde(default)]
-    pub feature_enabled: bool,
-    #[serde(default)]
-    pub connection_enabled: bool,
-    #[serde(default = "default_vowifi_auto_restore_initial_delay_secs")]
-    pub auto_restore_initial_delay_secs: u64,
-    #[serde(default = "default_vowifi_auto_restore_attempts")]
-    pub auto_restore_attempts: u8,
-    #[serde(default = "default_vowifi_auto_restore_retry_delay_secs")]
-    pub auto_restore_retry_delay_secs: u64,
-}
-
-impl Default for VowifiConfig {
-    fn default() -> Self {
-        Self {
-            feature_enabled: false,
-            connection_enabled: false,
-            auto_restore_initial_delay_secs: default_vowifi_auto_restore_initial_delay_secs(),
-            auto_restore_attempts: default_vowifi_auto_restore_attempts(),
-            auto_restore_retry_delay_secs: default_vowifi_auto_restore_retry_delay_secs(),
-        }
-    }
-}
-
-fn default_volte_sms_enabled() -> bool {
-    true
-}
-
 fn default_volte_voice_enabled() -> bool {
     false
 }
@@ -2533,6 +2982,26 @@ fn default_volte_auto_restore_attempts() -> u8 {
 
 fn default_volte_auto_restore_retry_delay_secs() -> u64 {
     30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoRestoreConfig {
+    #[serde(default = "default_volte_auto_restore_initial_delay_secs")]
+    pub initial_delay_secs: u64,
+    #[serde(default = "default_volte_auto_restore_attempts")]
+    pub attempts: u8,
+    #[serde(default = "default_volte_auto_restore_retry_delay_secs")]
+    pub retry_delay_secs: u64,
+}
+
+impl Default for AutoRestoreConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_secs: default_volte_auto_restore_initial_delay_secs(),
+            attempts: default_volte_auto_restore_attempts(),
+            retry_delay_secs: default_volte_auto_restore_retry_delay_secs(),
+        }
+    }
 }
 
 /// IMS bearer IP address-family attempt order. The runtime always asks the
@@ -2553,17 +3022,8 @@ pub enum VolteIpFamilyPreference {
 }
 
 impl VolteIpFamilyPreference {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ipv6First => "ipv6_first",
-            Self::Ipv4First => "ipv4_first",
-            Self::Ipv6Only => "ipv6_only",
-            Self::Ipv4Only => "ipv4_only",
-        }
-    }
-
-    /// The equivalent ordered attempt list. Lets the runtime treat the legacy
-    /// single-select preference and the newer per-line ordered list uniformly.
+    /// The equivalent ordered attempt list used by per-line profiles and IMS
+    /// planning helpers.
     /// The `*First` presets lead with dual-stack, matching the historical
     /// "always try dual-stack first, then fall back to single families" behaviour.
     pub fn to_families(self) -> Vec<VolteIpFamily> {
@@ -2608,45 +3068,8 @@ impl VolteIpFamily {
     }
 }
 
-/// VoLTE (IMS over LTE) SMS configuration.
-///
-/// `feature_enabled`, `sms_enabled`, and `connection_enabled` are retained for
-/// backward-compatible config/API deserialization. Physical modem lines use
-/// `LineProfileConfig::volte_connection_enabled` as their sole IMS connection
-/// intent; these legacy global fields must not gate a line.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VolteConfig {
-    #[serde(default)]
-    pub feature_enabled: bool,
-    #[serde(default = "default_volte_sms_enabled")]
-    pub sms_enabled: bool,
-    #[serde(default = "default_volte_voice_enabled")]
-    pub voice_enabled: bool,
-    #[serde(default)]
-    pub connection_enabled: bool,
-    #[serde(default)]
-    pub ip_family_preference: VolteIpFamilyPreference,
-    #[serde(default = "default_volte_auto_restore_initial_delay_secs")]
-    pub auto_restore_initial_delay_secs: u64,
-    #[serde(default = "default_volte_auto_restore_attempts")]
-    pub auto_restore_attempts: u8,
-    #[serde(default = "default_volte_auto_restore_retry_delay_secs")]
-    pub auto_restore_retry_delay_secs: u64,
-}
-
-impl Default for VolteConfig {
-    fn default() -> Self {
-        Self {
-            feature_enabled: false,
-            sms_enabled: default_volte_sms_enabled(),
-            voice_enabled: default_volte_voice_enabled(),
-            connection_enabled: false,
-            ip_family_preference: VolteIpFamilyPreference::default(),
-            auto_restore_initial_delay_secs: default_volte_auto_restore_initial_delay_secs(),
-            auto_restore_attempts: default_volte_auto_restore_attempts(),
-            auto_restore_retry_delay_secs: default_volte_auto_restore_retry_delay_secs(),
-        }
-    }
+fn default_line_volte_ip_families() -> Vec<VolteIpFamily> {
+    VolteIpFamilyPreference::default().to_families()
 }
 
 /// How this line's logical SIP trunk associates with the remote Asterisk/FreePBX.
@@ -2825,10 +3248,6 @@ impl TrunkProfileConfig {
     }
 }
 
-fn default_vowifi_epdg_port() -> u16 {
-    500
-}
-
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 /// How this line's IKEv2/NAT-T traffic leaves the host.
@@ -2849,9 +3268,9 @@ pub enum VowifiProxyMode {
     UdpRelay,
 }
 
-/// Per-SIM WiFi Calling intent and network overrides. The proxy endpoint is
-/// kept separate from the mode because ordinary HTTP CONNECT cannot carry the
-/// UDP 500/4500 traffic used by IKEv2/NAT-T.
+/// Per-line WiFi Calling runtime intent. SIM-bound carrier selection, DNS,
+/// ePDG and IMS values live exclusively in `SimOverrideStore`; only the host
+/// egress proxy remains attached to the physical line.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LineVowifiConfig {
     #[serde(default)]
@@ -2861,70 +3280,7 @@ pub struct LineVowifiConfig {
     #[serde(default)]
     pub proxy_endpoint: String,
     #[serde(default)]
-    pub dns_server: String,
-    /// Pin this line to a specific carrier profile by `profile_id`. `None`
-    /// (the default) resolves the profile automatically from the SIM's IMSI:
-    /// database match first, then the built-in / dynamic 3GPP derivation.
-    ///
-    /// Only a profile that exists in the carrier-profile database is honored; a
-    /// pinned id that no longer resolves there falls back to automatic matching,
-    /// so deleting a profile can never strand a line. This replaces the old
-    /// per-line `epdg_host`/`epdg_port` overrides — the ePDG now always comes
-    /// from the resolved profile, editable on the 运营商 Profile page.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExternalVowifiProfile {
-    pub profile_id: String,
-    pub mcc: String,
-    pub mnc: String,
-    pub epdg_host: String,
-    #[serde(default = "default_vowifi_epdg_port")]
-    pub epdg_port: u16,
-    #[serde(default = "default_external_ip_stack")]
-    pub ip_stack: String,
-    #[serde(default)]
-    pub apn: Option<String>,
-    #[serde(default)]
-    pub dns_server: Option<String>,
-}
-
-fn default_external_ip_stack() -> String {
-    "ipv6".to_string()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ExternalVowifiProfilesFile {
-    #[serde(default = "default_external_profiles_schema_version")]
-    schema_version: u32,
-    #[serde(default)]
-    profiles: Vec<ExternalVowifiProfile>,
-}
-
-fn default_external_profiles_schema_version() -> u32 {
-    1
-}
-
-/// Parse the legacy `vowifi-profiles.conf`.
-///
-/// Kept only so the one-time migration into the profile database can read an
-/// existing file; nothing writes this format any more.
-pub fn parse_external_vowifi_profiles(content: &str) -> Vec<ExternalVowifiProfile> {
-    let legacy_or_current = content
-        .split("# --- CUSTOM PROFILES ---")
-        .nth(1)
-        .unwrap_or(content);
-    let json = legacy_or_current
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    serde_json::from_str::<ExternalVowifiProfilesFile>(json.trim())
-        .map(|file| file.profiles)
-        .or_else(|_| serde_json::from_str::<Vec<ExternalVowifiProfile>>(json.trim()))
-        .unwrap_or_default()
+    pub auto_restore: AutoRestoreConfig,
 }
 
 impl Default for LineVowifiConfig {
@@ -2933,8 +3289,7 @@ impl Default for LineVowifiConfig {
             enabled: false,
             proxy_mode: VowifiProxyMode::Direct,
             proxy_endpoint: String::new(),
-            dns_server: String::new(),
-            profile_id: None,
+            auto_restore: AutoRestoreConfig::default(),
         }
     }
 }
@@ -2952,16 +3307,21 @@ pub struct StandaloneSimSlotConfig {
     pub enabled: bool,
 }
 
-/// Persisted controls for one stable physical-modem + SIM line. Trunk settings
-/// extend this same profile; keeping the connection flag here makes multi-line
-/// auto-restore independent instead of relying on one global bool.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Persisted controls for one stable physical-modem + SIM line. Every
+/// connectivity intent and Trunk setting is owned by this profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LineProfileConfig {
     pub line_id: String,
     #[serde(default = "default_line_enabled")]
     pub enabled: bool,
     #[serde(default)]
     pub volte_connection_enabled: bool,
+    #[serde(default)]
+    pub volte_auto_restore: AutoRestoreConfig,
+    #[serde(default = "default_volte_voice_enabled")]
+    pub volte_voice_enabled: bool,
+    #[serde(default, alias = "vilte")]
+    pub ims_video: ImsVideoConfig,
     #[serde(default)]
     pub vowifi: LineVowifiConfig,
     #[serde(default)]
@@ -2979,26 +3339,20 @@ pub struct LineProfileConfig {
     /// while preserving Wi-Fi based VoWiFi and Asterisk Trunk intents.
     #[serde(default)]
     pub airplane_mode_enabled: bool,
-    /// Per-line SMS path priority. `None` inherits the global policy, so
-    /// single-line installs and existing config files keep working unchanged.
-    /// A SIM that only has working VoLTE and a SIM that only has working VoWiFi
-    /// need different orders, which one global list cannot express.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sms_path: Option<SmsPathPolicy>,
-    /// Per-line voice path priority; same inheritance rule as `sms_path`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub voice_path: Option<VoicePathPolicy>,
-    /// Per-line ordered IMS IP-family attempt order. `None` inherits the global
-    /// `VolteConfig.ip_family_preference`. The list elements are the families to
-    /// enable, in fallback order: `[Ipv4, Ipv6]` tries dual-stack then IPv4 then
-    /// IPv6 (== `Ipv4First`), `[Ipv6]` is IPv6-only, and so on. An empty list is
-    /// treated as "follow the default" so a line can never disable both families.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volte_ip_families: Option<Vec<VolteIpFamily>>,
-    /// Per-line APN. `None` inherits the global APN, which is only correct while
-    /// every SIM is on the same carrier.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub apn: Option<ApnConfig>,
+    /// Per-line SMS path priority.
+    #[serde(default)]
+    pub sms_path: SmsPathPolicy,
+    /// Per-line voice path priority.
+    #[serde(default)]
+    pub voice_path: VoicePathPolicy,
+    /// Per-line ordered IMS IP-family attempt order. The list elements are the families to
+    /// enable, in fallback order. `[Ipv4v6, Ipv4, Ipv6]` tries dual-stack, then
+    /// IPv4, then IPv6; `[Ipv6]` is IPv6-only. An empty list is invalid.
+    #[serde(default = "default_line_volte_ip_families")]
+    pub volte_ip_families: Vec<VolteIpFamily>,
+    /// Per-line APN.
+    #[serde(default)]
+    pub apn: ApnConfig,
     /// Per-line eSIM (eUICC) management control. `None` means "auto": eSIM
     /// management is offered only when the line's SIM reports a eUICC chip
     /// (`esim_status`/`sim_type`). `Some(true)` forces eSIM management on even
@@ -3097,16 +3451,19 @@ impl LineProfileConfig {
             line_id: line_id.into(),
             enabled: true,
             volte_connection_enabled: false,
-            volte_ip_families: None,
+            volte_auto_restore: AutoRestoreConfig::default(),
+            volte_voice_enabled: default_volte_voice_enabled(),
+            ims_video: ImsVideoConfig::default(),
+            volte_ip_families: default_line_volte_ip_families(),
             vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
             data_connection_enabled: false,
             data_proxy: LineDataProxyConfig::default(),
             roaming_allowed: default_roaming_allowed(),
             airplane_mode_enabled: false,
-            sms_path: None,
-            voice_path: None,
-            apn: None,
+            sms_path: SmsPathPolicy::default().normalized(),
+            voice_path: VoicePathPolicy::default().normalized(),
+            apn: ApnConfig::default(),
             esim_control: None,
         }
     }
@@ -3118,6 +3475,12 @@ impl LineProfileConfig {
             data_proxy: self.data_proxy.redacted(),
             ..self.clone()
         }
+    }
+}
+
+impl Default for LineProfileConfig {
+    fn default() -> Self {
+        Self::for_line(String::new())
     }
 }
 
@@ -3144,16 +3507,6 @@ fn validate_line_data_proxy_config(config: &mut LineDataProxyConfig) -> Result<(
 
 fn validate_line_vowifi_config(config: &mut LineVowifiConfig) -> Result<(), String> {
     config.proxy_endpoint = config.proxy_endpoint.trim().to_string();
-    config.dns_server = config.dns_server.trim().to_string();
-    config.profile_id = config
-        .profile_id
-        .as_ref()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    if !config.dns_server.is_empty() && config.dns_server.parse::<std::net::IpAddr>().is_err() {
-        return Err("vowifi_dns_server_invalid".to_string());
-    }
     match config.proxy_mode {
         VowifiProxyMode::Direct => config.proxy_endpoint.clear(),
         VowifiProxyMode::Socks5UdpAssociate => {
@@ -3179,7 +3532,7 @@ fn valid_trunk_binding(binding: &str) -> bool {
         })
 }
 
-// ===================== Phase F: ViLTE (video telephony over LTE) =====================
+// ===================== Phase F: shared IMS video (ViLTE / VoWiFi video) =====================
 
 fn default_vilte_codec() -> String {
     "h264".to_string()
@@ -3192,28 +3545,37 @@ fn default_vilte_video_payload_type() -> u8 {
 
 fn default_vilte_h264_fmtp() -> String {
     // Baseline profile, packetization-mode 1 (non-interleaved). profile-level-id
-    // 42e01f = Constrained Baseline, level 3.1 — a widely interoperable ViLTE
+    // 42e01f = Constrained Baseline, level 3.1 — a widely interoperable IMS video
     // default. The relay never transcodes, so this is purely what we advertise
     // to the far end on the offer/answer; the negotiated value is carried
     // through verbatim.
     "profile-level-id=42e01f;packetization-mode=1".to_string()
 }
 
-/// ViLTE (video telephony over LTE) configuration.
+/// Shared IMS video (ViLTE / VoWiFi video) configuration, gated per access leg.
 ///
-/// Video rides the *same* IMS voice session as VoLTE voice (one INVITE, an
-/// audio `m=` line plus a video `m=` line), so `feature_enabled` here is gated
-/// on the VoLTE voice feature at the `ConfigManager` layer. On the target
-/// hardware class (no audio/video capture) the device is a pure media relay: it
-/// forwards RTP between the operator IMS leg and an internal SIP UA and never
-/// encodes/decodes video. Therefore only pass-through codecs are meaningful —
-/// `codec` is what we advertise, not something we transcode to.
+/// Video rides the *same* IMS voice session as the access's voice call (one
+/// INVITE, an audio `m=` line plus a video `m=` line). VoLTE and VoWiFi each
+/// carry their own gate: `volte_enabled` is gated on the VoLTE voice feature at
+/// the `ConfigManager` layer, and `vowifi_enabled` on the VoWiFi voice feature.
+/// On the target hardware class (no audio/video capture) the device is a pure
+/// media relay: it forwards RTP between the operator IMS leg and an internal
+/// SIP UA and never encodes/decodes video. Therefore only pass-through codecs
+/// are meaningful — `codec` is what we advertise, not something we transcode to.
+///
+/// Schema migration: the historical field `feature_enabled` (a single gate that
+/// implicitly meant VoLTE) is accepted as an alias for `volte_enabled` on load,
+/// so existing persisted configs migrate in place.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VilteConfig {
+pub struct ImsVideoConfig {
+    /// Whether IMS video is enabled for the VoLTE (LTE) access leg.
+    #[serde(default, alias = "feature_enabled")]
+    pub volte_enabled: bool,
+    /// Whether IMS video is enabled for the VoWiFi (WiFi/ePDG) access leg.
     #[serde(default)]
-    pub feature_enabled: bool,
-    /// Advertised video codec name (relay is pass-through; H.264 is the ViLTE
-    /// baseline mandated by GSMA IR.94).
+    pub vowifi_enabled: bool,
+    /// Advertised video codec name (relay is pass-through; H.264 is the IMS
+    /// video baseline mandated by GSMA IR.94).
     #[serde(default = "default_vilte_codec")]
     pub codec: String,
     /// Dynamic RTP payload type to advertise for the video stream.
@@ -3224,10 +3586,11 @@ pub struct VilteConfig {
     pub h264_fmtp: String,
 }
 
-impl Default for VilteConfig {
+impl Default for ImsVideoConfig {
     fn default() -> Self {
         Self {
-            feature_enabled: false,
+            volte_enabled: false,
+            vowifi_enabled: false,
             codec: default_vilte_codec(),
             video_payload_type: default_vilte_video_payload_type(),
             h264_fmtp: default_vilte_h264_fmtp(),
@@ -3439,17 +3802,14 @@ fn default_voice_path_order() -> Vec<PathLayerConfig> {
             kind: AccessPathKind::Volte,
             enabled: true,
         },
-        PathLayerConfig {
-            kind: AccessPathKind::Cs,
-            enabled: true,
-        },
     ]
 }
 
 /// Voice path selection is deliberately independent from the SMS policy.
 /// `gateway_mode` remains true on the Qualcomm 410 because the host has no
-/// microphone/speaker and must hand media to a future internal UA or WebRTC
-/// adapter.
+/// microphone/speaker and hands media to the per-line Asterisk trunk. CS calls
+/// remain available through the line-scoped ModemManager call API, but are not
+/// exposed here because there is no CS media backend behind the SIP trunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoicePathPolicy {
     #[serde(default = "default_voice_path_order")]
@@ -3479,16 +3839,12 @@ impl VoicePathPolicy {
         let mut seen: Vec<AccessPathKind> = Vec::new();
         let mut deduped: Vec<PathLayerConfig> = Vec::new();
         for layer in self.priority.into_iter() {
-            if !seen.contains(&layer.kind) {
+            if layer.kind.is_ims() && !seen.contains(&layer.kind) {
                 seen.push(layer.kind);
                 deduped.push(layer);
             }
         }
-        for kind in [
-            AccessPathKind::Vowifi,
-            AccessPathKind::Volte,
-            AccessPathKind::Cs,
-        ] {
+        for kind in [AccessPathKind::Vowifi, AccessPathKind::Volte] {
             if !seen.contains(&kind) {
                 deduped.push(PathLayerConfig {
                     kind,
@@ -3503,9 +3859,11 @@ impl VoicePathPolicy {
 
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    /// Version of the persisted line-profile schema.
     #[serde(default)]
-    pub webhook: WebhookConfig,
+    pub line_config_version: u32,
     #[serde(default)]
     pub notifications: NotificationConfig,
     #[serde(default)]
@@ -3514,76 +3872,37 @@ pub struct AppConfig {
     pub version_update_notifications: VersionUpdateNotificationConfig,
     #[serde(default)]
     pub security: SecurityConfig,
-    /// 是否允许蜂窝数据漫游（写入 ModemManager Simple.Connect 的 allow-roaming）
-    #[serde(default = "default_roaming_allowed")]
-    pub roaming_allowed: bool,
-    #[serde(default = "default_data_enabled")]
-    pub data_enabled: bool,
-    #[serde(default)]
-    pub apn: ApnConfig,
     #[serde(default)]
     pub esim: EsimConfig,
     #[serde(default)]
     pub automation: AutomationConfig,
-    #[serde(default)]
-    pub vowifi: VowifiConfig,
-    #[serde(default)]
-    pub volte: VolteConfig,
     #[serde(default)]
     pub line_profiles: Vec<LineProfileConfig>,
     #[serde(default)]
     pub modem_slots: Vec<ModemSlotConfig>,
     #[serde(default)]
     pub standalone_sim_slots: Vec<StandaloneSimSlotConfig>,
-    #[serde(default)]
-    pub vilte: VilteConfig,
-    #[serde(default)]
-    pub sms_path: SmsPathPolicy,
-    #[serde(default)]
-    pub voice_path: VoicePathPolicy,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            webhook: WebhookConfig::default(),
+            line_config_version: CURRENT_LINE_CONFIG_VERSION,
             notifications: NotificationConfig::default(),
             device_network: DeviceNetworkConfig::default(),
             version_update_notifications: VersionUpdateNotificationConfig::default(),
             security: SecurityConfig::default(),
-            roaming_allowed: default_roaming_allowed(),
-            data_enabled: default_data_enabled(),
-            apn: ApnConfig::default(),
             esim: EsimConfig::default(),
             automation: AutomationConfig::default(),
-            vowifi: VowifiConfig::default(),
-            volte: VolteConfig::default(),
             line_profiles: Vec::new(),
             modem_slots: Vec::new(),
             standalone_sim_slots: Vec::new(),
-            vilte: VilteConfig::default(),
-            sms_path: SmsPathPolicy::default(),
-            voice_path: VoicePathPolicy::default(),
         }
     }
 }
 
-fn migrate_legacy_webhook_config(config: &mut AppConfig) {
-    if config.notifications.channels.is_empty()
-        && config.notifications.rules.is_empty()
-        && config.webhook != WebhookConfig::default()
-    {
-        let legacy = LegacyNotificationConfig {
-            webhook: config.webhook.clone(),
-            ..Default::default()
-        };
-        config.notifications = NotificationConfig::from_legacy(legacy);
-    }
-    config.webhook = config
-        .notifications
-        .first_webhook_config()
-        .unwrap_or_default();
-}
+pub(crate) const CURRENT_LINE_CONFIG_VERSION: u32 = 4;
+pub(crate) const CONFIG_STORAGE_SCHEMA_VERSION: u32 = 1;
 
 fn migrate_template_string(template: &mut String) -> bool {
     let mut changed = false;
@@ -3655,12 +3974,7 @@ fn migrate_template_string(template: &mut String) -> bool {
 fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
     let mut changed = false;
 
-    // 1. Webhook template
-    if migrate_template_string(&mut config.webhook.update_template) {
-        changed = true;
-    }
-
-    // 2. Notification rules templates
+    // 1. Notification rules templates
     for rule in &mut config.notifications.rules {
         if rule.event_type == NotificationEventType::VersionUpdate
             && migrate_template_string(&mut rule.template)
@@ -3669,7 +3983,7 @@ fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
         }
     }
 
-    // 3. Notification channels templates
+    // 2. Notification channels templates
     for channel in &mut config.notifications.channels {
         if let Some(obj) = channel.config.as_object_mut() {
             // E.g. BarkConfig, PushPlusConfig, WecomAppConfig etc have nested "common"
@@ -3694,50 +4008,368 @@ fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
 /// 配置管理器
 pub struct ConfigManager {
     config: Arc<RwLock<AppConfig>>,
-    config_path: PathBuf,
+    storage: ConfigStorage,
     save_lock: Mutex<()>,
 }
 
-impl ConfigManager {
-    /// 创建新的配置管理器
-    pub fn new(config_path: PathBuf) -> Self {
-        let mut config = if config_path.exists() {
-            match fs::read_to_string(&config_path) {
-                Ok(content) => match serde_json::from_str::<AppConfig>(&content) {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        warn!(error = %e, "Failed to parse config file, using defaults");
-                        AppConfig::default()
-                    }
-                },
-                Err(e) => {
-                    warn!(error = %e, "Failed to read config file, using defaults");
-                    AppConfig::default()
-                }
+#[derive(Debug, Clone)]
+enum ConfigStorage {
+    /// Internal test backend. Production paths are always SQLite.
+    Json(PathBuf),
+    /// Production backend. The carrier catalog and runtime/event database stay
+    /// separate; this database owns user configuration only.
+    Sqlite(PathBuf),
+}
+
+impl ConfigStorage {
+    fn from_path(path: PathBuf) -> Self {
+        let is_sqlite = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "sqlite" | "sqlite3" | "db"
+                )
+            });
+        if is_sqlite {
+            Self::Sqlite(path)
+        } else {
+            Self::Json(path)
+        }
+    }
+
+    fn path(&self) -> &PathBuf {
+        match self {
+            Self::Json(path) | Self::Sqlite(path) => path,
+        }
+    }
+}
+
+fn open_config_database(path: &Path) -> Result<SqliteConnection, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Failed to create config database directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "Refusing symlink config database {}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "Config database path is not a regular file: {}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
+            options.open(path).map_err(|error| {
+                format!(
+                    "Failed to create config database {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect config database {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            format!(
+                "Failed to set config database permissions {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    let connection = SqliteConnection::open(path)
+        .map_err(|error| format!("Failed to open config database {}: {error}", path.display()))?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("Failed to configure config database timeout: {error}"))?;
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(|error| format!("Failed to enable config database WAL: {error}"))?;
+    connection
+        .execute_batch(
+            "PRAGMA synchronous = FULL;
+             PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS app_config (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 storage_schema_version INTEGER NOT NULL,
+                 line_config_version INTEGER NOT NULL,
+                 config_json TEXT NOT NULL CHECK (json_valid(config_json)),
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS config_schema_journal (
+                 version INTEGER PRIMARY KEY,
+                 applied_at TEXT NOT NULL,
+                 note TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO config_schema_journal(version, applied_at, note)
+                 VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'initial schema');",
+        )
+        .map_err(|error| format!("Failed to initialize config database schema: {error}"))?;
+    let quick_check = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Failed to check config database integrity: {error}"))?;
+    if quick_check != "ok" {
+        return Err(format!(
+            "Config database integrity check failed: {quick_check}"
+        ));
+    }
+    Ok(connection)
+}
+
+fn load_config_document(
+    connection: &SqliteConnection,
+    path: &Path,
+) -> Result<Option<(AppConfig, bool)>, String> {
+    let row = connection
+        .query_row(
+            "SELECT storage_schema_version, line_config_version, config_json
+             FROM app_config WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Failed to read config database {}: {error}", path.display()))?;
+    let Some((storage_version, stored_line_version, content)) = row else {
+        return Ok(None);
+    };
+    if storage_version != CONFIG_STORAGE_SCHEMA_VERSION {
+        return Err(format!(
+            "Unsupported config storage schema version {storage_version} in {}; expected {}",
+            path.display(),
+            CONFIG_STORAGE_SCHEMA_VERSION
+        ));
+    }
+    let config = parse_current_config(&content, path)?;
+    if stored_line_version != config.line_config_version {
+        return Err(format!(
+            "Config database version mismatch in {}: column={stored_line_version}, document={}",
+            path.display(),
+            config.line_config_version
+        ));
+    }
+    let canonical_rewrite_required = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .zip(serde_json::to_value(&config).ok())
+        .is_some_and(|(stored, canonical)| stored != canonical);
+    Ok(Some((config, canonical_rewrite_required)))
+}
+
+fn parse_current_config(content: &str, source: &Path) -> Result<AppConfig, String> {
+    let config = serde_json::from_str::<AppConfig>(content).map_err(|error| {
+        format!(
+            "Failed to parse configuration {}: {error}",
+            source.display()
+        )
+    })?;
+    if config.line_config_version != CURRENT_LINE_CONFIG_VERSION {
+        return Err(format!(
+            "Unsupported line config version {} in {}; expected {}",
+            config.line_config_version,
+            source.display(),
+            CURRENT_LINE_CONFIG_VERSION
+        ));
+    }
+    Ok(config)
+}
+
+fn save_config_document(path: &Path, content: &str) -> Result<(), String> {
+    let mut connection = open_config_database(path)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("Failed to begin config transaction: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO app_config (
+                 singleton, storage_schema_version, line_config_version, config_json, updated_at
+             ) VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 storage_schema_version = excluded.storage_schema_version,
+                 line_config_version = excluded.line_config_version,
+                 config_json = excluded.config_json,
+                 updated_at = excluded.updated_at",
+            params![
+                CONFIG_STORAGE_SCHEMA_VERSION,
+                CURRENT_LINE_CONFIG_VERSION,
+                content,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| format!("Failed to write config document: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("Failed to commit config transaction: {error}"))
+}
+
+fn save_json_document(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create config directory: {error}"))?;
+    }
+
+    let temp_path = path.with_extension("tmp");
+    let backup_path = path.with_extension("bak");
+    let mut temp_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(|error| format!("Failed to open temporary config file: {error}"))?;
+    temp_file
+        .write_all(content.as_bytes())
+        .map_err(|error| format!("Failed to write temporary config file: {error}"))?;
+    temp_file
+        .sync_all()
+        .map_err(|error| format!("Failed to sync temporary config file: {error}"))?;
+    drop(temp_file);
+
+    if path.exists() {
+        fs::copy(path, &backup_path)
+            .map_err(|error| format!("Failed to back up config file: {error}"))?;
+    }
+    if let Err(rename_error) = fs::rename(&temp_path, path) {
+        if cfg!(windows) && path.exists() {
+            fs::copy(&temp_path, path)
+                .map_err(|error| format!("Failed to replace config file: {error}"))?;
+            fs::remove_file(&temp_path)
+                .map_err(|error| format!("Failed to remove temporary config file: {error}"))?;
+        } else {
+            return Err(format!(
+                "Failed to atomically replace config file: {rename_error}"
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+    Ok(())
+}
+
+impl ConfigManager {
+    /// Load a persisted configuration. An existing file must parse exactly as
+    /// the current schema; silently replacing it with defaults hides invalid
+    /// per-line settings and can direct operations to the wrong SIM.
+    pub fn try_new(config_path: PathBuf) -> Result<Self, String> {
+        match ConfigStorage::from_path(config_path) {
+            ConfigStorage::Json(path) => Self::try_new_json(path),
+            ConfigStorage::Sqlite(path) => Self::try_new_sqlite(path),
+        }
+    }
+
+    fn try_new_json(config_path: PathBuf) -> Result<Self, String> {
+        let mut canonical_rewrite_required = false;
+        let mut config = if config_path.exists() {
+            let content = fs::read_to_string(&config_path).map_err(|error| {
+                format!(
+                    "Failed to read config file {}: {error}",
+                    config_path.display()
+                )
+            })?;
+            let config = serde_json::from_str::<AppConfig>(&content).map_err(|error| {
+                format!(
+                    "Failed to parse config file {}: {error}",
+                    config_path.display()
+                )
+            })?;
+            if config.line_config_version != CURRENT_LINE_CONFIG_VERSION {
+                return Err(format!(
+                    "Unsupported line config version {} in {}; expected {}",
+                    config.line_config_version,
+                    config_path.display(),
+                    CURRENT_LINE_CONFIG_VERSION
+                ));
+            }
+            canonical_rewrite_required = serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .zip(serde_json::to_value(&config).ok())
+                .is_some_and(|(stored, canonical)| stored != canonical);
+            config
         } else {
             info!("No config file found, using defaults");
             AppConfig::default()
         };
 
-        migrate_legacy_webhook_config(&mut config);
-        let changed = migrate_templates_to_remove_md5(&mut config);
+        let changed = migrate_templates_to_remove_md5(&mut config) || canonical_rewrite_required;
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
-            config_path,
+            storage: ConfigStorage::Json(config_path),
             save_lock: Mutex::new(()),
         };
 
-        // 保存配置（如果文件不存在，或者配置模板发生了自动清理）
-        if !manager.config_path.exists() || changed {
-            let _ = manager.save();
+        // Rewrite only current-schema files that need canonical formatting.
+        if !manager.storage.path().exists() || changed {
+            manager.save()?;
         }
         // `vowifi-profiles.conf` is no longer created or rewritten here. Custom
         // carrier profiles live in the database; an existing file is migrated
         // once at startup and then archived.
 
-        manager
+        Ok(manager)
+    }
+
+    fn try_new_sqlite(config_path: PathBuf) -> Result<Self, String> {
+        let connection = open_config_database(&config_path)?;
+        let stored = load_config_document(&connection, &config_path)?;
+        let database_was_empty = stored.is_none();
+
+        let (mut config, canonical_rewrite_required) = match stored {
+            Some((config, rewrite)) => (config, rewrite),
+            None => {
+                info!(path = ?config_path, "No SQLite configuration found, using defaults");
+                (AppConfig::default(), false)
+            }
+        };
+
+        let changed = migrate_templates_to_remove_md5(&mut config) || canonical_rewrite_required;
+        let manager = Self {
+            config: Arc::new(RwLock::new(config)),
+            storage: ConfigStorage::Sqlite(config_path.clone()),
+            save_lock: Mutex::new(()),
+        };
+
+        if database_was_empty || changed {
+            manager.save()?;
+        }
+        Ok(manager)
+    }
+
+    #[cfg(test)]
+    fn new(config_path: PathBuf) -> Self {
+        Self::try_new(config_path).expect("test configuration must load")
     }
 
     /// 获取通知配置
@@ -3748,16 +4380,6 @@ impl ConfigManager {
     /// 获取自动化配置
     pub fn get_automation_config(&self) -> AutomationConfig {
         self.config.read().unwrap().automation.clone()
-    }
-
-    /// Path of the retired `vowifi-profiles.conf`. Custom carrier profiles now
-    /// live in the `vowifi_carrier_profiles` database table; this only exists so
-    /// the one-time migration knows where to look.
-    pub fn legacy_vowifi_profiles_path(&self) -> PathBuf {
-        self.config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("vowifi-profiles.conf")
     }
 
     /// 更新自动化配置
@@ -3779,6 +4401,11 @@ impl ConfigManager {
                     }
                     _ => {}
                 }
+            }
+            if !matches!(&task.action, AutomationAction::RebootDevice { .. })
+                && task.target.is_none()
+            {
+                return Err("automation_target_line_required".to_string());
             }
             match &task.action {
                 AutomationAction::ConsumeData { bytes, unit } => {
@@ -3825,71 +4452,58 @@ impl ConfigManager {
         self.save()
     }
 
-    pub fn get_roaming_allowed(&self) -> bool {
-        self.config.read().unwrap().roaming_allowed
-    }
-
-    pub fn get_data_enabled(&self) -> bool {
-        self.config.read().unwrap().data_enabled
-    }
-
-    pub fn get_apn_config(&self) -> ApnConfig {
-        self.config.read().unwrap().apn.clone()
-    }
-
     pub fn get_esim_config(&self) -> EsimConfig {
         self.config.read().unwrap().esim.clone()
     }
 
-    pub fn get_vowifi_config(&self) -> VowifiConfig {
-        self.config.read().unwrap().vowifi.clone()
-    }
-
-    pub fn set_vowifi_feature_enabled(&self, enabled: bool) -> Result<VowifiConfig, String> {
-        let next = {
-            let mut c = self.config.write().unwrap();
-            c.vowifi.feature_enabled = enabled;
-            if !enabled {
-                c.vowifi.connection_enabled = false;
-            }
-            c.vowifi.clone()
-        };
-        self.save()?;
-        Ok(next)
-    }
-
-    pub fn set_vowifi_connection_enabled(&self, enabled: bool) -> Result<VowifiConfig, String> {
-        let next = {
-            let mut c = self.config.write().unwrap();
-            if enabled && !c.vowifi.feature_enabled {
-                return Err("vowifi_feature_disabled".to_string());
-            }
-            c.vowifi.connection_enabled = enabled;
-            c.vowifi.clone()
-        };
-        self.save()?;
-        Ok(next)
-    }
-
-    pub fn get_volte_config(&self) -> VolteConfig {
-        self.config.read().unwrap().volte.clone()
-    }
-
-    pub fn set_volte_feature_enabled(&self, enabled: bool) -> Result<VolteConfig, String> {
-        let next = {
-            let mut c = self.config.write().unwrap();
-            c.volte.feature_enabled = enabled;
-            if !enabled {
-                c.volte.connection_enabled = false;
-            }
-            c.volte.clone()
-        };
-        self.save()?;
-        Ok(next)
-    }
-
     pub fn get_line_profiles(&self) -> Vec<LineProfileConfig> {
         self.config.read().unwrap().line_profiles.clone()
+    }
+
+    /// Ensure every discovered physical line has one explicit persisted profile.
+    pub fn reconcile_line_profiles(&self, line_ids: &[String]) -> Result<bool, String> {
+        let mut ordered_ids = Vec::new();
+        for line_id in line_ids.iter().filter(|line_id| valid_line_id(line_id)) {
+            if !ordered_ids.contains(line_id) {
+                ordered_ids.push(line_id.clone());
+            }
+        }
+        if ordered_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let migrated = {
+            let mut config = self.config.write().unwrap();
+            let mut changed = false;
+            for profile in &mut config.line_profiles {
+                let normalized = profile.voice_path.clone().normalized();
+                if normalized != profile.voice_path {
+                    profile.voice_path = normalized;
+                    changed = true;
+                }
+            }
+            for line_id in &ordered_ids {
+                if !config
+                    .line_profiles
+                    .iter()
+                    .any(|profile| &profile.line_id == line_id)
+                {
+                    config
+                        .line_profiles
+                        .push(LineProfileConfig::for_line(line_id));
+                    changed = true;
+                }
+            }
+            config
+                .line_profiles
+                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+            changed
+        };
+
+        if migrated {
+            self.save()?;
+        }
+        Ok(migrated)
     }
 
     /// Reconcile discovered physical hardware with persistent display slots.
@@ -4110,9 +4724,8 @@ impl ConfigManager {
     }
 
     pub fn get_line_profile(&self, line_id: &str) -> LineProfileConfig {
-        self.config
-            .read()
-            .unwrap()
+        let config = self.config.read().unwrap();
+        config
             .line_profiles
             .iter()
             .find(|profile| profile.line_id == line_id)
@@ -4193,29 +4806,24 @@ impl ConfigManager {
         Ok(next)
     }
 
-    /// Set this line's ordered VoLTE IMS address-family list. `None` clears the
-    /// per-line override so the line falls back to the global
-    /// `VolteConfig::ip_family_preference`. An empty or duplicated list is
-    /// rejected so a saved override always means something the runtime can use.
+    /// Set this line's explicit ordered VoLTE IMS address-family list.
     pub fn set_line_volte_ip_families(
         &self,
         line_id: &str,
-        families: Option<Vec<VolteIpFamily>>,
+        families: Vec<VolteIpFamily>,
     ) -> Result<LineProfileConfig, String> {
         if !valid_line_id(line_id) {
             return Err("invalid_line_id".to_string());
         }
-        if let Some(families) = families.as_ref() {
-            if families.is_empty() {
-                return Err("volte_ip_families_empty".to_string());
+        if families.is_empty() {
+            return Err("volte_ip_families_empty".to_string());
+        }
+        let mut seen = Vec::new();
+        for family in &families {
+            if seen.contains(family) {
+                return Err("volte_ip_families_duplicate".to_string());
             }
-            let mut seen = Vec::new();
-            for family in families {
-                if seen.contains(family) {
-                    return Err("volte_ip_families_duplicate".to_string());
-                }
-                seen.push(*family);
-            }
+            seen.push(*family);
         }
         let next = {
             let mut config = self.config.write().unwrap();
@@ -4242,6 +4850,10 @@ impl ConfigManager {
         Ok(next)
     }
 
+    pub fn get_line_volte_ip_families(&self, line_id: &str) -> Vec<VolteIpFamily> {
+        self.get_line_profile(line_id).volte_ip_families
+    }
+
     pub fn set_line_vowifi_config(
         &self,
         line_id: &str,
@@ -4253,9 +4865,6 @@ impl ConfigManager {
         validate_line_vowifi_config(&mut vowifi)?;
         let next = {
             let mut config = self.config.write().unwrap();
-            if vowifi.enabled {
-                config.vowifi.feature_enabled = true;
-            }
             let profile = if let Some(profile) = config
                 .line_profiles
                 .iter_mut()
@@ -4348,6 +4957,9 @@ impl ConfigManager {
                     .push(LineProfileConfig::for_line(line_id));
                 config.line_profiles.last_mut().expect("profile inserted")
             };
+            if enabled && !profile.enabled {
+                return Err("line_disabled".to_string());
+            }
             if enabled && profile.airplane_mode_enabled {
                 return Err("line_airplane_mode_enabled".to_string());
             }
@@ -4594,184 +5206,157 @@ impl ConfigManager {
         self.set_line_trunk_profile(line_id, TrunkProfileConfig { enabled, ..current })
     }
 
-    pub fn set_volte_connection_enabled(&self, enabled: bool) -> Result<VolteConfig, String> {
-        let next = {
-            let mut c = self.config.write().unwrap();
-            if enabled && !c.volte.feature_enabled {
-                return Err("volte_feature_disabled".to_string());
-            }
-            c.volte.connection_enabled = enabled;
-            c.volte.clone()
-        };
-        self.save()?;
-        Ok(next)
+    pub fn get_line_volte_voice_enabled(&self, line_id: &str) -> bool {
+        self.get_line_profile(line_id).volte_voice_enabled
     }
 
-    /// Toggle VoLTE voice handling for registered per-line IMS sessions.
-    pub fn set_volte_voice_enabled(&self, enabled: bool) -> Result<VolteConfig, String> {
-        let next = {
-            let mut c = self.config.write().unwrap();
-            c.volte.voice_enabled = enabled;
-            if !enabled {
-                c.vilte.feature_enabled = false;
-            }
-            c.volte.clone()
-        };
-        self.save()?;
-        Ok(next)
-    }
-
-    /// Current SMS multi-path routing policy (normalized so every path kind is
-    /// present exactly once).
-    pub fn get_sms_path_policy(&self) -> SmsPathPolicy {
-        self.config.read().unwrap().sms_path.clone().normalized()
-    }
-
-    /// Replace the SMS multi-path routing policy. The incoming policy is
-    /// normalized before persisting so a partial/duplicated priority list from
-    /// the UI can never leave the config in an invalid state.
-    pub fn set_sms_path_policy(&self, policy: SmsPathPolicy) -> Result<SmsPathPolicy, String> {
-        let next = policy.normalized();
-        {
-            let mut c = self.config.write().unwrap();
-            c.sms_path = next.clone();
+    /// Toggle VoLTE voice handling for exactly one registered IMS line.
+    /// Disabling voice also disables VoLTE video on that line, matching the media
+    /// dependency without changing any other profile.
+    pub fn set_line_volte_voice_enabled(
+        &self,
+        line_id: &str,
+        enabled: bool,
+    ) -> Result<LineProfileConfig, String> {
+        let mut ims_video = self.get_line_ims_video_config(line_id);
+        if !enabled {
+            ims_video.volte_enabled = false;
         }
-        self.save()?;
-        Ok(next)
+        self.update_line_profile(line_id, |profile| {
+            profile.volte_voice_enabled = enabled;
+            if !enabled {
+                profile.ims_video = ims_video;
+            }
+        })
     }
 
-    /// SMS path policy that applies to one line: its own override when set,
-    /// otherwise the global policy.
+    /// SMS path policy for one line.
     pub fn get_line_sms_path_policy(&self, line_id: &str) -> SmsPathPolicy {
-        self.get_line_profile(line_id)
-            .sms_path
-            .map(|policy| policy.normalized())
-            .unwrap_or_else(|| self.get_sms_path_policy())
+        self.get_line_profile(line_id).sms_path.normalized()
     }
 
-    /// Set or clear (`None`) one line's SMS path override.
+    /// Set one line's explicit SMS path policy.
     pub fn set_line_sms_path_policy(
         &self,
         line_id: &str,
-        policy: Option<SmsPathPolicy>,
+        policy: SmsPathPolicy,
     ) -> Result<SmsPathPolicy, String> {
-        let normalized = policy.map(|policy| policy.normalized());
+        let normalized = policy.normalized();
         self.update_line_profile(line_id, |profile| {
             profile.sms_path = normalized.clone();
         })?;
         Ok(self.get_line_sms_path_policy(line_id))
     }
 
-    pub fn get_voice_path_policy(&self) -> VoicePathPolicy {
-        self.config.read().unwrap().voice_path.clone().normalized()
-    }
-
-    /// APN that applies to one line: its own override when set, otherwise the
-    /// global APN.
+    /// APN for one line.
     pub fn get_line_apn_config(&self, line_id: &str) -> ApnConfig {
-        self.get_line_profile(line_id)
-            .apn
-            .unwrap_or_else(|| self.get_apn_config())
+        self.get_line_profile(line_id).apn
     }
 
-    /// Set or clear (`None`) one line's APN override.
-    pub fn set_line_apn_config(
-        &self,
-        line_id: &str,
-        apn: Option<ApnConfig>,
-    ) -> Result<ApnConfig, String> {
+    /// Set one line's explicit APN configuration.
+    pub fn set_line_apn_config(&self, line_id: &str, apn: ApnConfig) -> Result<ApnConfig, String> {
         self.update_line_profile(line_id, |profile| {
             profile.apn = apn.clone();
         })?;
         Ok(self.get_line_apn_config(line_id))
     }
 
-    /// Voice path policy that applies to one line; same inheritance as SMS.
+    /// Voice path policy for one line.
     pub fn get_line_voice_path_policy(&self, line_id: &str) -> VoicePathPolicy {
-        self.get_line_profile(line_id)
-            .voice_path
-            .map(|policy| policy.normalized())
-            .unwrap_or_else(|| self.get_voice_path_policy())
+        self.get_line_profile(line_id).voice_path.normalized()
     }
 
-    /// Set or clear (`None`) one line's voice path override.
+    /// Set one line's explicit voice path policy.
     pub fn set_line_voice_path_policy(
         &self,
         line_id: &str,
-        policy: Option<VoicePathPolicy>,
+        policy: VoicePathPolicy,
     ) -> Result<VoicePathPolicy, String> {
-        let normalized = match policy {
-            Some(policy) => {
-                let policy = policy.normalized();
-                if !policy.gateway_mode {
-                    return Err("voice_gateway_mode_required_on_this_device".to_string());
-                }
-                Some(policy)
-            }
-            None => None,
-        };
+        if policy
+            .priority
+            .iter()
+            .any(|layer| layer.kind == AccessPathKind::Cs)
+        {
+            return Err("voice_cs_trunk_backend_unavailable".to_string());
+        }
+        let normalized = policy.normalized();
+        if !normalized.gateway_mode {
+            return Err("voice_gateway_mode_required_on_this_device".to_string());
+        }
         self.update_line_profile(line_id, |profile| {
             profile.voice_path = normalized.clone();
         })?;
         Ok(self.get_line_voice_path_policy(line_id))
     }
 
-    pub fn set_voice_path_policy(
+    pub fn get_line_ims_video_config(&self, line_id: &str) -> ImsVideoConfig {
+        self.get_line_profile(line_id).ims_video
+    }
+
+    /// Whether the VoWiFi voice leg is enabled for one line. VoWiFi voice rides
+    /// the line's VoWiFi connection, so this is `vowifi.enabled`.
+    pub fn get_line_vowifi_voice_enabled(&self, line_id: &str) -> bool {
+        self.get_line_profile(line_id).vowifi.enabled
+    }
+
+    /// Toggle IMS video for one line's VoLTE leg. Video rides that line's VoLTE
+    /// voice session, so another line's voice switch cannot satisfy this
+    /// dependency.
+    pub fn set_line_ims_video_volte_enabled(
         &self,
-        policy: VoicePathPolicy,
-    ) -> Result<VoicePathPolicy, String> {
-        let next = policy.normalized();
-        if !next.gateway_mode {
-            return Err("voice_gateway_mode_required_on_this_device".to_string());
+        line_id: &str,
+        enabled: bool,
+    ) -> Result<ImsVideoConfig, String> {
+        if enabled && !self.get_line_volte_voice_enabled(line_id) {
+            return Err("volte_voice_disabled".to_string());
         }
-        {
-            let mut c = self.config.write().unwrap();
-            c.voice_path = next.clone();
+        let mut next = self.get_line_ims_video_config(line_id);
+        next.volte_enabled = enabled;
+        self.set_line_ims_video_config(line_id, next)
+    }
+
+    /// Toggle IMS video for one line's VoWiFi leg. Video rides that line's
+    /// VoWiFi voice session, so another line's voice switch cannot satisfy this
+    /// dependency.
+    pub fn set_line_ims_video_vowifi_enabled(
+        &self,
+        line_id: &str,
+        enabled: bool,
+    ) -> Result<ImsVideoConfig, String> {
+        if enabled && !self.get_line_vowifi_voice_enabled(line_id) {
+            return Err("vowifi_voice_disabled".to_string());
         }
-        self.save()?;
-        Ok(next)
+        let mut next = self.get_line_ims_video_config(line_id);
+        next.vowifi_enabled = enabled;
+        self.set_line_ims_video_config(line_id, next)
     }
 
-    pub fn get_vilte_config(&self) -> VilteConfig {
-        self.config.read().unwrap().vilte.clone()
-    }
-
-    /// Toggle the ViLTE video feature. Video rides the VoLTE voice session, so
-    /// enabling ViLTE requires VoLTE voice handling to be enabled. The actual
-    /// IMS availability is derived from per-line profiles at runtime.
-    pub fn set_vilte_feature_enabled(&self, enabled: bool) -> Result<VilteConfig, String> {
-        let next = {
-            let mut c = self.config.write().unwrap();
-            if enabled && !c.volte.voice_enabled {
-                return Err("volte_voice_disabled".to_string());
-            }
-            c.vilte.feature_enabled = enabled;
-            c.vilte.clone()
-        };
-        self.save()?;
-        Ok(next)
-    }
-
-    /// Replace the full ViLTE config (codec / payload type / fmtp). Does not
-    /// change the gating; `feature_enabled` in the incoming value is honored
-    /// only if VoLTE voice is enabled, otherwise it is forced off.
-    pub fn set_vilte_config(&self, vilte: VilteConfig) -> Result<VilteConfig, String> {
-        if !vilte.codec.trim().eq_ignore_ascii_case("h264") {
+    /// Replace one line's IMS video config (codec / payload type / fmtp).
+    /// `volte_enabled` is forced off when VoLTE voice is disabled on that same
+    /// line, and `vowifi_enabled` when VoWiFi voice is disabled, leaving every
+    /// other line untouched.
+    pub fn set_line_ims_video_config(
+        &self,
+        line_id: &str,
+        ims_video: ImsVideoConfig,
+    ) -> Result<ImsVideoConfig, String> {
+        if !ims_video.codec.trim().eq_ignore_ascii_case("h264") {
             return Err("vilte_codec_unsupported".to_string());
         }
-        if !(96..=127).contains(&vilte.video_payload_type) {
+        if !(96..=127).contains(&ims_video.video_payload_type) {
             return Err("vilte_payload_type_invalid".to_string());
         }
-        let next = {
-            let mut c = self.config.write().unwrap();
-            let mut incoming = vilte;
-            if incoming.feature_enabled && !c.volte.voice_enabled {
-                incoming.feature_enabled = false;
-            }
-            c.vilte = incoming;
-            c.vilte.clone()
-        };
-        self.save()?;
+        let mut next = ims_video;
+        if next.volte_enabled && !self.get_line_volte_voice_enabled(line_id) {
+            next.volte_enabled = false;
+        }
+        if next.vowifi_enabled && !self.get_line_vowifi_voice_enabled(line_id) {
+            next.vowifi_enabled = false;
+        }
+        let persisted = next.clone();
+        self.update_line_profile(line_id, |profile| {
+            profile.ims_video = persisted;
+        })?;
         Ok(next)
     }
 
@@ -4811,30 +5396,6 @@ impl ConfigManager {
         self.save()
     }
 
-    pub fn set_data_enabled(&self, enabled: bool) -> Result<(), String> {
-        {
-            let mut c = self.config.write().unwrap();
-            c.data_enabled = enabled;
-        }
-        self.save()
-    }
-
-    pub fn set_apn_config(&self, apn: ApnConfig) -> Result<(), String> {
-        {
-            let mut c = self.config.write().unwrap();
-            c.apn = apn;
-        }
-        self.save()
-    }
-
-    pub fn set_roaming_allowed(&self, allowed: bool) -> Result<(), String> {
-        {
-            let mut c = self.config.write().unwrap();
-            c.roaming_allowed = allowed;
-        }
-        self.save()
-    }
-
     pub fn set_ddns_config(&self, ddns: DdnsConfig) -> Result<(), String> {
         {
             let mut c = self.config.write().unwrap();
@@ -4855,13 +5416,14 @@ impl ConfigManager {
     pub fn set_notifications(&self, notifications: NotificationConfig) -> Result<(), String> {
         {
             let mut config = self.config.write().unwrap();
-            config.webhook = notifications.first_webhook_config().unwrap_or_default();
             config.notifications = notifications;
+            strip_legacy_notification_channel_fields(&mut config.notifications);
         }
         self.save()
     }
 
-    /// 保存配置到文件
+    /// Persist the complete typed configuration through the selected backend.
+    /// Production always uses one SQLite transaction; JSON is test-only.
     pub fn save(&self) -> Result<(), String> {
         let _save_guard = self.save_lock.lock().unwrap();
         let content = {
@@ -4869,74 +5431,24 @@ impl ConfigManager {
             serde_json::to_string_pretty(&*config)
                 .map_err(|e| format!("Failed to serialize config: {}", e))?
         };
-
-        // 确保目录存在
-        if let Some(parent) = self.config_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create config directory: {}", e))?;
+        match &self.storage {
+            ConfigStorage::Json(path) => save_json_document(path, &content),
+            ConfigStorage::Sqlite(path) => save_config_document(path, &content),
         }
-
-        let temp_path = self.config_path.with_extension("tmp");
-        let backup_path = self.config_path.with_extension("bak");
-        let mut temp_file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp_path)
-            .map_err(|e| format!("Failed to open temporary config file: {e}"))?;
-        temp_file
-            .write_all(content.as_bytes())
-            .map_err(|e| format!("Failed to write temporary config file: {e}"))?;
-        temp_file
-            .sync_all()
-            .map_err(|e| format!("Failed to sync temporary config file: {e}"))?;
-        drop(temp_file);
-
-        if self.config_path.exists() {
-            fs::copy(&self.config_path, &backup_path)
-                .map_err(|e| format!("Failed to back up config file: {e}"))?;
-        }
-
-        if let Err(rename_error) = fs::rename(&temp_path, &self.config_path) {
-            // Windows does not consistently replace an existing destination.
-            // Production Linux uses the atomic rename path above; this fallback
-            // keeps local development and migration tooling functional.
-            if cfg!(windows) && self.config_path.exists() {
-                fs::copy(&temp_path, &self.config_path)
-                    .map_err(|e| format!("Failed to replace config file: {e}"))?;
-                fs::remove_file(&temp_path)
-                    .map_err(|e| format!("Failed to remove temporary config file: {e}"))?;
-            } else {
-                return Err(format!(
-                    "Failed to atomically replace config file: {rename_error}"
-                ));
-            }
-        }
-
-        #[cfg(unix)]
-        if let Some(parent) = self.config_path.parent() {
-            if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
-                let _ = directory.sync_all();
-            }
-        }
-
-        Ok(())
     }
 }
 
 /// 获取默认配置文件路径
 pub fn get_default_config_path() -> PathBuf {
-    // Tests, recovery tools and side-by-side release candidates must be able
-    // to avoid the device-wide `/data/config.json` without moving or editing
-    // the production file.
-    if let Some(path) = std::env::var_os("SIMADMIN_CONFIG_PATH") {
+    if let Some(path) = std::env::var_os("SIMADMIN_CONFIG_DB") {
         if !path.is_empty() {
             return PathBuf::from(path);
         }
     }
 
-    // 尝试 /data/config.json（设备上的持久化目录）
-    let device_path = PathBuf::from("/data/config.json");
+    // Production default. An empty database receives the current default
+    // document; no legacy file is consulted.
+    let device_path = PathBuf::from("/data/config.sqlite3");
     if device_path.parent().map(|p| p.exists()).unwrap_or(false) {
         return device_path;
     }
@@ -4946,5 +5458,5 @@ pub fn get_default_config_path() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("config.json")
+        .join("config.sqlite3")
 }

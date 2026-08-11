@@ -42,13 +42,13 @@ import type {
   ExternalVowifiProfile,
   LoginRequest,
   LineRuntimeStatus,
+  SupplementarySnapshot,
   ManualRegisterRequest,
   TrunkProfileConfig,
   VowifiLineConfigResponse,
   LineVowifiConfig,
   StandaloneSimSlotConfig,
   TrunkProfileResponse,
-  VolteControlResponse,
   VolteLineControlResponse,
   VolteIpFamily,
   NetworkInfo,
@@ -76,15 +76,8 @@ import type {
   SmsStats,
   SmsPathPolicy,
   SystemStatsResponse,
-  VowifiConfig,
   VowifiDiagnosticsResponse,
-  VowifiEsimRestoreEntry,
-  VowifiProfileMatchResponse,
   VowifiProfilesResponse,
-  VowifiRuntimeEventsResponse,
-  VowifiSmsDeliveriesResponse,
-  VowifiSoakRunsResponse,
-  VowifiStatusResponse,
   WebhookTestResponse,
   LineEsimControlResponse,
   VoicePathPolicy,
@@ -98,6 +91,9 @@ import type {
   WlanProfilesResponse,
   WlanScanResponse,
   WlanStatusResponse,
+  E911Capability,
+  E911Operation,
+  E911Status,
 } from './types'
 
 type SmsListResponse = {
@@ -196,12 +192,8 @@ async function request<T>(
   return json
 }
 
-/// Build the `?line_id=…` suffix for line-scoped cellular endpoints. Omitting
-/// the id lets the backend act on the primary line, which is what the
-/// single-line pages want.
-function lineScopeQuery(lineId?: string) {
-  const trimmed = lineId?.trim()
-  return trimmed ? `?line_id=${encodeURIComponent(trimmed)}` : ''
+function modemLinePath(lineId: string, suffix: string) {
+  return `/modem/lines/${encodeURIComponent(lineId)}${suffix}`
 }
 
 class SimAdminCurrentAPI {
@@ -290,20 +282,20 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getEsimEuicc(lineId?: string) {
-    return request<ApiResponse<EsimEuiccInfo>>(`/esim/euicc${lineScopeQuery(lineId)}`, {
+  async getEsimEuicc(lineId: string) {
+    return request<ApiResponse<EsimEuiccInfo>>(modemLinePath(lineId, '/esim/euicc'), {
       timeoutMs: 30000,
     })
   }
 
-  async getEsimProfiles(lineId?: string) {
-    return request<ApiResponse<EsimProfilesResponse>>(`/esim/profiles${lineScopeQuery(lineId)}`, {
+  async getEsimProfiles(lineId: string) {
+    return request<ApiResponse<EsimProfilesResponse>>(modemLinePath(lineId, '/esim/profiles'), {
       timeoutMs: 30000,
     })
   }
 
   async getCachedEsimProfiles() {
-    return request<ApiResponse<EsimProfilesResponse>>('/esim/profiles?cached=1', {
+    return request<ApiResponse<EsimProfilesResponse>>('/esim/profiles/cache', {
       timeoutMs: 5000,
     })
   }
@@ -322,8 +314,8 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async enableEsimProfile(iccid: string, lineId?: string) {
-    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/enable${lineScopeQuery(lineId)}`, {
+  async enableEsimProfile(lineId: string, iccid: string) {
+    return request<ApiResponse<EsimCommandResponse>>(modemLinePath(lineId, `/esim/profiles/${encodeURIComponent(iccid)}/enable`), {
       method: 'POST',
       body: JSON.stringify({}),
       timeoutMs: 10000,
@@ -331,75 +323,75 @@ class SimAdminCurrentAPI {
   }
 
 
-  async renameEsimProfile(iccid: string, name: string, lineId?: string) {
-    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/rename${lineScopeQuery(lineId)}`, {
+  async renameEsimProfile(lineId: string, iccid: string, name: string) {
+    return request<ApiResponse<EsimCommandResponse>>(modemLinePath(lineId, `/esim/profiles/${encodeURIComponent(iccid)}/rename`), {
       method: 'POST',
       body: JSON.stringify({ name }),
       timeoutMs: 60000,
     })
   }
 
-  async deleteEsimProfile(iccid: string, lineId?: string) {
-    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}${lineScopeQuery(lineId)}`, {
+  async deleteEsimProfile(lineId: string, iccid: string) {
+    return request<ApiResponse<EsimCommandResponse>>(modemLinePath(lineId, `/esim/profiles/${encodeURIComponent(iccid)}`), {
       method: 'DELETE',
       timeoutMs: 60000,
     })
   }
 
-  async downloadEsimProfile(requestData: EsimDownloadRequest, lineId?: string) {
-    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles${lineScopeQuery(lineId)}`, {
+  async downloadEsimProfile(lineId: string, requestData: EsimDownloadRequest) {
+    return request<ApiResponse<EsimCommandResponse>>(modemLinePath(lineId, '/esim/profiles'), {
       method: 'POST',
       body: JSON.stringify(requestData),
       timeoutMs: 180000, // 3 minutes timeout
     })
   }
 
-  async getDeviceInfo() {
-    return request<ApiResponse<DeviceInfo>>('/device')
+  async getDeviceInfo(lineId: string) {
+    return request<ApiResponse<DeviceInfo>>(modemLinePath(lineId, '/device'))
   }
 
-  async getSimInfo() {
-    return request<ApiResponse<SimInfo>>('/sim')
+  async getSimInfo(lineId: string) {
+    return request<ApiResponse<SimInfo>>(modemLinePath(lineId, '/sim'))
   }
 
-  async updateSimCache(data: UpdateSimCacheRequest) {
-    return request<ApiResponse<void>>('/sim/cache', {
+  async updateSimCache(lineId: string, data: UpdateSimCacheRequest) {
+    return request<ApiResponse<void>>(modemLinePath(lineId, '/sim/cache'), {
       method: 'POST',
       body: JSON.stringify(data),
     })
   }
 
-  async getNetworkInfo() {
-    return request<ApiResponse<NetworkInfo>>('/network')
+  async getNetworkInfo(lineId: string) {
+    return request<ApiResponse<NetworkInfo>>(modemLinePath(lineId, '/network'))
   }
 
-  async getCellsInfo(lineId?: string) {
-    return request<ApiResponse<CellsResponse>>(`/cells${lineScopeQuery(lineId)}`)
+  async getCellsInfo(lineId: string) {
+    return request<ApiResponse<CellsResponse>>(modemLinePath(lineId, '/cells'))
   }
 
-  async startCellMonitor() {
-    return request<ApiResponse<Record<string, never>>>('/cell-monitor/start', {
+  async startCellMonitor(lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/cell-monitor/start'), {
       method: 'POST',
       body: JSON.stringify({}),
     })
   }
 
-  async stopCellMonitor() {
-    return request<ApiResponse<Record<string, never>>>('/cell-monitor/stop', {
+  async stopCellMonitor(lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/cell-monitor/stop'), {
       method: 'POST',
       body: JSON.stringify({}),
     })
   }
 
-  async restartBaseband() {
-    return request<ApiResponse<BasebandRestartResponse>>('/baseband/restart', {
+  async restartBaseband(lineId: string) {
+    return request<ApiResponse<BasebandRestartResponse>>(modemLinePath(lineId, '/baseband/restart'), {
       method: 'POST',
       body: JSON.stringify({}),
     })
   }
 
-  async getBasebandRestartStatus() {
-    return request<ApiResponse<BasebandRestartResponse>>('/baseband/restart/status')
+  async getBasebandRestartStatus(lineId: string) {
+    return request<ApiResponse<BasebandRestartResponse>>(modemLinePath(lineId, '/baseband/restart/status'))
   }
 
   async restartService() {
@@ -480,83 +472,83 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<ConnectionAddressesResponse>>('/network/connection-addresses')
   }
 
-  async getSignalStrength() {
-    return request<ApiResponse<SignalStrengthResponse>>('/network/signal-strength')
+  async getSignalStrength(lineId: string) {
+    return request<ApiResponse<SignalStrengthResponse>>(modemLinePath(lineId, '/network/signal-strength'))
   }
 
-  async getCellLocationInfo() {
-    return request<ApiResponse<CellLocationResponse>>('/location/cell-info')
+  async getCellLocationInfo(lineId: string) {
+    return request<ApiResponse<CellLocationResponse>>(modemLinePath(lineId, '/location/cell-info'))
   }
 
-  async getOperators(lineId?: string) {
-    return request<ApiResponse<OperatorListResponse>>(`/network/operators${lineScopeQuery(lineId)}`)
+  async getOperators(lineId: string) {
+    return request<ApiResponse<OperatorListResponse>>(modemLinePath(lineId, '/network/operators'))
   }
 
-  async scanOperators(lineId?: string) {
-    return request<ApiResponse<OperatorListResponse>>(`/network/operators/scan${lineScopeQuery(lineId)}`)
+  async scanOperators(lineId: string) {
+    return request<ApiResponse<OperatorListResponse>>(modemLinePath(lineId, '/network/operators/scan'))
   }
 
-  async registerOperatorManual(mccmnc: string, lineId?: string) {
-    const body: ManualRegisterRequest = { mccmnc, line_id: lineId }
-    return request<ApiResponse<Record<string, never>>>('/network/register-manual', {
+  async registerOperatorManual(mccmnc: string, lineId: string) {
+    const body: ManualRegisterRequest = { mccmnc }
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/network/register-manual'), {
       method: 'POST',
       body: JSON.stringify(body),
     })
   }
 
-  async registerOperatorAuto(lineId?: string) {
-    return request<ApiResponse<Record<string, never>>>(`/network/register-auto${lineScopeQuery(lineId)}`, {
+  async registerOperatorAuto(lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/network/register-auto'), {
       method: 'POST',
       body: JSON.stringify({}),
     })
   }
 
-  async getApnList(lineId?: string) {
-    return request<ApiResponse<ApnListResponse>>(`/apn${lineScopeQuery(lineId)}`)
+  async getApnList(lineId: string) {
+    return request<ApiResponse<ApnListResponse>>(modemLinePath(lineId, '/apn'))
   }
 
-  async setApn(config: SetApnRequest) {
-    return request<ApiResponse<Record<string, unknown>>>('/apn', {
+  async setApn(lineId: string, config: SetApnRequest) {
+    return request<ApiResponse<Record<string, unknown>>>(modemLinePath(lineId, '/apn'), {
       method: 'POST',
       body: JSON.stringify(config),
     })
   }
 
-  async getRadioMode(lineId?: string) {
-    return request<ApiResponse<RadioModeResponse>>(`/radio-mode${lineScopeQuery(lineId)}`)
+  async getRadioMode(lineId: string) {
+    return request<ApiResponse<RadioModeResponse>>(modemLinePath(lineId, '/radio-mode'))
   }
 
-  async setRadioMode(mode: RadioMode, lineId?: string) {
-    return request<ApiResponse<Record<string, never>>>('/radio-mode', {
+  async setRadioMode(mode: RadioMode, lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/radio-mode'), {
       method: 'POST',
-      body: JSON.stringify({ mode, line_id: lineId }),
+      body: JSON.stringify({ mode }),
     })
   }
 
-  async getBandLockStatus(lineId?: string) {
-    return request<ApiResponse<BandLockStatus>>(`/band-lock${lineScopeQuery(lineId)}`)
+  async getBandLockStatus(lineId: string) {
+    return request<ApiResponse<BandLockStatus>>(modemLinePath(lineId, '/band-lock'))
   }
 
-  async setBandLock(config: BandLockRequest, lineId?: string) {
-    return request<ApiResponse<Record<string, never>>>('/band-lock', {
-      method: 'POST',
-      body: JSON.stringify({ ...config, line_id: lineId }),
-    })
-  }
-
-  async getCellLockStatus(lineId?: string) {
-    return request<ApiResponse<CellLockStatusResponse>>(`/cell-lock${lineScopeQuery(lineId)}`)
-  }
-
-  async setCellLock(config: CellLockRequest) {
-    return request<ApiResponse<CellLockResult>>('/cell-lock', {
+  async setBandLock(config: BandLockRequest, lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/band-lock'), {
       method: 'POST',
       body: JSON.stringify(config),
     })
   }
 
-  async unlockAllCells(lineId?: string) {
-    return request<ApiResponse<CellLockResult>>(`/cell-lock/unlock-all${lineScopeQuery(lineId)}`, {
+  async getCellLockStatus(lineId: string) {
+    return request<ApiResponse<CellLockStatusResponse>>(modemLinePath(lineId, '/cell-lock'))
+  }
+
+  async setCellLock(lineId: string, config: CellLockRequest) {
+    return request<ApiResponse<CellLockResult>>(modemLinePath(lineId, '/cell-lock'), {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async unlockAllCells(lineId: string) {
+    return request<ApiResponse<CellLockResult>>(modemLinePath(lineId, '/cell-lock/unlock-all'), {
       method: 'POST',
       body: JSON.stringify({}),
     })
@@ -653,15 +645,10 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<LineRuntimeStatus[]>>('/modems')
   }
 
-  async getVolteControl() {
-    return request<ApiResponse<VolteControlResponse>>('/volte/control')
-  }
-
-  async setVolteFeature(enabled: boolean) {
-    return request<ApiResponse<VolteControlResponse>>('/volte/feature', {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    })
+  async getImsSupplementary(lineId: string) {
+    return request<ApiResponse<SupplementarySnapshot>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/supplementary`,
+    )
   }
 
   async getVolteLines() {
@@ -689,7 +676,7 @@ class SimAdminCurrentAPI {
     )
   }
 
-  async setVolteLineIpFamilies(lineId: string, families: VolteIpFamily[] | null) {
+  async setVolteLineIpFamilies(lineId: string, families: VolteIpFamily[]) {
     return request<ApiResponse<VolteLineControlResponse>>(
       `/volte/lines/${encodeURIComponent(lineId)}/ip-families`,
       { method: 'POST', body: JSON.stringify({ families }) },
@@ -698,6 +685,10 @@ class SimAdminCurrentAPI {
 
   async getVowifiLines() {
     return request<ApiResponse<VowifiLineConfigResponse[]>>('/vowifi/lines')
+  }
+
+  async getVowifiLine(lineId: string) {
+    return request<ApiResponse<VowifiLineConfigResponse>>(`/vowifi/lines/${encodeURIComponent(lineId)}`)
   }
 
   async setVowifiLineConnection(lineId: string, enabled: boolean) {
@@ -750,10 +741,10 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async sendSms(phoneNumber: string, content: string, lineId?: string) {
-    return request<ApiResponse<{ path: string; transport?: string; line_id?: string }>>('/sms/send', {
+  async sendSms(lineId: string, phoneNumber: string, content: string) {
+    return request<ApiResponse<{ path: string; transport?: string; line_id: string }>>(modemLinePath(lineId, '/sms/send'), {
       method: 'POST',
-      body: JSON.stringify({ phone_number: phoneNumber, content, line_id: lineId || undefined }),
+      body: JSON.stringify({ phone_number: phoneNumber, content }),
     })
   }
 
@@ -784,31 +775,25 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<SmsStats>>(`/sms/stats${query}`)
   }
 
-  async getSmsPathPolicy() {
-    return request<ApiResponse<SmsPathPolicy>>('/sms/path-policy')
+  async getSmsPathPolicy(lineId: string) {
+    return request<ApiResponse<SmsPathPolicy>>(modemLinePath(lineId, '/sms/path-policy'))
   }
 
-  async setSmsPathPolicy(policy: SmsPathPolicy) {
-    return request<ApiResponse<SmsPathPolicy>>('/sms/path-policy', {
+  async setSmsPathPolicy(lineId: string, policy: SmsPathPolicy) {
+    return request<ApiResponse<SmsPathPolicy>>(modemLinePath(lineId, '/sms/path-policy'), {
       method: 'POST',
       body: JSON.stringify(policy),
     })
   }
 
-  async clearAllSms() {
-    return request<ApiResponse<Record<string, never>>>('/sms/clear', {
-      method: 'POST',
-    })
-  }
-
-  async deleteSmsMessage(id: number) {
-    return request<ApiResponse<{ deleted: number }>>(`/sms/message/${id}`, {
+  async deleteSmsMessage(id: number, channelId: string) {
+    return request<ApiResponse<{ deleted: number }>>(`/sms/message/${id}?channel_id=${encodeURIComponent(channelId)}`, {
       method: 'DELETE',
     })
   }
 
-  async deleteSmsConversation(phoneNumber: string, channelId?: string) {
-    const query = channelId ? `?channel_id=${encodeURIComponent(channelId)}` : ''
+  async deleteSmsConversation(phoneNumber: string, channelId: string) {
+    const query = `?channel_id=${encodeURIComponent(channelId)}`
     return request<ApiResponse<{ deleted: number }>>(
       `/sms/conversation/${encodeURIComponent(phoneNumber)}${query}`,
       {
@@ -817,71 +802,80 @@ class SimAdminCurrentAPI {
     )
   }
 
-  async deleteSmsBatch(payload: { ids?: number[]; phone_numbers?: string[]; channel_id?: string }) {
+  async deleteSmsBatch(payload: { ids?: number[]; phone_numbers?: string[]; channel_id: string }) {
     return request<ApiResponse<{ deleted: number }>>('/sms/batch-delete', {
       method: 'POST',
       body: JSON.stringify(payload),
     })
   }
 
-  async getCalls() {
-    return request<ApiResponse<CallListResponse>>('/calls')
+  async getCalls(lineId: string) {
+    return request<ApiResponse<CallListResponse>>(modemLinePath(lineId, '/calls'))
   }
 
-  async dialCall(phoneNumber: string) {
-    return request<ApiResponse<{ path: string }>>('/call/dial', {
+  async dialCall(phoneNumber: string, lineId: string) {
+    return request<ApiResponse<{ path: string; line_id: string }>>(modemLinePath(lineId, '/calls/dial'), {
       method: 'POST',
       body: JSON.stringify({ phone_number: phoneNumber }),
     })
   }
 
-  async hangupCall(path: string) {
-    return request<ApiResponse<Record<string, never>>>('/call/hangup', {
+  async hangupCall(path: string, lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/calls/hangup'), {
       method: 'POST',
       body: JSON.stringify({ path }),
     })
   }
 
-  async hangupAllCalls() {
-    return request<ApiResponse<Record<string, never>>>('/call/hangup-all', {
+  async hangupAllCalls(lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/calls/hangup-all'), {
       method: 'POST',
       body: JSON.stringify({}),
     })
   }
 
-  async answerCall(path: string) {
-    return request<ApiResponse<Record<string, never>>>('/call/answer', {
+  async answerCall(path: string, lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/calls/answer'), {
       method: 'POST',
       body: JSON.stringify({ path }),
     })
   }
 
-  async getCallHistory(params?: { limit?: number; offset?: number }) {
+  async sendCallDtmf(path: string, digit: string, lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/calls/dtmf'), {
+      method: 'POST',
+      body: JSON.stringify({ path, digit }),
+    })
+  }
+
+  async getCallHistory(params: { lineId: string; limit?: number; offset?: number }) {
     const query = new URLSearchParams()
     if (params?.limit) query.append('limit', params.limit.toString())
     if (params?.offset) query.append('offset', params.offset.toString())
     const queryStr = query.toString() ? `?${query.toString()}` : ''
-    return request<ApiResponse<CallHistoryResponse>>(`/call/history${queryStr}`)
+    return request<ApiResponse<CallHistoryResponse>>(
+      modemLinePath(params.lineId, `/calls/history${queryStr}`),
+    )
   }
 
-  async deleteCallRecord(id: number) {
-    return request<ApiResponse<Record<string, never>>>(`/call/history/${id}`, {
+  async deleteCallRecord(id: number, lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, `/calls/history/${id}`), {
       method: 'DELETE',
     })
   }
 
-  async clearCallHistory() {
-    return request<ApiResponse<Record<string, never>>>('/call/history/clear', {
+  async clearCallHistory(lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/calls/history/clear'), {
       method: 'POST',
     })
   }
 
-  async getVoicePathPolicy() {
-    return request<ApiResponse<VoicePathPolicy>>('/voice/path-policy')
+  async getVoicePathPolicy(lineId: string) {
+    return request<ApiResponse<VoicePathPolicy>>(modemLinePath(lineId, '/voice/path-policy'))
   }
 
-  async setVoicePathPolicy(policy: VoicePathPolicy) {
-    return request<ApiResponse<VoicePathPolicy>>('/voice/path-policy', {
+  async setVoicePathPolicy(lineId: string, policy: VoicePathPolicy) {
+    return request<ApiResponse<VoicePathPolicy>>(modemLinePath(lineId, '/voice/path-policy'), {
       method: 'POST',
       body: JSON.stringify(policy),
     })
@@ -891,41 +885,41 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<WebCallCapabilitiesResponse>>('/web-call/capabilities')
   }
 
-  async getVolteVoiceStatus() {
-    return request<ApiResponse<VolteVoiceStatusResponse>>('/volte/call/status')
+  async getVolteVoiceStatus(lineId: string) {
+    return request<ApiResponse<VolteVoiceStatusResponse>>(modemLinePath(lineId, '/volte/call/status'))
   }
 
-  async setVolteVoice(enabled: boolean) {
-    return request<ApiResponse<VolteVoiceStatusResponse>>('/volte/voice', {
+  async setVolteVoice(lineId: string, enabled: boolean) {
+    return request<ApiResponse<VolteVoiceStatusResponse>>(modemLinePath(lineId, '/volte/voice'), {
       method: 'POST',
       body: JSON.stringify({ enabled }),
     })
   }
 
-  async getVilteStatus() {
-    return request<ApiResponse<VilteStatusResponse>>('/vilte/control')
+  async getVilteStatus(lineId: string) {
+    return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/control'))
   }
 
-  async setVilteFeature(enabled: boolean) {
-    return request<ApiResponse<VilteStatusResponse>>('/vilte/control', {
+  async setVilteFeature(lineId: string, enabled: boolean) {
+    return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/control'), {
       method: 'POST',
       body: JSON.stringify({ enabled }),
     })
   }
 
-  async setVilteConfig(config: VilteConfig) {
-    return request<ApiResponse<VilteStatusResponse>>('/vilte/config', {
+  async setVilteConfig(lineId: string, config: VilteConfig) {
+    return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/config'), {
       method: 'POST',
       body: JSON.stringify(config),
     })
   }
 
-  async getCallSettings() {
-    return request<ApiResponse<CallSettingsResponse>>('/call/settings')
+  async getCallSettings(lineId: string) {
+    return request<ApiResponse<CallSettingsResponse>>(modemLinePath(lineId, '/calls/settings'))
   }
 
-  async setCallWaiting(enabled: boolean) {
-    return request<ApiResponse<Record<string, never>>>('/call/settings', {
+  async setCallWaiting(lineId: string, enabled: boolean) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/calls/settings'), {
       method: 'POST',
       body: JSON.stringify({ property: 'VoiceCallWaiting', value: enabled ? 'enabled' : 'disabled' }),
     })
@@ -948,10 +942,11 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getNotificationLogs(params?: { type?: string; status?: string; q?: string; start_date?: string; end_date?: string; limit?: number; offset?: number }) {
+  async getNotificationLogs(params?: { type?: string; status?: string; line_id?: string; q?: string; start_date?: string; end_date?: string; limit?: number; offset?: number }) {
     const query = new URLSearchParams()
     if (params?.type) query.append('type', params.type)
     if (params?.status) query.append('status', params.status)
+    if (params?.line_id) query.append('line_id', params.line_id)
     if (params?.q) query.append('q', params.q)
     if (params?.start_date) query.append('start_date', params.start_date)
     if (params?.end_date) query.append('end_date', params.end_date)
@@ -961,15 +956,16 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<NotificationLogsResponse>>(`/notifications/logs${queryStr}`)
   }
 
-  async clearNotificationLogs(filters?: { type?: string; status?: string; start_date?: string; end_date?: string }) {
+  async clearNotificationLogs(filters?: { type?: string; status?: string; line_id?: string; start_date?: string; end_date?: string }) {
     return request<ApiResponse<{ deleted: number }>>('/notifications/logs/clear', {
       method: 'POST',
       body: JSON.stringify(filters ?? {}),
     })
   }
 
-  async getNotificationQueue(params?: { limit?: number }) {
+  async getNotificationQueue(params?: { line_id?: string; limit?: number }) {
     const query = new URLSearchParams()
+    if (params?.line_id) query.append('line_id', params.line_id)
     if (params?.limit) query.append('limit', params.limit.toString())
     const queryStr = query.toString() ? `?${query.toString()}` : ''
     return request<ApiResponse<NotificationQueueResponse>>(`/notifications/queue${queryStr}`)
@@ -1093,84 +1089,43 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getVowifiProfile() {
-    return request<ApiResponse<VowifiProfileMatchResponse>>('/vowifi/profile', {
-      timeoutMs: 10000,
-    })
-  }
-
-  async getVowifiStatus() {
-    return request<ApiResponse<VowifiStatusResponse>>('/vowifi/status', {
-      timeoutMs: 30000,
-    })
-  }
-
-  async getVowifiControl() {
-    return request<ApiResponse<VowifiConfig>>('/vowifi/control', {
-      timeoutMs: 10000,
-    })
-  }
-
-  async setVowifiFeature(enabled: boolean) {
-    return request<ApiResponse<VowifiConfig>>('/vowifi/feature', {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-      timeoutMs: 10000,
-    })
-  }
-
-  async setVowifiConnection(enabled: boolean) {
-    return request<ApiResponse<VowifiStatusResponse>>('/vowifi/connection', {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-      timeoutMs: 120000,
-    })
-  }
-
-  async connectVowifi() {
-    return request<ApiResponse<VowifiStatusResponse>>('/vowifi/connect', {
-      method: 'POST',
-      timeoutMs: 120000,
-    })
-  }
-
-  async getVowifiDiagnostics(options: { limit?: number; traceId?: string } = {}) {
+  async getVowifiDiagnostics(options: { lineId: string; limit?: number; traceId?: string }) {
     const query = new URLSearchParams()
     query.set('limit', String(options.limit ?? 50))
     const traceId = options.traceId?.trim()
     if (traceId) query.set('trace_id', traceId)
-    const suffix = query.toString()
-    return request<ApiResponse<VowifiDiagnosticsResponse>>(`/vowifi/diagnostics${suffix ? `?${suffix}` : ''}`, {
-      timeoutMs: 30000,
-    })
+    return request<ApiResponse<VowifiDiagnosticsResponse>>(
+      `/vowifi/lines/${encodeURIComponent(options.lineId.trim())}/diagnostics?${query.toString()}`,
+      { timeoutMs: 30000 },
+    )
   }
 
-  async getVowifiEvents(limit = 50, traceId?: string) {
-    const query = new URLSearchParams()
-    query.set('limit', String(limit))
-    const filter = traceId?.trim()
-    if (filter) query.set('trace_id', filter)
-    return request<ApiResponse<VowifiRuntimeEventsResponse>>(`/vowifi/events?${query.toString()}`, {
-      timeoutMs: 10000,
-    })
+  async getE911Capability(lineId: string) {
+    return request<ApiResponse<E911Capability>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/e911/capability`,
+      { timeoutMs: 10000 },
+    )
   }
 
-  async getVowifiSmsDeliveries(limit = 20) {
-    return request<ApiResponse<VowifiSmsDeliveriesResponse>>(`/vowifi/sms/delivery?limit=${limit}`, {
-      timeoutMs: 10000,
-    })
+  async getE911Status(lineId: string) {
+    return request<ApiResponse<E911Status>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/e911/status`,
+      { timeoutMs: 10000 },
+    )
   }
 
-  async getVowifiSoakRuns(limit = 20) {
-    return request<ApiResponse<VowifiSoakRunsResponse>>(`/vowifi/soak?limit=${limit}`, {
-      timeoutMs: 10000,
-    })
+  async queryE911(lineId: string) {
+    return request<ApiResponse<E911Status>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/e911/query`,
+      { method: 'POST', timeoutMs: 30000 },
+    )
   }
 
-  async getVowifiEsimRestore() {
-    return request<ApiResponse<VowifiEsimRestoreEntry | null>>('/vowifi/esim-restore/status', {
-      timeoutMs: 10000,
-    })
+  async createE911Operation(lineId: string) {
+    return request<ApiResponse<E911Operation>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/e911/operations`,
+      { method: 'POST', timeoutMs: 10000 },
+    )
   }
 
   async applyOta(restartNow = false) {
@@ -1203,10 +1158,11 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getAutomationLogs(params?: { type?: string; status?: string; start_date?: string; end_date?: string; q?: string; limit?: number; offset?: number }) {
+  async getAutomationLogs(params?: { type?: string; status?: string; line_id?: string; start_date?: string; end_date?: string; q?: string; limit?: number; offset?: number }) {
     const query = new URLSearchParams()
     if (params?.type) query.append('type', params.type)
     if (params?.status) query.append('status', params.status)
+    if (params?.line_id) query.append('line_id', params.line_id)
     if (params?.q) query.append('q', params.q)
     if (params?.start_date) query.append('start_date', params.start_date)
     if (params?.end_date) query.append('end_date', params.end_date)
@@ -1216,7 +1172,7 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<AutomationLogsResponse>>(`/automation/logs${queryStr}`)
   }
 
-  async clearAutomationLogs(filters?: { type?: string; status?: string; start_date?: string; end_date?: string }) {
+  async clearAutomationLogs(filters?: { type?: string; status?: string; line_id?: string; start_date?: string; end_date?: string }) {
     return request<ApiResponse<{ deleted: number }>>('/automation/logs/clear', {
       method: 'POST',
       body: JSON.stringify(filters ?? {}),

@@ -398,8 +398,6 @@ export interface CellLockRequest {
   lock_type?: number
   pci?: number
   arfcn?: number
-  /** Omitted means the primary line. */
-  line_id?: string
 }
 
 export interface CellLockResult {
@@ -592,10 +590,19 @@ export interface TrunkProfileResponse {
  */
 export type VolteIpFamily = 'ipv4v6' | 'ipv4' | 'ipv6'
 
+export interface AutoRestoreConfig {
+  initial_delay_secs: number
+  attempts: number
+  retry_delay_secs: number
+}
+
 export interface LineProfileConfig {
   line_id: string
   enabled: boolean
   volte_connection_enabled: boolean
+  volte_auto_restore: AutoRestoreConfig
+  volte_voice_enabled: boolean
+  vilte: VilteConfig
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
   data_connection_enabled: boolean
@@ -603,11 +610,10 @@ export interface LineProfileConfig {
   roaming_allowed: boolean
   airplane_mode_enabled: boolean
   /**
-   * Ordered IMS address-family attempt list. `null` inherits the global VoLTE
-   * preference. Order is the attempt/fallback order; a one-element list means
+   * Ordered IMS address-family attempt list. Order is the attempt/fallback order; a one-element list means
    * "only that family".
    */
-  volte_ip_families?: VolteIpFamily[] | null
+  volte_ip_families: VolteIpFamily[]
   /**
    * Per-line eSIM management override. `null`/undefined = auto (managed only
    * when the SIM reports a eUICC chip), `true` = force eSIM controls on,
@@ -723,13 +729,22 @@ export interface SmsPolicyRecord {
   smsc_auth_required: boolean
 }
 
+export interface VoiceCodecPolicyRecord {
+  codec: string
+  payload_type: number | null
+  sample_rate: number | null
+  fmtp: string | null
+}
+
 export interface VoicePolicyRecord {
   vowifi_enabled: boolean
   carrier_fallback_enabled: boolean
   preferred_codecs: string[]
+  codec_policies: VoiceCodecPolicyRecord[]
   amr_octet_align: boolean
   ptime_ms: number
   sip_endpoint_exposed: boolean
+  voicemail_number: string | null
 }
 
 export interface E911PolicyRecord {
@@ -737,6 +752,55 @@ export interface E911PolicyRecord {
   provider: string | null
   entitlement_url: string | null
   websheet_host_policy: string | null
+}
+
+export interface UtPolicyRecord {
+  enabled: boolean
+  xcap_root: string | null
+  document_selector: string | null
+  namespace: string | null
+  authentication: string
+  partial_update: boolean
+  call_waiting_selector: string | null
+  diversion_rule_selector: string | null
+  oip_selector: string | null
+  oir_selector: string | null
+  tls_min_version: string
+  tls_max_version: string
+  tls_builtin_roots: boolean
+  tls_additional_ca_pem: string | null
+}
+
+export interface E911Capability {
+  profile_id: string
+  provider_kind: string
+  provider_id: string
+  operator_requires: boolean
+  query_supported: boolean
+  websheet_expected: boolean
+}
+
+export interface E911Status {
+  profile_id: string
+  provider_kind: string
+  state: string
+  source: string
+  operator_requires: boolean
+  address_saved_locally: boolean
+  operator_confirmed: boolean
+  emergency_unverified: boolean
+  needs_user_action: boolean
+  needs_reconfirm: boolean
+  retry_after_epoch?: number | null
+}
+
+export interface E911Operation {
+  operation_id: string
+  line_id: string
+  launch_url: string
+  server_flow_url: string
+  expires_epoch: number
+  state: string
 }
 
 export interface CarrierProfileRecord {
@@ -748,6 +812,7 @@ export interface CarrierProfileRecord {
   sms: SmsPolicyRecord
   voice: VoicePolicyRecord
   e911: E911PolicyRecord
+  ut: UtPolicyRecord
 }
 
 /** Where a resolved profile came from. */
@@ -833,22 +898,13 @@ export interface LineVowifiConfig {
   enabled: boolean
   proxy_mode: VowifiProxyMode
   proxy_endpoint: string
-  dns_server: string
-  /**
-   * Pin this line to a specific carrier profile by `profile_id`. `null`/omitted
-   * resolves the profile automatically from the SIM's IMSI. The dropdown only
-   * offers database profiles; a pinned id that no longer resolves falls back to
-   * automatic matching so deleting a profile never strands a line.
-   */
-  profile_id?: string | null
+  auto_restore: AutoRestoreConfig
 }
 
 export interface VowifiLineConfigResponse {
   line_id: string
   modem: ModemBinding
   config: LineVowifiConfig
-  is_primary: boolean
-  runtime_scope: string
   runtime_phase: string
   runtime_stage: string
   runtime_registered: boolean
@@ -868,19 +924,42 @@ export interface LineRuntimeStatus {
   modem: ModemBinding
   volte: VolteRuntimeStatus
   trunk: TrunkRuntimeStatus
+  supplementary: SupplementarySnapshot
+}
+
+export interface SupplementarySnapshot {
+  line_id: string
+  call_waiting: 'enabled' | 'disabled' | 'unknown'
+  call_waiting_capability: CapabilityReadiness
+  forwarding_capability: CapabilityReadiness
+  identity_capability: CapabilityReadiness
+  mwi_capability: CapabilityReadiness
+  message_waiting?: MessageWaitingSummary | null
+}
+
+export interface CapabilityReadiness {
+  supported: boolean
+  ready: boolean
+  reason?: string | null
+}
+
+export interface MessageWaitingSummary {
+  source: 'operator_ims' | 'asterisk_local'
+  messages_waiting: boolean
+  message_account?: string | null
+  voice?: MessageCount | null
+}
+
+export interface MessageCount {
+  new: number
+  old: number
+  urgent_new: number
+  urgent_old: number
 }
 
 export interface VolteLineControlResponse {
   modem: ModemBinding
   profile: LineProfileConfig
-  runtime: VolteRuntimeStatus
-}
-
-export interface VolteControlResponse {
-  enabled: boolean
-  feature_enabled: boolean
-  sms_enabled: boolean
-  connection_enabled: boolean
   runtime: VolteRuntimeStatus
 }
 
@@ -919,6 +998,7 @@ export interface SmsStats {
 
 export interface CallInfo {
   path: string
+  line_id: string
   phone_number: string
   state: string
   direction: string
@@ -931,6 +1011,7 @@ export interface CallListResponse {
 
 export interface CallRecord {
   id: number
+  line_id?: string
   direction: string
   phone_number: string
   duration: number
@@ -948,6 +1029,7 @@ export interface CallStats {
 }
 
 export interface CallHistoryResponse {
+  line_id: string
   records: CallRecord[]
   stats: CallStats
 }
@@ -979,8 +1061,15 @@ export interface SmsPathPolicy {
   message_retention_limit: number
 }
 
+export type VoiceAccessPathKind = 'vowifi' | 'volte'
+
+export interface VoicePathLayerConfig {
+  kind: VoiceAccessPathKind
+  enabled: boolean
+}
+
 export interface VoicePathPolicy {
-  priority: PathLayerConfig[]
+  priority: VoicePathLayerConfig[]
   gateway_mode: boolean
 }
 
@@ -1009,17 +1098,21 @@ export interface VilteConfig {
 }
 
 export interface VilteStatusResponse {
+  line_id: string
   enabled: boolean
   feature_enabled: boolean
+  registered: boolean
   gateway_mode: boolean
   local_video_capable: boolean
   config: VilteConfig
 }
 
 export interface VolteVoiceStatusResponse {
+  line_id: string
   enabled: boolean
-  feature_enabled: boolean
+  ims_connection_enabled: boolean
   voice_enabled: boolean
+  registered: boolean
   gateway_mode: boolean
   local_audio_capable: boolean
 }
@@ -1063,8 +1156,6 @@ export interface OperatorListResponse {
 
 export interface ManualRegisterRequest {
   mccmnc: string
-  /** Omitted means the primary line. */
-  line_id?: string
 }
 
 export interface ApnContext {
@@ -1090,8 +1181,6 @@ export interface SetApnRequest {
   username?: string
   password?: string
   auth_method?: string
-  /** Omitted means the primary line, and only then is the global APN written. */
-  line_id?: string
 }
 
 export interface PingResult {
@@ -1132,7 +1221,7 @@ export type NotificationChannelKey =
   | 'feishu_robot'
   | 'telegram'
 
-export type NotificationEventType = 'sms' | 'ddns' | 'version_update' | 'system_event' | 'device_status' | 'automation'
+export type NotificationEventType = 'sms' | 'call' | 'ddns' | 'version_update' | 'system_event' | 'device_status' | 'automation'
 export type NotificationLogStatus = 'success' | 'failed' | 'no_available_channel' | 'quiet_hours' | 'unmatched'
 export type MatcherOperator = 'always' | 'contains' | 'not_contains' | 'equals' | 'regex'
 
@@ -1284,6 +1373,7 @@ export interface NotificationRule {
 
 export interface NotificationLogEntry {
   id: number
+  line_id?: string | null
   event_type: NotificationEventType
   status: NotificationLogStatus
   summary: string
@@ -1304,6 +1394,7 @@ export type NotificationQueueItemStatus = 'pending' | 'scheduled' | 'retrying' |
 
 export interface NotificationQueueEntry {
   id: number
+  line_id?: string | null
   status: NotificationQueueItemStatus
   event_type: NotificationEventType
   event_label: string
@@ -1444,14 +1535,6 @@ export interface OtaLatestReleaseResponse {
   body?: string
   html_url?: string
   assets?: OtaReleaseAsset[]
-}
-
-export interface VowifiConfig {
-  feature_enabled: boolean
-  connection_enabled: boolean
-  auto_restore_initial_delay_secs: number
-  auto_restore_attempts: number
-  auto_restore_retry_delay_secs: number
 }
 
 export interface VowifiCarrierProfile {
@@ -2150,6 +2233,7 @@ export interface VowifiStatusResponse {
   switch_retry_count: number
 }
 export interface VowifiRuntimeSnapshotEntry {
+  line_id?: string | null
   phase: string
   profile_id?: string | null
   plmn?: string | null
@@ -2282,6 +2366,7 @@ export interface VowifiReadinessAuditReport {
   sensitive_values_policy: string
 }
 export interface VowifiDiagnosticsResponse {
+  line_id?: string | null
   status: VowifiStatusResponse
   persisted_snapshot?: VowifiRuntimeSnapshotEntry | null
   events: VowifiRuntimeEventsResponse
@@ -2297,6 +2382,7 @@ export interface VowifiDiagnosticsResponse {
 
 export interface VowifiRuntimeEventEntry {
   id: number
+  line_id?: string | null
   trace_id?: string | null
   level: string
   phase: string
@@ -2322,6 +2408,7 @@ export interface VowifiSmsPartEntry {
 
 export interface VowifiSmsDeliveryEntry {
   message_id: string
+  line_id?: string | null
   trace_id: string
   direction: string
   state: string
@@ -2353,6 +2440,7 @@ export interface VowifiSoakSampleEntry {
 
 export interface VowifiSoakRunEntry {
   run_id: string
+  line_id?: string | null
   scenario_id: string
   profile_id?: string | null
   plmn?: string | null
@@ -2374,6 +2462,7 @@ export interface VowifiSoakRunsResponse {
 }
 
 export interface VowifiEsimRestoreEntry {
+  line_id?: string | null
   switch_token?: string | null
   switch_phase?: string | null
   phase_ms?: number | null
@@ -2543,6 +2632,7 @@ export interface AutomationTask {
 
 export interface AutomationLogEntry {
   id: number
+  line_id?: string | null
   task_id: string
   task_name: string
   task_type: string

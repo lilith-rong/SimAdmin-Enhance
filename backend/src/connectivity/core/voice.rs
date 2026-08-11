@@ -2,7 +2,8 @@
 //!
 //! This module mirrors the split used by `sms.rs`: it holds the pure,
 //! offline-testable pieces of the voice path (call state machine, SDP
-//! offer/answer builder + parser, AMR/AMR-WB RTP payload framing) while the
+//! offer/answer builder + parser, EVS signaling, and AMR/AMR-WB RTP payload
+//! framing) while the
 //! real network I/O (INVITE over the ESP-protected IMS route, RTP media loop)
 //! lives in `live.rs`.
 //!
@@ -48,12 +49,17 @@ fn unix_millis() -> u128 {
 ///
 /// Extracting it lets both the VoWiFi path (which builds it from a
 /// `&'static CarrierProfile`) and the VoLTE path (which builds it from its own
-/// `VolteConfig`/runtime) reuse the exact same SDP/state-machine logic without
+/// runtime) reuse the exact same SDP/state-machine logic without
 /// depending on the VoWiFi-specific `CarrierProfile` type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceParams {
-    /// Preferred codec tokens in priority order ("amr", "amr-wb", "pcmu", "pcma").
+    /// Preferred codec tokens in priority order ("evs", "amr", "amr-wb",
+    /// "pcmu", "pcma").
     pub preferred_codecs: Vec<String>,
+    /// Optional carrier-specific RTP policy. When populated this is the
+    /// authoritative offer list; `preferred_codecs` remains the compact
+    /// preference/readiness view used by status APIs and legacy profiles.
+    pub codec_policies: Vec<AudioCodecPolicy>,
     /// Packetization time (ms) advertised in the SDP offer.
     pub ptime_ms: u16,
     /// Whether AMR payloads are offered octet-aligned (`octet-align=1`).
@@ -68,6 +74,103 @@ pub struct VoiceParams {
     pub profile_id: &'static str,
     /// PLMN label for snapshots.
     pub plmn: &'static str,
+}
+
+/// A user part that is safe to place in an IMS `tel:`/`sip:` dial target.
+///
+/// Normal phone numbers keep the established 3--20 digit range. Service
+/// access codes (such as US voicemail `*86`) additionally permit `*` and `#`
+/// and are capped at 32 characters, matching the modem's `AT+CSVM` parser.
+/// This is deliberately narrower than a generic SIP URI: an external domain,
+/// URI parameter, whitespace, or control character must never reach an
+/// operator INVITE builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImsDialStringError {
+    Empty,
+    InvalidCharacter,
+    InvalidLength,
+    InvalidPlusPlacement,
+}
+
+impl std::fmt::Display for ImsDialStringError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = match self {
+            Self::Empty => "ims_dial_string_empty",
+            Self::InvalidCharacter => "ims_dial_string_invalid_character",
+            Self::InvalidLength => "ims_dial_string_invalid_length",
+            Self::InvalidPlusPlacement => "ims_dial_string_invalid_plus_placement",
+        };
+        formatter.write_str(code)
+    }
+}
+
+impl std::error::Error for ImsDialStringError {}
+
+/// Normalize a locally supplied dial string before it is inserted into an IMS
+/// request URI. This accepts only the user portion of an optional `sip:` or
+/// `tel:` target; a supplied host and URI parameters are intentionally ignored
+/// because the registered IMS access owns the destination domain.
+pub fn normalize_ims_dial_user(value: &str) -> Result<String, ImsDialStringError> {
+    let trimmed = value.trim();
+    let without_scheme = trimmed
+        .strip_prefix("sip:")
+        .or_else(|| trimmed.strip_prefix("tel:"))
+        .unwrap_or(trimmed);
+    let raw_user = without_scheme
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default();
+    let user = raw_user
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '(' | ')'))
+        .collect::<String>();
+    if user.is_empty() {
+        return Err(ImsDialStringError::Empty);
+    }
+
+    let mut saw_plus = false;
+    let mut has_service_character = false;
+    for (index, character) in user.chars().enumerate() {
+        match character {
+            '+' if index == 0 => saw_plus = true,
+            '+' => return Err(ImsDialStringError::InvalidPlusPlacement),
+            '0'..='9' => {}
+            '*' | '#' => has_service_character = true,
+            _ => return Err(ImsDialStringError::InvalidCharacter),
+        }
+    }
+    let payload = user.strip_prefix('+').unwrap_or(&user);
+    if payload.is_empty() || (saw_plus && has_service_character) {
+        return Err(ImsDialStringError::InvalidPlusPlacement);
+    }
+    let valid_length = if has_service_character {
+        (1..=32).contains(&payload.len())
+    } else {
+        (3..=20).contains(&payload.len())
+    };
+    valid_length
+        .then_some(user)
+        .ok_or(ImsDialStringError::InvalidLength)
+}
+
+/// Carrier-specific parameters for one audio codec offer.
+///
+/// The policy deliberately models signaling only. SimAdmin can advertise,
+/// negotiate and relay the resulting RTP payload, but it does not imply that
+/// SimAdmin contains an encoder, decoder or transcoder for the codec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioCodecPolicy {
+    pub codec: AudioCodec,
+    /// Explicit RTP payload type from the carrier catalog. Dynamic codecs may
+    /// leave this unset and receive an available value from 96..=127.
+    pub payload_type: Option<u8>,
+    /// Explicit RTP clock rate. It must match the codec's registered clock.
+    pub sample_rate: Option<u32>,
+    /// Codec-specific SDP parameters without the `a=fmtp:<pt>` prefix.
+    pub fmtp: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +324,8 @@ impl MediaTransportKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioCodec {
+    /// 3GPP Enhanced Voice Services, RTP payload per 3GPP TS 26.445 Annex A.
+    Evs,
     /// AMR narrowband (3GPP TS 26.071), RTP payload per RFC 4867.
     Amr,
     /// AMR wideband (3GPP TS 26.171), RTP payload per RFC 4867.
@@ -234,6 +339,7 @@ pub enum AudioCodec {
 impl AudioCodec {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Evs => "evs",
             Self::Amr => "amr",
             Self::AmrWb => "amr_wb",
             Self::Pcmu => "pcmu",
@@ -244,6 +350,7 @@ impl AudioCodec {
     /// The `a=rtpmap` encoding name for this codec.
     pub fn rtpmap_encoding(self) -> &'static str {
         match self {
+            Self::Evs => "EVS",
             Self::Amr => "AMR",
             Self::AmrWb => "AMR-WB",
             Self::Pcmu => "PCMU",
@@ -255,7 +362,7 @@ impl AudioCodec {
     pub fn clock_rate(self) -> u32 {
         match self {
             Self::Amr | Self::Pcmu | Self::Pcma => 8000,
-            Self::AmrWb => 16000,
+            Self::Evs | Self::AmrWb => 16000,
         }
     }
 
@@ -264,7 +371,7 @@ impl AudioCodec {
         match self {
             Self::Pcmu => Some(0),
             Self::Pcma => Some(8),
-            Self::Amr | Self::AmrWb => None,
+            Self::Evs | Self::Amr | Self::AmrWb => None,
         }
     }
 
@@ -274,8 +381,9 @@ impl AudioCodec {
         matches!(self, Self::Amr | Self::AmrWb)
     }
 
-    fn from_token(token: &str) -> Option<Self> {
+    pub fn from_token(token: &str) -> Option<Self> {
         match token.to_ascii_lowercase().as_str() {
+            "evs" => Some(Self::Evs),
             "amr" => Some(Self::Amr),
             "amr-wb" | "amr_wb" | "amrwb" => Some(Self::AmrWb),
             "pcmu" => Some(Self::Pcmu),
@@ -391,17 +499,26 @@ impl std::error::Error for VoiceEncodingError {}
 pub struct SdpCodec {
     pub codec: AudioCodec,
     pub payload_type: u8,
+    /// RTP clock rate carried by `a=rtpmap`. EVS is always 16000 Hz.
+    pub clock_rate: u32,
+    /// Optional explicit channel count from `a=rtpmap`; omission means mono.
+    pub channels: Option<u8>,
     /// Extra `a=fmtp` parameters (e.g. `mode-set`, `octet-align`), verbatim.
     pub fmtp: Option<String>,
 }
 
 impl SdpCodec {
     fn rtpmap_line(&self) -> String {
+        let channels = self
+            .channels
+            .map(|channels| format!("/{channels}"))
+            .unwrap_or_default();
         format!(
-            "a=rtpmap:{} {}/{}\r\n",
+            "a=rtpmap:{} {}/{}{}\r\n",
             self.payload_type,
             self.codec.rtpmap_encoding(),
-            self.codec.clock_rate()
+            self.clock_rate,
+            channels,
         )
     }
 
@@ -453,6 +570,26 @@ impl MediaDirection {
     /// modules (e.g. the ViLTE video SDP parser) can reuse direction parsing.
     pub fn from_token_pub(token: &str) -> Option<Self> {
         Self::from_token(token)
+    }
+
+    /// The direction which represents the opposite endpoint of this SDP leg.
+    /// A B2BUA must invert unidirectional offers/answers while relaying them to
+    /// its peer; `sendrecv` and `inactive` are symmetric.
+    pub const fn for_peer(self) -> Self {
+        match self {
+            Self::SendRecv => Self::SendRecv,
+            Self::SendOnly => Self::RecvOnly,
+            Self::RecvOnly => Self::SendOnly,
+            Self::Inactive => Self::Inactive,
+        }
+    }
+
+    pub const fn allows_send(self) -> bool {
+        matches!(self, Self::SendRecv | Self::SendOnly)
+    }
+
+    pub const fn allows_receive(self) -> bool {
+        matches!(self, Self::SendRecv | Self::RecvOnly)
     }
 }
 
@@ -543,9 +680,25 @@ impl SdpAudioDescription {
     pub fn common_codecs(&self, remote: &SdpAudioDescription) -> Vec<AudioCodec> {
         self.codecs
             .iter()
-            .filter(|local| remote.codecs.iter().any(|other| other.codec == local.codec))
+            .filter(|local| remote.find_matching_codec(local).is_some())
             .map(|local| local.codec)
             .collect()
+    }
+
+    /// Find the corresponding payload on this media description. Exact fmtp
+    /// matches win so multiple EVS payload types with different `br`/`bw`
+    /// restrictions do not all collapse onto the first EVS entry.
+    pub fn find_matching_codec(&self, other: &SdpCodec) -> Option<&SdpCodec> {
+        let same_encoding = |candidate: &&SdpCodec| {
+            candidate.codec == other.codec
+                && candidate.clock_rate == other.clock_rate
+                && candidate.channels.unwrap_or(1) == other.channels.unwrap_or(1)
+        };
+        self.codecs
+            .iter()
+            .filter(same_encoding)
+            .find(|candidate| candidate.fmtp == other.fmtp)
+            .or_else(|| self.codecs.iter().find(same_encoding))
     }
 }
 
@@ -553,7 +706,7 @@ impl SdpAudioDescription {
 ///
 /// This is deliberately permissive: it extracts the `c=`, `m=audio`,
 /// `a=rtpmap`, `a=fmtp`, `a=ptime` and direction attributes needed to drive an
-/// AMR/G.711 RTP flow, and ignores everything else.
+/// EVS/AMR/G.711 RTP flow, and ignores everything else.
 pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncodingError> {
     if body.is_empty() {
         return Err(VoiceEncodingError::EmptySdp);
@@ -563,17 +716,19 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
     let mut origin_username = String::from("-");
     let mut session_id = 0u64;
     let mut session_version = 0u64;
-    let mut connection_addr = String::new();
-    let mut addr_type = SdpAddrType::Ip4;
+    let mut origin_connection: Option<(SdpAddrType, String)> = None;
+    let mut session_connection: Option<(SdpAddrType, String)> = None;
+    let mut audio_connection: Option<(SdpAddrType, String)> = None;
     let mut media_port = 0u16;
     let mut transport = MediaTransportKind::RtpAvp;
     let mut payload_order: Vec<u8> = Vec::new();
     let mut direction = MediaDirection::SendRecv;
     let mut ptime: Option<u16> = None;
-    let mut rtpmaps: Vec<(u8, AudioCodec)> = Vec::new();
+    let mut rtpmaps: Vec<(u8, AudioCodec, u32, Option<u8>)> = Vec::new();
     let mut fmtps: Vec<(u8, String)> = Vec::new();
     let mut in_audio_media = false;
     let mut saw_audio_media = false;
+    let mut saw_any_media = false;
 
     for raw_line in text.split('\n') {
         let line = raw_line.trim_end_matches('\r').trim_end();
@@ -590,28 +745,34 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
                     origin_username = parts[0].to_string();
                     session_id = parts[1].parse().unwrap_or(0);
                     session_version = parts[2].parse().unwrap_or(0);
-                    addr_type = if parts[5].contains("IP6") {
+                    let addr_type = if parts[4].eq_ignore_ascii_case("IP6") {
                         SdpAddrType::Ip6
                     } else {
                         SdpAddrType::Ip4
                     };
-                    connection_addr = parts[5].to_string();
+                    origin_connection = Some((addr_type, parts[5].to_string()));
                 }
             }
             "c" => {
                 let parts = value.split_whitespace().collect::<Vec<_>>();
                 if parts.len() >= 3 {
-                    addr_type = if parts[1].eq_ignore_ascii_case("IP6") {
+                    let addr_type = if parts[1].eq_ignore_ascii_case("IP6") {
                         SdpAddrType::Ip6
                     } else {
                         SdpAddrType::Ip4
                     };
-                    connection_addr = parts[2].to_string();
+                    let connection = (addr_type, parts[2].to_string());
+                    if !saw_any_media {
+                        session_connection = Some(connection);
+                    } else if in_audio_media {
+                        audio_connection = Some(connection);
+                    }
                 }
             }
             "m" => {
                 // m=<media> <port> <proto> <fmt list>
                 let parts = value.split_whitespace().collect::<Vec<_>>();
+                saw_any_media = true;
                 in_audio_media = parts.first().copied() == Some("audio");
                 if in_audio_media {
                     saw_audio_media = true;
@@ -630,9 +791,9 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
                             payload_order.push(pt);
                             // seed static codecs so PCMU/PCMA resolve without rtpmap
                             if pt == 0 {
-                                rtpmaps.push((0, AudioCodec::Pcmu));
+                                rtpmaps.push((0, AudioCodec::Pcmu, 8000, None));
                             } else if pt == 8 {
-                                rtpmaps.push((8, AudioCodec::Pcma));
+                                rtpmaps.push((8, AudioCodec::Pcma, 8000, None));
                             }
                         }
                     }
@@ -644,10 +805,18 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
                     let mut iter = rtpmap.split_whitespace();
                     if let (Some(pt_str), Some(enc)) = (iter.next(), iter.next()) {
                         if let Ok(pt) = pt_str.parse::<u8>() {
-                            let encoding = enc.split('/').next().unwrap_or("");
-                            if let Some(codec) = AudioCodec::from_token(encoding) {
-                                rtpmaps.retain(|(existing, _)| *existing != pt);
-                                rtpmaps.push((pt, codec));
+                            let mut encoding = enc.split('/');
+                            let name = encoding.next().unwrap_or("");
+                            let clock_rate = encoding.next().and_then(|value| value.parse().ok());
+                            let channels = encoding.next().and_then(|value| value.parse().ok());
+                            if let (Some(codec), Some(clock_rate)) =
+                                (AudioCodec::from_token(name), clock_rate)
+                            {
+                                let channels_valid = channels.is_none_or(|value| value > 0);
+                                if clock_rate == codec.clock_rate() && channels_valid {
+                                    rtpmaps.retain(|(existing, _, _, _)| *existing != pt);
+                                    rtpmaps.push((pt, codec, clock_rate, channels));
+                                }
                             }
                         }
                     }
@@ -675,7 +844,9 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
     // Assemble codecs following the m= payload order, using rtpmap when present.
     let mut codecs = Vec::new();
     for pt in &payload_order {
-        if let Some((_, codec)) = rtpmaps.iter().find(|(mapped, _)| mapped == pt) {
+        if let Some((_, codec, clock_rate, channels)) =
+            rtpmaps.iter().find(|(mapped, _, _, _)| mapped == pt)
+        {
             let fmtp = fmtps
                 .iter()
                 .find(|(mapped, _)| mapped == pt)
@@ -683,6 +854,8 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
             codecs.push(SdpCodec {
                 codec: *codec,
                 payload_type: *pt,
+                clock_rate: *clock_rate,
+                channels: *channels,
                 fmtp,
             });
         }
@@ -691,6 +864,11 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
     if codecs.is_empty() {
         return Err(VoiceEncodingError::UnsupportedCodec);
     }
+
+    let (addr_type, connection_addr) = audio_connection
+        .or(session_connection)
+        .or(origin_connection)
+        .ok_or(VoiceEncodingError::SdpMalformed)?;
 
     Ok(SdpAudioDescription {
         session_id,
@@ -730,27 +908,71 @@ pub fn build_mo_audio_offer_with_params(
     }
 }
 
-/// Produce the preferred codec offer list, assigning dynamic payload types to
-/// the AMR family (96/97) while keeping static types for G.711.
+/// Produce the preferred codec offer list. Carrier policy may pin dynamic RTP
+/// payload types and EVS fmtp; otherwise values are allocated from 96..=127.
 pub fn build_codec_offer_with_params(params: &VoiceParams) -> Vec<SdpCodec> {
+    let policies = if params.codec_policies.is_empty() {
+        params
+            .preferred_codecs
+            .iter()
+            .filter_map(|token| {
+                AudioCodec::from_token(token).map(|codec| AudioCodecPolicy {
+                    codec,
+                    payload_type: None,
+                    sample_rate: None,
+                    fmtp: None,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        params.codec_policies.clone()
+    };
+
     let mut codecs = Vec::new();
-    let mut next_dynamic_pt = 96u8;
-    for token in &params.preferred_codecs {
-        let Some(codec) = AudioCodec::from_token(token) else {
+    let reserved_payload_types = policies
+        .iter()
+        .filter_map(|policy| policy.payload_type)
+        .collect::<std::collections::HashSet<_>>();
+    let mut used_payload_types = std::collections::HashSet::new();
+    for policy in policies {
+        let codec = policy.codec;
+        let clock_rate = policy.sample_rate.unwrap_or_else(|| codec.clock_rate());
+        if clock_rate != codec.clock_rate() {
             continue;
-        };
+        }
         let payload_type = match codec.static_payload_type() {
-            Some(pt) => pt,
-            None => {
-                let pt = next_dynamic_pt;
-                next_dynamic_pt = next_dynamic_pt.saturating_add(1);
+            Some(pt)
+                if policy
+                    .payload_type
+                    .is_none_or(|configured| configured == pt) =>
+            {
                 pt
             }
+            Some(_) => continue,
+            None => match policy.payload_type {
+                Some(pt @ 96..=127) => pt,
+                Some(_) => continue,
+                None => match (96..=127).find(|candidate| {
+                    !reserved_payload_types.contains(candidate)
+                        && !used_payload_types.contains(candidate)
+                }) {
+                    Some(pt) => pt,
+                    None => continue,
+                },
+            },
         };
-        let fmtp = amr_default_fmtp(codec, params.amr_octet_align);
+        if !used_payload_types.insert(payload_type) {
+            continue;
+        }
+        let fmtp = policy
+            .fmtp
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| amr_default_fmtp(codec, params.amr_octet_align));
         codecs.push(SdpCodec {
             codec,
             payload_type,
+            clock_rate,
+            channels: None,
             fmtp,
         });
     }
@@ -784,7 +1006,11 @@ pub fn build_sdp_answer_with_params(
     // for codecs we also support, honoring the offerer's preference order.
     let mut answer_codecs = Vec::new();
     for offered in &offer.codecs {
-        if local_offer.iter().any(|local| local.codec == offered.codec) {
+        if local_offer.iter().any(|local| {
+            local.codec == offered.codec
+                && local.clock_rate == offered.clock_rate
+                && local.channels.unwrap_or(1) == offered.channels.unwrap_or(1)
+        }) {
             answer_codecs.push(offered.clone());
         }
     }
@@ -1567,9 +1793,43 @@ pub fn select_voice_leg_with_params(
 mod tests {
     use super::*;
 
+    #[test]
+    fn dial_user_accepts_service_access_codes_and_e164_numbers() {
+        assert_eq!(normalize_ims_dial_user(" *86 ").unwrap(), "*86");
+        assert_eq!(
+            normalize_ims_dial_user("tel:+60 111-202-3012").unwrap(),
+            "+601112023012"
+        );
+        assert_eq!(
+            normalize_ims_dial_user("sip:*86@old.example;user=phone").unwrap(),
+            "*86"
+        );
+    }
+
+    #[test]
+    fn dial_user_rejects_ambiguous_or_unsafe_targets() {
+        assert_eq!(
+            normalize_ims_dial_user("+*86").unwrap_err(),
+            ImsDialStringError::InvalidPlusPlacement
+        );
+        assert_eq!(
+            normalize_ims_dial_user("12").unwrap_err(),
+            ImsDialStringError::InvalidLength
+        );
+        assert_eq!(
+            normalize_ims_dial_user("911,transport=tcp").unwrap_err(),
+            ImsDialStringError::InvalidCharacter
+        );
+        assert_eq!(
+            normalize_ims_dial_user("+601234567890123456789").unwrap_err(),
+            ImsDialStringError::InvalidLength
+        );
+    }
+
     fn test_params() -> VoiceParams {
         VoiceParams {
             preferred_codecs: vec!["amr".to_string(), "pcmu".to_string()],
+            codec_policies: Vec::new(),
             ptime_ms: 20,
             amr_octet_align: true,
             vowifi_enabled: true,
@@ -1652,6 +1912,70 @@ mod tests {
     }
 
     #[test]
+    fn evs_policy_round_trips_payload_clock_and_fmtp() {
+        assert_eq!(AudioCodec::from_token("EVS"), Some(AudioCodec::Evs));
+        assert_eq!(AudioCodec::Evs.clock_rate(), 16000);
+        assert_eq!(AudioCodec::Evs.static_payload_type(), None);
+
+        let mut params = test_params();
+        params.preferred_codecs = vec!["evs".to_string(), "amr-wb".to_string()];
+        params.codec_policies = vec![AudioCodecPolicy {
+            codec: AudioCodec::Evs,
+            payload_type: Some(109),
+            sample_rate: Some(16000),
+            fmtp: Some("br=5.9-24.4; bw=nb-swb".to_string()),
+        }];
+        let offer =
+            build_mo_audio_offer_with_params(&params, "192.0.2.10", SdpAddrType::Ip4, 40000);
+        assert_eq!(offer.codecs.len(), 1);
+        assert_eq!(offer.codecs[0].codec, AudioCodec::Evs);
+        assert_eq!(offer.codecs[0].payload_type, 109);
+        assert_eq!(offer.codecs[0].clock_rate, 16000);
+        assert_eq!(
+            offer.codecs[0].fmtp.as_deref(),
+            Some("br=5.9-24.4; bw=nb-swb")
+        );
+
+        let body = offer.to_sdp();
+        assert!(body.contains("a=rtpmap:109 EVS/16000\r\n"));
+        assert!(body.contains("a=fmtp:109 br=5.9-24.4; bw=nb-swb\r\n"));
+        let parsed = parse_audio_sdp(body.as_bytes()).expect("parse EVS offer");
+        assert_eq!(parsed.codecs, offer.codecs);
+
+        let answer =
+            build_sdp_answer_with_params(&params, &parsed, "192.0.2.20", SdpAddrType::Ip4, 41000)
+                .expect("answer EVS offer");
+        assert_eq!(answer.codecs[0].payload_type, 109);
+        assert_eq!(answer.codecs[0].fmtp, offer.codecs[0].fmtp);
+    }
+
+    #[test]
+    fn parser_rejects_evs_with_non_registered_clock_rate() {
+        let body = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 109\r\na=rtpmap:109 EVS/8000\r\n";
+        assert_eq!(
+            parse_audio_sdp(body),
+            Err(VoiceEncodingError::UnsupportedCodec)
+        );
+    }
+
+    #[test]
+    fn audio_parser_uses_audio_connection_and_ignores_video_connection() {
+        let body = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=call\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\nc=IN IP4 192.0.2.10\r\na=rtpmap:0 PCMU/8000\r\nm=video 40002 RTP/AVP 96\r\nc=IN IP4 192.0.2.20\r\na=rtpmap:96 H264/90000\r\n";
+        let parsed = parse_audio_sdp(body).unwrap();
+        assert_eq!(parsed.connection_addr, "192.0.2.10");
+        assert_eq!(parsed.addr_type, SdpAddrType::Ip4);
+        assert_eq!(parsed.media_port, 40000);
+    }
+
+    #[test]
+    fn audio_parser_uses_session_connection_without_audio_override() {
+        let body = b"v=0\r\no=- 1 1 IN IP6 2001:db8::1\r\ns=call\r\nc=IN IP6 2001:db8::2\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\nm=video 40002 RTP/AVP 96\r\nc=IN IP6 2001:db8::20\r\na=rtpmap:96 H264/90000\r\n";
+        let parsed = parse_audio_sdp(body).unwrap();
+        assert_eq!(parsed.connection_addr, "2001:db8::2");
+        assert_eq!(parsed.addr_type, SdpAddrType::Ip6);
+    }
+
+    #[test]
     fn sdp_answer_intersects_codecs() {
         let offer = SdpAudioDescription {
             session_id: 1,
@@ -1665,11 +1989,15 @@ mod tests {
                 SdpCodec {
                     codec: AudioCodec::Amr,
                     payload_type: 96,
+                    clock_rate: 8000,
+                    channels: None,
                     fmtp: Some("octet-align=1".to_string()),
                 },
                 SdpCodec {
                     codec: AudioCodec::Pcmu,
                     payload_type: 0,
+                    clock_rate: 8000,
+                    channels: None,
                     fmtp: None,
                 },
             ],

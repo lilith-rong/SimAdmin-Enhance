@@ -3,4 +3,4 @@ pub mod target;
 pub mod tasks;
 pub mod traits;
 
-pub use scheduler::spawn_automation_scheduler;
+pub use scheduler::{spawn_automation_scheduler, spawn_automation_task, AutomationStartResult};

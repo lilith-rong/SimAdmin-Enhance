@@ -1,0 +1,15 @@
+meta {
+  name: get_vowifi_line
+  type: http
+  seq: 141
+}
+
+get {
+  url: {{base_url}}/api/vowifi/lines/{{line_id}}
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

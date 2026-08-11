@@ -162,7 +162,7 @@ function esimChipLabel(line: VolteLineControlResponse) {
   return '未启用'
 }
 
-export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo?: ReactNode }) {
+export default function ModemLinesPanel({ basicInfoForLine }: { basicInfoForLine?: (lineId: string) => ReactNode }) {
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
@@ -730,8 +730,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           <Typography variant="body2" fontWeight={600}>VoWiFi / WiFi Calling</Typography>
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
-                          {vowifiLine?.config.profile_id ? `指定 profile ${vowifiLine.config.profile_id}` : '自动匹配运营商 profile'}
-                          {vowifiLine?.config.dns_server ? ` · DNS ${vowifiLine.config.dns_server}` : ''}
+                          {vowifiLine?.matched_profile_id ? `运营商 profile ${vowifiLine.matched_profile_id}` : '等待匹配运营商 profile'}
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={0.5}>
@@ -835,13 +834,15 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
         onClose={() => setEditingVowifiLine(null)}
         onSaved={handleVowifiSaved}
       />
-      <VolteLineDialog
-        open={editingVolteLine !== null}
-        lineId={editingVolteLine?.modem.line_id ?? null}
-        families={editingVolteLine?.profile.volte_ip_families ?? null}
-        onClose={() => setEditingVolteLine(null)}
-        onSaved={handleVolteSaved}
-      />
+      {editingVolteLine && (
+        <VolteLineDialog
+          open
+          lineId={editingVolteLine.modem.line_id}
+          families={editingVolteLine.profile.volte_ip_families}
+          onClose={() => setEditingVolteLine(null)}
+          onSaved={handleVolteSaved}
+        />
+      )}
       <DataProxyDialog
         open={editingDataLineId !== null}
         lineId={editingDataLineId}
@@ -861,7 +862,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
         trunk={detailLine ? trunkByLineId.get(detailLine.modem.line_id) : undefined}
         vowifi={detailLine ? vowifiByLineId.get(detailLine.modem.line_id) : undefined}
         initialTab={detailTab}
-        primaryBasicInfo={detailLine && lines[0]?.modem.line_id === detailLine.modem.line_id ? primaryBasicInfo : undefined}
+        basicInfo={detailLine ? basicInfoForLine?.(detailLine.modem.line_id) : undefined}
         onClose={() => setDetailLine(null)}
       />
     </Stack>
