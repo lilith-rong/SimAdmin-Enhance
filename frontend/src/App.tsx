@@ -12,12 +12,10 @@ const SECURITY_SETTINGS_UPDATED_EVENT = 'simadmin-security-settings-updated'
 // 路由级别代码分割 - 按需加载页面组件
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const SimCard = lazy(() => import('./pages/SimCard'))
-const NotificationCenter = lazy(() => import('./pages/NotificationCenter'))
 const Phone = lazy(() => import('./pages/Phone'))
 const Configuration = lazy(() => import('./pages/Configuration'))
 const OtaUpdate = lazy(() => import('./pages/OtaUpdate'))
 const Login = lazy(() => import('./pages/Login'))
-const AutomationCenter = lazy(() => import('./pages/AutomationCenter'))
 
 // 页面加载中的 fallback
 function PageLoading() {
@@ -124,8 +122,8 @@ function App() {
               <Route path="network-interfaces" element={<Navigate to="/config" replace />} />
               <Route path="band-lock" element={<Navigate to="/config" replace />} />
               <Route path="sms" element={<Navigate to="/sim" replace />} />
-              <Route path="notifications" element={<Suspense fallback={<PageLoading />}><NotificationCenter /></Suspense>} />
-              <Route path="automation" element={<Suspense fallback={<PageLoading />}><AutomationCenter /></Suspense>} />
+              <Route path="notifications" element={<Navigate to="/sim" replace />} />
+              <Route path="automation" element={<Navigate to="/sim" replace />} />
               <Route path="phone" element={<Suspense fallback={<PageLoading />}><Phone /></Suspense>} />
               <Route path="config" element={<Suspense fallback={<PageLoading />}><Configuration /></Suspense>} />
               <Route path="config/security" element={<Suspense fallback={<PageLoading />}><Configuration /></Suspense>} />
