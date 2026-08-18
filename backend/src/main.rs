@@ -354,7 +354,12 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         primaries.len()
     );
     if prepared.is_empty() {
-        anyhow::bail!("stock RPMSG driver did not expose a DATA6 WWAN port");
+        // A stock kernel may expose DATA6_CNTL without creating a second QMI
+        // character port. This is an explicit per-line fallback condition, not
+        // a service crash: retrying every few seconds cannot change the driver
+        // capability and needlessly churns systemd and the baseband netdevs.
+        println!("secondary-qmi-init: DATA6 unavailable; using the ModemManager bearer fallback");
+        return Ok(());
     }
 
     // Type=notify service remains alive and verifies that the endpoint is still
@@ -643,6 +648,8 @@ async fn main() -> Result<()> {
 
     // Connect to system D-Bus
     let dbus_conn = Arc::new(Connection::system().await?);
+    let device_kind = hardware::devices::detect_device_kind();
+    info!(?device_kind, "Detected hardware device kind");
 
     // 创建 SMS 数据库（存储在可执行文件同级目录）
     let db_path = get_data_db_path();

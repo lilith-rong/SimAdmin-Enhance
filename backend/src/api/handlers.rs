@@ -3527,6 +3527,28 @@ pub async fn set_line_airplane_mode_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
     }
+    if payload.enabled && app.config_manager.get_line_profile(&line_id).vowifi.enabled {
+        // Rebuild the WiFi Calling registration after cellular deregistration
+        // so the operator recalculates MT SMS and call routing without CS.
+        let refresh_app = app.clone();
+        let scope = VowifiScope::for_line(Arc::clone(&line));
+        tokio::spawn(async move {
+            let _ = reset_vowifi_runtime_for_scope(
+                &refresh_app,
+                &scope,
+                "line_airplane_mode_vowifi_refresh",
+            )
+            .await;
+            let _ = connect_vowifi_on_line(
+                &refresh_app,
+                &scope,
+                VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+                Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+                false,
+            )
+            .await;
+        });
+    }
     sync_line_video_capabilities(&app).await;
     (
         StatusCode::OK,
@@ -5696,8 +5718,8 @@ async fn restore_cellular_and_reset_vowifi(
             detail_json: "{}",
         });
 
-    if let Err(err) = ensure_line_radio_enabled(app, scope).await {
-        warn!(error = %err, "Failed to re-enable the line radio while stopping WiFi Calling");
+    if let Err(err) = ensure_line_radio_state_for_vowifi(app, scope).await {
+        warn!(error = %err, "Failed to restore the line radio state while stopping WiFi Calling");
     }
 
     restore_cellular_data_after_vowifi(app, scope).await;
@@ -6179,18 +6201,28 @@ fn persist_optional_vowifi_restore_phase(
     }
 }
 
-/// VoWiFi needs this line's modem powered on for SIM/AKA access, so make sure
-/// the line is not sitting in airplane mode. Only ever turns airplane mode off,
-/// and only for the line that is connecting - a second SIM keeps its own state.
-async fn ensure_line_radio_enabled(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
+/// Preserve the line's persisted RF intent while preparing VoWiFi. QMI UIM and
+/// PC/SC SIM access remain available with cellular RF disabled, so connect,
+/// refresh and fallback paths must not clear airplane mode.
+async fn ensure_line_radio_state_for_vowifi(
+    app: &AppState,
+    scope: &VowifiScope,
+) -> Result<(), String> {
     let Some(modem_path) = scope.modem_path() else {
         return Ok(());
     };
+    if app
+        .config_manager
+        .get_line_profile(scope.line_id())
+        .airplane_mode_enabled
+    {
+        return Ok(());
+    }
     modem_manager::set_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path, false).await
 }
 
 async fn pause_cellular_data_for_vowifi(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
-    if let Err(err) = ensure_line_radio_enabled(app, scope).await {
+    if let Err(err) = ensure_line_radio_state_for_vowifi(app, scope).await {
         warn!(error = %err, "Failed to keep modem enabled for WiFi Calling SIM access");
     }
     let Some(modem_path) = scope.modem_path() else {
@@ -6280,8 +6312,16 @@ async fn connect_vowifi_on_line(
     if !scope.is_present() {
         return disabled_vowifi_status("vowifi_line_not_present");
     }
+    let operator_ready =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(scope.line_id())
+            .is_available();
+    let refresh_due =
+        crate::connectivity::modems::ims::vowifi::live::live_ims_registration_refresh_due_for_line(
+            scope.line_id(),
+        )
+        .await;
     let current = scope.status().await;
-    if current.readiness.sms_ready {
+    if current.readiness.sms_ready && operator_ready && !refresh_due {
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
         return current;
     }
@@ -6306,9 +6346,38 @@ async fn connect_vowifi_on_line(
     };
 
     let current = scope.status().await;
-    if current.readiness.sms_ready {
+    let operator_ready =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(scope.line_id())
+            .is_available();
+    let refresh_due =
+        crate::connectivity::modems::ims::vowifi::live::live_ims_registration_refresh_due_for_line(
+            scope.line_id(),
+        )
+        .await;
+    if current.readiness.sms_ready && operator_ready && !refresh_due {
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
         return current;
+    }
+    if (refresh_due || !operator_ready)
+        && (current.readiness.ims_registered
+            || current.readiness.sms_ready
+            || current.readiness.voice_ready)
+    {
+        // The SIP task clears the operator link when REGISTER expires, while
+        // the runtime snapshot still contains the last successful readiness.
+        // The same invalidation is required at the proactive refresh deadline,
+        // otherwise the executor would skip REGISTER and falsely report that
+        // the lease was renewed.
+        let reason = if operator_ready {
+            "vowifi_registration_refresh_due"
+        } else {
+            "vowifi_registration_expired"
+        };
+        // Release the old operator channel, protected UDP port pair and ePDG
+        // gateway before binding the replacement registration. Resetting only
+        // the public snapshot leaves port_us/port_uc occupied and makes every
+        // refresh fail with ims_udp_bind_failed.
+        let _ = reset_vowifi_runtime_for_scope(app, scope, reason).await;
     }
 
     let profile_meta = current.profile.profile.as_ref();
@@ -6419,6 +6488,7 @@ pub struct VowifiLineConfigResponse {
     pub runtime_phase: String,
     pub runtime_stage: String,
     pub runtime_registered: bool,
+    pub runtime_restore_in_progress: bool,
     pub runtime_error: Option<String>,
     pub matched_profile_id: Option<String>,
 }
@@ -6432,17 +6502,30 @@ async fn build_vowifi_line_response(
     // Every line has a real runtime now, so report that line's own phase instead
     // of the old "only the primary line has a runtime" placeholder.
     let status = line.vowifi.snapshot().await.status_response();
+    // The runtime snapshot records the last completed IMS stage, while the
+    // operator link is the live source of truth for whether the REGISTER
+    // channel still has a consumer.  A SIP registration can expire between
+    // snapshot refreshes; do not report stale sms/voice readiness as active.
+    let operator_ready =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&modem.line_id)
+            .is_available();
     let (runtime_phase, runtime_stage, runtime_registered, runtime_error, matched_profile_id) = {
         let stage = if config.enabled && status.phase == "not_started" {
             "starting".to_string()
+        } else if config.enabled && status.readiness.ims_registered && !operator_ready {
+            "reconnecting".to_string()
         } else {
             status.phase.to_string()
         };
         (
             status.phase.to_string(),
             stage,
-            status.readiness.ims_registered,
-            status.degraded_reason,
+            status.readiness.ims_registered && operator_ready,
+            if !operator_ready && status.readiness.ims_registered {
+                Some("vowifi_registration_expired".to_string())
+            } else {
+                status.degraded_reason
+            },
             status
                 .profile
                 .profile
@@ -6456,6 +6539,7 @@ async fn build_vowifi_line_response(
         runtime_phase,
         runtime_stage,
         runtime_registered,
+        runtime_restore_in_progress: line.vowifi_restore_in_progress(),
         runtime_error,
         matched_profile_id,
     }
@@ -7949,7 +8033,17 @@ async fn schedule_vowifi_auto_restore(
     line: Arc<crate::services::line_registry::LineRuntime>,
     line_id: String,
 ) {
-    if line.vowifi_restore_in_progress() || line.vowifi.snapshot().await.readiness().sms_ready {
+    let operator_ready =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
+            .is_available();
+    let refresh_due =
+        crate::connectivity::modems::ims::vowifi::live::live_ims_registration_refresh_due_for_line(
+            &line_id,
+        )
+        .await;
+    if line.vowifi_restore_in_progress()
+        || (line.vowifi.snapshot().await.readiness().sms_ready && operator_ready && !refresh_due)
+    {
         return;
     }
     let workflow = VowifiRestoreWorkflow::boot_auto_restore(config, line_id);

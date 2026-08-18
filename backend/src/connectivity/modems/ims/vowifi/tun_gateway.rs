@@ -1,14 +1,13 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::HashMap,
     fmt,
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use super::{ike_keys::ChildSaSecretPair, transport::UdpSocketDatagramTransport};
@@ -321,11 +320,13 @@ fn platform_shutdown_tun(_tun_name: &str) {}
 mod imp {
     use super::*;
     use std::{
+        collections::HashMap,
         fs::{File, OpenOptions},
         io::{ErrorKind, Read, Write},
         net::{Ipv4Addr, Ipv6Addr},
         os::fd::AsRawFd,
         process::Command,
+        time::Duration,
     };
 
     use tokio::sync::mpsc;

@@ -409,6 +409,19 @@ fn sync_file(path: &Path) -> Result<(), String> {
         .read(true)
         .open(path)
         .map_err(|error| format!("config_maintenance_sync_open:{error}"))?;
+    #[cfg(windows)]
+    {
+        // Windows does not expose a reliable fsync equivalent for every SQLite
+        // handle/filesystem combination. The database has already been closed
+        // by SQLite after VACUUM INTO; treat ERROR_ACCESS_DENIED from the final
+        // flush as a portability limitation, while preserving other failures.
+        return match file.sync_all() {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(5) => Ok(()),
+            Err(error) => Err(format!("config_maintenance_sync:{error}")),
+        };
+    }
+    #[cfg(not(windows))]
     file.sync_all()
         .map_err(|error| format!("config_maintenance_sync:{error}"))
 }
@@ -424,11 +437,11 @@ fn sync_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn set_private_file_mode(path: &Path) -> Result<(), String> {
+fn set_private_file_mode(_path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("config_maintenance_permissions:{error}"))?;
     }
     Ok(())
