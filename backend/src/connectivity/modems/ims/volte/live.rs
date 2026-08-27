@@ -18,10 +18,11 @@ use crate::{
     connectivity::core::{
         access::ImsChannel,
         context::{ImsRoute, SipTransport},
+        ims_failure::{ImsFailureDiagnostic, ImsServiceState, ImsServiceVerdict},
         ims_video::{negotiate_video, parse_video_sdp, VideoMediaDescription},
         media::{
-            ActiveRtpRelay, MediaRelayMetrics, MediaRelayPolicy, PayloadTypeMapping,
-            PendingRtpRelay,
+            ActiveRtpRelay, MediaRelayMetrics, MediaRelayPolicy, OperatorSocketCreator,
+            PayloadTypeMapping, PendingRtpRelay,
         },
         register::{
             run_register, run_register_observed, run_unregister, RegisterAuthenticator,
@@ -41,7 +42,9 @@ use crate::{
         ImsError,
     },
     connectivity::modems::ims::vowifi::{
-        carrier_catalog::CatalogAccessKind, profile_store::ProfileStore, profiles::CarrierProfile,
+        carrier_catalog::CatalogAccessKind,
+        profile_store::{ProfileOrigin, ProfileStore},
+        profiles::CarrierProfile,
     },
     hardware::cellular::modem_manager::ModemBinding,
     platform::config::{TrunkIncomingMode, TrunkIpConnectMode, VolteIpFamily},
@@ -59,6 +62,7 @@ use crate::{
             ut::{XcapAccessContext, XcapDigestProvider},
             SupplementaryRuntime,
         },
+        ue_worker::{worker_for_line_feature, UeWorkerFeatures, UeWorkerHandle},
     },
 };
 
@@ -72,7 +76,9 @@ use crate::connectivity::modems::ims::{
 
 use super::{
     bearer::{
-        configure_bearer_network, disconnect_bearer, ensure_ims_bearer_observed, route_pcscf,
+        configure_bearer_network, configure_bearer_network_in_worker, disconnect_bearer,
+        ensure_bearer_interface_ready, ensure_ims_bearer_observed, interface_still_holds_address,
+        route_media_host, route_media_host_in_worker, route_pcscf, route_pcscf_in_worker,
         teardown_bearer_network, BearerAttempt, BearerConnection, BearerRequest,
     },
     channel::VolteSipChannel,
@@ -83,9 +89,9 @@ use super::{
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
     pcscf::{
-        discover_pcscf, discover_pcscf_via_active_at_context, pcscf_socket,
-        prefetch_pcscf_from_ims_profile, prepare_ims_profile_context, set_pcscf_reporting,
-        ImsProfileLease,
+        discover_pcscf_in_worker, discover_pcscf_on_interface,
+        discover_pcscf_via_active_at_context, pcscf_socket, prefetch_pcscf_from_ims_profile,
+        prepare_ims_profile_context, set_pcscf_reporting, ImsProfileLease,
     },
     plan::{FailureClass, ImsConnectionPlan},
     readiness,
@@ -101,9 +107,94 @@ const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
 const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
+const OPTIONS_PING_INTERVAL: Duration = Duration::from_secs(45);
+const OPTIONS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const OPTIONS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const OPTIONS_MAX_CONSECUTIVE_FAILURES: u8 = 2;
 /// Keep two independent IMS dialogs for call waiting. A further call is
 /// rejected with a stable busy error before allocating RTP relays.
 const MAX_CONCURRENT_CALLS: usize = 2;
+
+fn volte_worker_enabled(features: UeWorkerFeatures) -> bool {
+    features.three_gpp_ims
+}
+
+fn trunk_worker_enabled(features: UeWorkerFeatures) -> bool {
+    // Once the IMS bearer itself lives in the worker namespace its media
+    // sockets must follow it even if the optional trunk migration gate was
+    // left off. A host RTP socket cannot bind an interface that no longer
+    // exists in the host namespace.
+    features.three_gpp_ims || features.trunk_sockets
+}
+
+struct VolteWorkerOperatorSocketCreator {
+    worker: UeWorkerHandle,
+}
+
+impl OperatorSocketCreator for VolteWorkerOperatorSocketCreator {
+    fn create_udp<'a>(
+        &'a self,
+        local: SocketAddr,
+        bind_to_device: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<tokio::net::UdpSocket>> + Send + 'a>,
+    > {
+        let spec = crate::services::ue_worker::UeSocketSpec::udp_bound(
+            local,
+            bind_to_device.map(str::to_string),
+        );
+        Box::pin(async move {
+            match self.worker.create_socket(spec).await {
+                Ok(crate::services::ue_worker::UeSocket::Udp(socket)) => Ok(socket),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "UE worker returned a non-UDP socket for VoLTE RTP",
+                )),
+                Err(error) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    error.to_string(),
+                )),
+            }
+        })
+    }
+}
+
+/// Return a VoLTE worker only when it is ready and can actually see the
+/// bearer interface. Merely having a worker is insufficient: until the native
+/// IMS `wwanX` has been moved into that namespace, creating a socket there
+/// would select the wrong route and can make IMS registration fail silently.
+async fn worker_for_bearer(
+    line_id: &str,
+    interface: &str,
+    feature: fn(UeWorkerFeatures) -> bool,
+) -> Option<UeWorkerHandle> {
+    let worker = worker_for_line_feature(line_id, feature)?;
+    let status = worker.status().await;
+    if !status.ready {
+        return None;
+    }
+    let visible = status
+        .last_net_status
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.interfaces.iter().any(|name| name == interface));
+    visible.then_some(worker)
+}
+
+async fn ready_worker_for_feature(
+    line_id: &str,
+    feature: fn(UeWorkerFeatures) -> bool,
+) -> Option<UeWorkerHandle> {
+    let worker = worker_for_line_feature(line_id, feature)?;
+    worker.status().await.ready.then_some(worker)
+}
+
+async fn volte_worker_for_bearer(line_id: &str, interface: &str) -> Option<UeWorkerHandle> {
+    worker_for_bearer(line_id, interface, volte_worker_enabled).await
+}
+
+async fn trunk_worker_for_bearer(line_id: &str, interface: &str) -> Option<UeWorkerHandle> {
+    worker_for_bearer(line_id, interface, trunk_worker_enabled).await
+}
 
 fn native_ims_bearer_required(data_slot_mode: DataSlotMode) -> bool {
     !data_slot_mode.ims_on_primary()
@@ -333,6 +424,12 @@ struct VolteLiveSession {
     pcscf: SocketAddr,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
+    /// Namespace owner of `xfrm_plan`. `None` means the legacy host namespace.
+    /// Keeping this with the session ensures teardown never deletes another
+    /// line's policies when worker isolation is enabled.
+    xfrm_worker: Option<UeWorkerHandle>,
+    /// Worker namespace that owns the native bearer interface and routes.
+    network_worker: Option<UeWorkerHandle>,
     register_ids: RequestIds,
     next_register_cseq: u32,
     sip_instance: String,
@@ -344,8 +441,30 @@ struct VolteLiveSession {
     /// Owned access-specific values fixed when this session started. Refresh,
     /// SMS and voice must not re-read SimOverrideStore mid-session.
     effective_ims: EffectiveImsProfile,
+    /// Runtime `P-Visited-Network-ID` derived from the currently registered
+    /// PLMN. The home carrier profile remains unchanged while roaming.
+    visited_network_header: Option<String>,
+    /// Operator-side RTP factory fixed when this session is created. It is
+    /// intentionally immutable for the lifetime of a dialog so an access
+    /// switch cannot move an established call to another UE.
+    media_operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
     voice_calls: HashMap<String, LiveVoiceCall>,
     mwi_subscription: Option<MwiSubscription>,
+}
+
+async fn bind_volte_operator_relay(
+    operator_ip: IpAddr,
+    trunk_local_ip: IpAddr,
+    operator_interface: Option<String>,
+    operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+) -> Result<PendingRtpRelay, std::io::Error> {
+    PendingRtpRelay::bind_with_operator_source(
+        operator_ip,
+        trunk_local_ip,
+        operator_interface.as_deref(),
+        operator_creator,
+    )
+    .await
 }
 
 struct MwiSubscription {
@@ -354,9 +473,16 @@ struct MwiSubscription {
     authenticated: bool,
 }
 
+struct PendingOptionsPing {
+    call_id: String,
+    cseq: u32,
+    deadline: tokio::time::Instant,
+}
+
 struct RetainedFailedBearer {
     bearer: BearerConnection,
     native_bearer: Option<NativeImsBearer>,
+    network_worker: Option<UeWorkerHandle>,
     modem_id: String,
     pcscf_reporting_cid: Option<u8>,
     ims_profile_lease: Option<ImsProfileLease>,
@@ -462,6 +588,7 @@ struct DeviceIdentity {
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
     effective_device_identity: EffectiveDeviceIdentity,
+    visited_network_header: Option<String>,
     aka_aid: Vec<u8>,
     usim_aid: String,
     isim_aid: Option<String>,
@@ -710,7 +837,7 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             .supported_header
             .split(',')
             .any(|token| token.trim().eq_ignore_ascii_case("sec-agree"));
-    vec![VolteRegisterVariant {
+    let primary = VolteRegisterVariant {
         label: profile.ims.register.live_header_variant_set,
         authorization,
         policy: sip::RegisterRequestPolicy {
@@ -724,7 +851,28 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
         },
         server_required_sec_agree: required,
         security_client_offer: VolteSecurityClientOffer::Full,
-    }]
+    };
+    // A database row can be syntactically valid yet disagree with a visited
+    // P-CSCF's initial REGISTER expectations. Keep the profile-specific form
+    // first, then allow one conservative generic form to proceed to AKA. The
+    // transaction loop still refuses this fallback after an authentication
+    // round, so it cannot mask bad credentials or USIM authentication errors.
+    let fallback = VolteRegisterVariant {
+        label: "generic_ims_register_fallback",
+        authorization: VolteInitialAuthorization::None,
+        policy: sip::RegisterRequestPolicy {
+            advertise_sec_agree: false,
+            require_sec_agree: false,
+            proxy_require_sec_agree: false,
+            include_mmtel_features: true,
+            include_video_feature: false,
+            include_route_header: true,
+            include_visited_network: profile.ims.register.include_visited_network,
+        },
+        server_required_sec_agree: false,
+        security_client_offer: VolteSecurityClientOffer::Full,
+    };
+    vec![primary, fallback]
 }
 
 fn security_server_matches_profile(profile: &CarrierProfile, value: &str) -> bool {
@@ -772,7 +920,11 @@ struct VolteRegisterAuthenticator {
     register_policy: sip::RegisterRequestPolicy,
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
+    visited_network_header: Option<String>,
     expires_seconds: u32,
+    /// Optional per-line worker used for SIP/IPsec sockets. The parent still
+    /// owns the bearer and AKA/QMI lifecycle; absence keeps the host path.
+    worker: Option<UeWorkerHandle>,
 }
 
 impl VolteRegisterAuthenticator {
@@ -790,6 +942,8 @@ impl VolteRegisterAuthenticator {
         register_policy: sip::RegisterRequestPolicy,
         profile: &'static CarrierProfile,
         effective_ims: EffectiveImsProfile,
+        visited_network_header: Option<String>,
+        worker: Option<UeWorkerHandle>,
     ) -> Self {
         Self {
             identity,
@@ -808,7 +962,9 @@ impl VolteRegisterAuthenticator {
             register_policy,
             profile,
             effective_ims,
+            visited_network_header,
             expires_seconds: profile.ims.register.expires_seconds,
+            worker,
         }
     }
 
@@ -852,7 +1008,10 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         .map_err(to_ims_error)?;
 
         if let Some(auts) = aka.auts.as_deref() {
-            self.route = channel.route();
+            // `self.route` is only ever used to build headers, so it holds the
+            // advertised route. No SA is active on this resync path yet, so it
+            // still equals the send route.
+            self.route = channel.advertised_route();
             let request_uri = sip::register_request_uri_with_target(
                 self.profile,
                 effective_register_target(&self.effective_ims),
@@ -898,7 +1057,17 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             } else {
                 RegistrationMode::Udp
             };
-            (None, security_verify.clone(), security_verify.is_some())
+            // TS 24.229 section 5.1.1.4.2 requires a protected AKA
+            // re-registration to repeat the negotiated Security-Client offer
+            // and mirror it with Security-Verify. Omitting Security-Client
+            // makes the P-CSCF reject an otherwise valid refresh with 4xx.
+            (
+                security_verify
+                    .as_ref()
+                    .map(|_| self.offered_security.clone()),
+                security_verify.clone(),
+                security_verify.is_some(),
+            )
         } else if let Some((selected, verify)) = security_server {
             self.runtime
                 .update(|state| state.stage = VolteStage::Ipsec)
@@ -915,7 +1084,13 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 algs,
             )
             .map_err(to_ims_error)?;
-            ipsec::install_plan(&plan).map_err(to_ims_error)?;
+            if let Some(worker) = self.worker.as_ref() {
+                ipsec::install_plan_in_worker(&plan, worker)
+                    .await
+                    .map_err(to_ims_error)?;
+            } else {
+                ipsec::install_plan(&plan).map_err(to_ims_error)?;
+            }
             let protected_send_route = ImsRoute {
                 local_addr: SocketAddr::new(
                     route.local_addr.ip(),
@@ -927,13 +1102,30 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             let receive_local =
                 SocketAddr::new(route.local_addr.ip(), self.offered_security_binding.port_s);
             let receive_remote = SocketAddr::new(route.pcscf_addr.ip(), selected.port_c);
-            if let Err(error) = channel.activate_security(
-                protected_send_route,
-                receive_local,
-                receive_remote,
-                Some(verify.clone()),
-            ) {
-                ipsec::uninstall_plan(&plan);
+            let activation = if let Some(worker) = self.worker.as_ref() {
+                channel
+                    .activate_security_in_worker(
+                        protected_send_route,
+                        receive_local,
+                        receive_remote,
+                        Some(verify.clone()),
+                        worker,
+                    )
+                    .await
+            } else {
+                channel.activate_security(
+                    protected_send_route,
+                    receive_local,
+                    receive_remote,
+                    Some(verify.clone()),
+                )
+            };
+            if let Err(error) = activation {
+                if let Some(worker) = self.worker.as_ref() {
+                    ipsec::uninstall_plan_in_worker(&plan, worker).await;
+                } else {
+                    ipsec::uninstall_plan(&plan);
+                }
                 return Err(error);
             }
             self.xfrm_plan = Some(plan);
@@ -948,7 +1140,13 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             self.mode = RegistrationMode::Udp;
             (None, None, false)
         };
-        self.route = channel.route();
+        // `self.route` only ever feeds header construction (Via/Contact and the
+        // Request-URI), never a socket, so it must carry the advertised route.
+        // After sec-agree that means the protected *server* port: TS 24.229
+        // §5.1.1.2.2 b)/c) requires the UE to advertise port_us even though the
+        // request leaves from port_uc. Advertising port_uc instead points the
+        // P-CSCF at a port nothing receives on, so terminating INVITEs are lost.
+        self.route = channel.advertised_route();
         let request_uri = sip::register_request_uri_with_target(
             self.profile,
             effective_register_target(&self.effective_ims),
@@ -1000,7 +1198,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
-        Ok(sip::build_register_from_profile_with_target(
+        Ok(sip::build_register_from_profile_with_target_and_visited(
             self.profile,
             effective_register_target(&self.effective_ims),
             sip::RegisterPhase::Authenticated,
@@ -1016,6 +1214,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 require_sec_agree: prepared.require_sec_agree,
                 ..self.register_policy
             },
+            self.visited_network_header.as_deref(),
         ))
     }
 }
@@ -1024,8 +1223,8 @@ pub async fn connect_live_for_line(
     live: &VolteLiveHandle,
     device: &VolteDeviceBinding,
     runtime: &Arc<VolteRuntime>,
-    voice_enabled: bool,
     line_ip_families: &[VolteIpFamily],
+    line_ip_families_auto: bool,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     dedupe_enabled: bool,
@@ -1066,6 +1265,7 @@ pub async fn connect_live_for_line(
         generation,
         device,
         plan,
+        line_ip_families_auto,
         allow_roaming,
         data_slot_mode,
         &profile_store,
@@ -1082,7 +1282,10 @@ pub async fn connect_live_for_line(
             let pcscf = session.pcscf.to_string();
             let data_path_mode = session.data_slot_mode.as_str().to_string();
             *live.session.lock().await = Some(session);
-            live.operator.set_ready(voice_enabled);
+            // A registered IMS session IS the voice capability: MMTEL is what the
+            // registration was for. There is no local switch left to consult --
+            // a carrier that refuses voice says so with a SIP status.
+            live.operator.set_ready(true);
             runtime
                 .update(|state| {
                     state.phase = VoltePhase::Registered;
@@ -1090,6 +1293,12 @@ pub async fn connect_live_for_line(
                     state.registration_mode = mode;
                     state.pcscf = Some(pcscf);
                     state.registered_at = Some(now());
+                    // The initial REGISTER transaction already proved both
+                    // directions of the SIP path. Seed the health timestamps
+                    // so the UI cannot present a freshly-created session with
+                    // an empty/unknown data path.
+                    state.last_tx_at = Some(now());
+                    state.last_rx_at = Some(now());
                     state.data_path_mode = Some(data_path_mode);
                     state.recovery_state = super::runtime::VolteRecoveryState::Registered;
                     state.manual_retry_available = false;
@@ -1113,6 +1322,9 @@ pub async fn connect_live_for_line(
             runtime
                 .update(|state| {
                     state.phase = VoltePhase::Degraded;
+                    if let Some(stage) = failure_stage(&error) {
+                        state.stage = stage;
+                    }
                     state.last_error = Some(message);
                     state.last_failure_at = Some(now());
                 })
@@ -1122,12 +1334,54 @@ pub async fn connect_live_for_line(
     }
 }
 
+fn failure_stage(error: &VolteError) -> Option<VolteStage> {
+    Some(match error.code() {
+        code::MM_IMSI_MISSING | code::IMSI_MISSING => VolteStage::Identity,
+        code::CARRIER_PROFILE_MISSING | code::CARRIER_IMS_APN_MISSING => VolteStage::CarrierProfile,
+        code::USIM_AID_MISSING
+        | code::USIM_AID_NOT_USIM
+        | code::USIM_AKA_FAILED
+        | code::AKA_MATERIAL_INVALID
+        | code::AKA_RES_EMPTY => VolteStage::IdentityAka,
+        code::RUNTIME_MM_MODEM_WAIT_TIMEOUT => VolteStage::Modem,
+        code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN
+        | code::RUNTIME_MM_BEARER_NOT_CONNECTED
+        | code::RUNTIME_MM_BEARER_CONNECT_FAILED
+        | code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE
+        | code::RUNTIME_IMS_BEARER_START_FAILED
+        | code::RUNTIME_MM_BEARER_PATH_MISSING
+        | code::RUNTIME_IMS_FAMILY_UNSUPPORTED
+        | code::DATA_SLOT_MODE_MISSING
+        | code::DATA_SLOT_CONFLICT => VolteStage::Bearer,
+        code::RUNTIME_ALL_PCSCF_FAILED
+        | code::RUNTIME_PROFILE_PCSCF_MISSING
+        | code::PCSCF_FAMILY_MISMATCH => VolteStage::Pcscf,
+        code::IP_SETTINGS_MISSING
+        | code::IPV6_GATEWAY_MISSING
+        | code::BEARER_NETDEV_NOT_UP
+        | code::BEARER_NETDEV_RUNTIME_ERROR
+        | code::BEARER_NETDEV_NOT_READY => VolteStage::IpConfig,
+        code::REGISTER_SEND_FAILED
+        | code::REGISTER_INITIAL_UNEXPECTED_STATUS
+        | code::REGISTER_NONCE_NOT_AKA
+        | code::DIGEST_CHALLENGE_MISSING
+        | code::DIGEST_REALM_MISSING
+        | code::DIGEST_NONCE_MISSING
+        | code::DIGEST_NONCE_DECODE_FAILED => VolteStage::RegisterInitial,
+        code::REGISTER_AUTH_SEND_FAILED | code::REGISTER_AUTH_UNEXPECTED_STATUS => {
+            VolteStage::RegisterAuthenticated
+        }
+        _ => return None,
+    })
+}
+
 async fn connect_inner(
     live: &VolteLiveHandle,
     runtime: &VolteRuntime,
     generation: u64,
     device: &VolteDeviceBinding,
-    plan: ImsConnectionPlan,
+    mut plan: ImsConnectionPlan,
+    line_ip_families_auto: bool,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     profile_store: &ProfileStore,
@@ -1154,7 +1408,20 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
-    let device_identity = load_device_identity(&device, profile_store, sim_override).await?;
+    let device_identity =
+        load_device_identity(&device, runtime, profile_store, sim_override).await?;
+    // A line's explicit order remains authoritative. The persisted default
+    // (`ipv4v6 -> ipv4 -> ipv6`) is the one case where the LTE catalog's
+    // `access.lte.ip_family` may provide a better first single-family hint;
+    // fallback still retains both families and is driven by network errors.
+    if line_ip_families_auto {
+        plan = plan.with_catalog_ip_stack_hint(&device_identity.effective_ims.ip_stack.value);
+        tracing::debug!(
+            ip_stack = %device_identity.effective_ims.ip_stack.value,
+            preference = ?plan.preference(),
+            "Applied LTE catalog IP-family hint to the default IMS plan"
+        );
+    }
     let ims_apn = device_identity
         .effective_ims
         .ims_apn
@@ -1162,13 +1429,6 @@ async fn connect_inner(
         .map(|field| field.value.trim())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| VolteError::new(code::CARRIER_IMS_APN_MISSING))?;
-    runtime
-        .update(|state| {
-            state.identity_source = Some(device_identity.source.to_string());
-            state.usim_aid = Some(device_identity.usim_aid.clone());
-            state.isim_aid = device_identity.isim_aid.clone();
-        })
-        .await;
     ensure_generation(runtime, generation)?;
 
     runtime
@@ -1383,6 +1643,34 @@ async fn connect_inner(
             }
         }
     };
+    // A native DATA6 bearer is created in the host namespace. Once the worker
+    // is ready, move only that session-owned interface into the UE namespace;
+    // ModemManager's primary bearer and every unrelated `wwanX` remain host
+    // owned. Migration is opportunistic and always falls back to the legacy
+    // host path if the worker is unavailable or cannot configure the link.
+    let mut network_worker = None;
+    if let Some(established) = native_bearer.as_mut() {
+        if let Some(worker) = ready_worker_for_feature(&device.line_id, volte_worker_enabled).await
+        {
+            let migration = match ensure_bearer_interface_ready(&established.interface).await {
+                Ok(()) => established.move_into_worker(worker.clone()).await,
+                Err(error) => Err(error),
+            };
+            match migration {
+                Ok(()) => {
+                    network_worker = Some(worker);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        line_id = %device.line_id,
+                        interface = %established.interface,
+                        error = %error,
+                        "Native IMS bearer worker migration unavailable; retaining host namespace"
+                    );
+                }
+            }
+        }
+    }
     for candidate in prefetched_pcscf.drain(..) {
         if !bearer.settings.pcscf.contains(&candidate) {
             bearer.settings.pcscf.push(candidate);
@@ -1453,7 +1741,22 @@ async fn connect_inner(
                 state.bearer_path = Some(bearer.path.clone());
             })
             .await;
-        if let Err(error) = configure_bearer_network(&bearer).await {
+        let mut configured = if let Some(worker) = network_worker.as_ref() {
+            configure_bearer_network_in_worker(&bearer, worker).await
+        } else {
+            configure_bearer_network(&bearer).await
+        };
+        if configured.is_err() {
+            if let (Some(established), Some(_worker)) =
+                (native_bearer.as_mut(), network_worker.take())
+            {
+                // A partially configured worker path is never left active. The
+                // native bearer restores the interface before host fallback.
+                established.restore_from_worker().await;
+                configured = configure_bearer_network(&bearer).await;
+            }
+        }
+        if let Err(error) = configured {
             runtime
                 .record_attempt(
                     VolteStage::IpConfig,
@@ -1565,6 +1868,7 @@ async fn connect_inner(
             *live.failed_bearer.lock().await = Some(RetainedFailedBearer {
                 bearer: bearer.clone(),
                 native_bearer: native_bearer.take(),
+                network_worker: network_worker.take(),
                 modem_id: device.modem_id.clone(),
                 pcscf_reporting_cid,
                 ims_profile_lease: ims_profile_lease.take(),
@@ -1572,12 +1876,18 @@ async fn connect_inner(
             });
             return Err(error.clone());
         }
-        teardown_bearer_network(&bearer).await;
-        // `disconnect_bearer` is a no-op for a native path; the WDS session behind
-        // it is owned by the handle below and released explicitly.
-        disconnect_bearer(&bearer.path).await;
         if let Some(established) = native_bearer.take() {
+            // Native release owns worker network cleanup, interface restore
+            // and WDS teardown. Avoid performing the same worker cleanup
+            // twice here.
             native_bearer::release_native_ims_bearer(established).await;
+        } else {
+            if let Some(worker) = network_worker.as_ref() {
+                super::bearer::teardown_bearer_network_in_worker(&bearer, worker).await;
+            } else {
+                teardown_bearer_network(&bearer).await;
+            }
+            disconnect_bearer(&bearer.path).await;
         }
         disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
         cleanup_ims_profile_lease(ims_profile_lease.take()).await;
@@ -1651,18 +1961,53 @@ async fn connect_family(
     runtime
         .update(|state| state.stage = VolteStage::Pcscf)
         .await;
-    let pcscf = discover_pcscf(
-        &bearer.settings,
-        &device_identity.ims.home_domain,
-        device_identity
-            .effective_ims
-            .pcscf
-            .as_ref()
-            .map(|field| field.value.as_str()),
-        local_addr,
-    )
-    .await?;
-    route_pcscf(bearer, pcscf).await?;
+    let worker = volte_worker_for_bearer(&device.line_id, &bearer.interface).await;
+    let configured_pcscf = device_identity
+        .effective_ims
+        .pcscf
+        .as_ref()
+        .map(|field| field.value.as_str());
+    let pcscf = if let Some(worker) = worker.as_ref() {
+        discover_pcscf_in_worker(
+            &bearer.settings,
+            &device_identity.ims.home_domain,
+            configured_pcscf,
+            local_addr,
+            &bearer.interface,
+            worker,
+        )
+        .await?
+    } else {
+        discover_pcscf_on_interface(
+            &bearer.settings,
+            &device_identity.ims.home_domain,
+            configured_pcscf,
+            local_addr,
+            Some(&bearer.interface),
+        )
+        .await?
+    };
+    if let Some(worker) = worker.as_ref() {
+        route_pcscf_in_worker(bearer, pcscf, worker).await?;
+    } else {
+        route_pcscf(bearer, pcscf).await?;
+    }
+    // The policy rule that steers SIP onto this bearer is keyed on the source
+    // address captured when the bearer settings were read. Maxis hands out a
+    // fresh address on every IMS PDN activation, so if the bearer re-addressed
+    // in the meantime that rule no longer matches and the REGISTER would leave
+    // over the host default route instead -- an eight second silent timeout
+    // reported as "all P-CSCF failed". Fail here instead, so the retry picks up
+    // the current address.
+    if !interface_still_holds_address(&bearer.interface, local_addr).await {
+        return Err(VolteError::with_detail(
+            code::BEARER_ADDRESS_CHANGED,
+            format!(
+                "interface={} policy_source={local_addr} pcscf={pcscf}",
+                bearer.interface
+            ),
+        ));
+    }
     runtime
         .update(|state| {
             state.stage = VolteStage::RegisterInitial;
@@ -1676,8 +2021,22 @@ async fn connect_family(
         transport: SipTransport::Udp,
     };
     let profile = device_identity.profile;
+    let network_worker = worker.clone();
+    let media_operator_creator = trunk_worker_for_bearer(&device.line_id, &bearer.interface)
+        .await
+        .map(|worker| {
+            Arc::new(VolteWorkerOperatorSocketCreator { worker }) as Arc<dyn OperatorSocketCreator>
+        });
+    if worker.is_none() {
+        tracing::debug!(
+            line_id = %device.line_id,
+            interface = %bearer.interface,
+            "VoLTE worker unavailable for bearer; using host namespace sockets"
+        );
+    }
     let sip_instance = sip_instance_for_profile(
         profile,
+        &device_identity.ims,
         device_identity.effective_device_identity.imei.as_deref(),
     );
     let mut register_variants = register_variants(profile).into_iter().peekable();
@@ -1691,13 +2050,61 @@ async fn connect_family(
                 .expect("REGISTER variant iterator was checked before use"),
         };
         variant.policy.include_video_feature = video_capability_enabled;
-        let mut channel = VolteSipChannel::bind(route, Some(&bearer.interface), None)
-            .map_err(map_channel_error)?;
-        let receive_port = channel
-            .reserve_security_receive_port()
-            .map_err(map_channel_error)?;
+        variant.policy.include_visited_network |= device_identity.visited_network_header.is_some();
+        let mut channel = if let Some(worker) = worker.as_ref() {
+            match VolteSipChannel::bind_in_worker(route, worker, Some(&bearer.interface), None)
+                .await
+            {
+                Ok(channel) => channel,
+                Err(error) => {
+                    tracing::warn!(
+                        line_id = %device.line_id,
+                        interface = %bearer.interface,
+                        error = %error,
+                        "VoLTE worker socket bind failed; aborting this worker-backed registration"
+                    );
+                    // The native bearer has already crossed into the worker
+                    // namespace. Binding a host socket to the same interface
+                    // would only produce a misleading fallback error because
+                    // the interface is no longer visible here. Let the
+                    // unified cleanup path restore the interface and release
+                    // the WDS session instead.
+                    return Err(map_channel_error(error));
+                }
+            }
+        } else {
+            VolteSipChannel::bind(route, Some(&bearer.interface), None)
+                .map_err(map_channel_error)?
+        };
+        let socket_worker = worker.clone();
+        let receive_port = if let Some(worker) = socket_worker.as_ref() {
+            match channel
+                .reserve_security_receive_port_in_worker(worker)
+                .await
+            {
+                Ok(port) => port,
+                Err(error) => {
+                    tracing::warn!(
+                        line_id = %device.line_id,
+                        interface = %bearer.interface,
+                        error = %error,
+                        "VoLTE worker receive socket failed; aborting this worker-backed registration"
+                    );
+                    return Err(map_channel_error(error));
+                }
+            }
+        } else {
+            channel
+                .reserve_security_receive_port()
+                .map_err(map_channel_error)?
+        };
         let ids = RequestIds::fresh(1);
-        let offered_binding = offered_security(channel.route().local_addr.port(), receive_port);
+        // port_c is the port packets are actually sourced from, so this reads the
+        // send route rather than the advertised one. They are identical here (no
+        // SA is active yet), but being explicit keeps the offer correct if this
+        // ever runs on an already-protected channel.
+        let offered_binding =
+            offered_security(channel.send_route().local_addr.port(), receive_port);
         // TS 24.229 / RFC 3329: the initial REGISTER already advertises the
         // full ipsec-3gpp offer (alg/ealg/prot/mod + client SPI/ports). The
         // 401 then supplies the server binding; the authenticated REGISTER
@@ -1720,7 +2127,7 @@ async fn connect_family(
         let initial_security_client = (profile.ims.register.sec_agree_mode != "disabled"
             && !profile.ims.register.security_client_mechanisms.is_empty())
         .then_some(negotiated_security.as_str());
-        let initial = sip::build_register_from_profile_with_target(
+        let initial = sip::build_register_from_profile_with_target_and_visited(
             profile,
             effective_register_target(&device_identity.effective_ims),
             sip::RegisterPhase::Initial,
@@ -1733,6 +2140,7 @@ async fn connect_family(
             None,
             &sip_instance,
             variant.policy,
+            device_identity.visited_network_header.as_deref(),
         );
         log_volte_register_request_metadata(variant, &channel, &initial);
         runtime
@@ -1758,15 +2166,21 @@ async fn connect_family(
             variant.policy,
             profile,
             device_identity.effective_ims.clone(),
+            device_identity.visited_network_header.clone(),
+            socket_worker,
         );
         let registration = match run_register_observed(&mut channel, &initial, &mut authenticator)
             .await
         {
             Ok(registration) => registration,
             Err(failure) => {
-                log_volte_register_failure_metadata(variant, &failure);
+                log_volte_register_failure_metadata(variant, &failure, None);
                 if let Some(plan) = authenticator.xfrm_plan.as_ref() {
-                    ipsec::uninstall_plan(plan);
+                    if let Some(worker) = authenticator.worker.as_ref() {
+                        ipsec::uninstall_plan_in_worker(plan, worker).await;
+                    } else {
+                        ipsec::uninstall_plan(plan);
+                    }
                 }
                 let error = map_register_failure(&failure);
                 runtime
@@ -1782,6 +2196,11 @@ async fn connect_family(
                 if let Some(upgraded_variant) = sec_agree_retry_variant(variant, &failure) {
                     last_error = Some(error);
                     pending_variant = Some(upgraded_variant);
+                    continue;
+                }
+                if let Some(timeout_variant) = sec_agree_timeout_retry_variant(variant, &failure) {
+                    last_error = Some(error);
+                    pending_variant = Some(timeout_variant);
                     continue;
                 }
                 if let Some(spaced_security_variant) =
@@ -1817,6 +2236,31 @@ async fn connect_family(
                     last_error = Some(error);
                     continue;
                 }
+                // Record the service verdict only where registration actually
+                // gives up. Doing it per attempt would leave a stale denial
+                // behind whenever a later variant succeeds -- this device is
+                // answered 421 on its first variant and registers on the next.
+                if let Some(response) = failure.response.as_deref() {
+                    let verdict = ImsServiceVerdict::from_register_failure(response);
+                    if verdict.voice != ImsServiceState::Unknown {
+                        tracing::warn!(
+                            register_variant = variant.label,
+                            voice_service = verdict.voice.as_str(),
+                            voice_service_code = verdict.code,
+                            carrier_reason = ?verdict.carrier_reason,
+                            alternative_service = ?verdict.alternative_service,
+                            "VoLTE IMS registration refused MMTEL voice service"
+                        );
+                    }
+                    runtime
+                        .update(|state| {
+                            state.voice_service = verdict.voice.as_str();
+                            state.voice_service_code = verdict.code;
+                            state.voice_service_reason = verdict.carrier_reason;
+                            state.voice_alternative_service = verdict.alternative_service;
+                        })
+                        .await;
+                }
                 return Err(error);
             }
         };
@@ -1843,11 +2287,45 @@ async fn connect_family(
             // MSISDN-associated IMPU.
             registered_identity.public_uri = uri.to_string();
         }
+        // There is no local voice switch left to consult: the UE always
+        // advertises the MMTEL feature tags, so the network's answer is the only
+        // authority on whether calls will work. Classify it here and publish the
+        // verdict, so a refusal is a reported fact rather than an inference.
+        let verdict = ImsServiceVerdict::from_register_success(&registration.response);
         tracing::info!(
             register_variant = variant.label,
             service_route_present = registered.service_route.is_some(),
             associated_uri_present = associated_uri.is_some(),
+            voice_service = verdict.voice.as_str(),
+            voice_service_code = verdict.code,
             "VoLTE IMS registration routing identities captured"
+        );
+        // Publish the registered identities. The registrar's P-Associated-URI
+        // set is the only place this line's own number is observable -- the SIM
+        // reports nothing and USSD needs a network a data-only bearer does not
+        // provide -- so it has to leave this function or it is lost.
+        let published_public_uri = registered_identity.public_uri.clone();
+        let published_associated_uris = registered.associated_uris.clone();
+        runtime
+            .update(|state| {
+                state.public_uri = Some(published_public_uri);
+                state.associated_uris = published_associated_uris;
+                state.voice_service = verdict.voice.as_str();
+                state.voice_service_code = verdict.code;
+                state.voice_service_reason = verdict.carrier_reason.clone();
+                state.voice_alternative_service = verdict.alternative_service.clone();
+            })
+            .await;
+        // The runtime snapshot above carries the raw URIs, but every existing
+        // reader of "this line's number" -- the UI, notification templates,
+        // device status -- goes through the own-number cache instead, and this
+        // function has no database handle. Publish the dialable numbers where
+        // the API layer can pick them up and persist them.
+        crate::connectivity::core::own_numbers::record(
+            &device.line_id,
+            crate::connectivity::core::ims_failure::telephone_numbers_from_register_success(
+                &registration.response,
+            ),
         );
         if authenticator.mode == RegistrationMode::Udp {
             runtime
@@ -1862,6 +2340,8 @@ async fn connect_family(
             pcscf: pcscf_socket(pcscf),
             ip_family: ip_family_name(local_addr),
             xfrm_plan: authenticator.xfrm_plan,
+            xfrm_worker: authenticator.worker.clone(),
+            network_worker,
             // Attached by `connect_inner`, which owns it until the session is known
             // to be good.
             native_bearer: None,
@@ -1881,6 +2361,8 @@ async fn connect_family(
             aka_aid: device_identity.aka_aid.clone(),
             profile,
             effective_ims: device_identity.effective_ims.clone(),
+            visited_network_header: device_identity.visited_network_header.clone(),
+            media_operator_creator,
             voice_calls: HashMap::new(),
             mwi_subscription: None,
         });
@@ -1923,6 +2405,12 @@ async fn unregister_live_session(
     let mut ids = session.register_ids.clone();
     ids.cseq = session.next_register_cseq;
     let security_verify = session.channel.security_verify().map(str::to_string);
+    let security_client = security_verify.as_ref().map(|_| {
+        session
+            .register_variant
+            .security_client_offer
+            .build(session.security_binding, session.profile)
+    });
     let request_uri = sip::register_request_uri_with_target(
         session.profile,
         effective_register_target(&session.effective_ims),
@@ -1937,7 +2425,7 @@ async fn unregister_live_session(
         require_sec_agree: security_verify.is_some(),
         ..session.register_variant.policy
     };
-    let request = sip::build_register_from_profile_with_target(
+    let request = sip::build_register_from_profile_with_target_and_visited(
         session.profile,
         effective_register_target(&session.effective_ims),
         sip::RegisterPhase::Refresh,
@@ -1946,10 +2434,11 @@ async fn unregister_live_session(
         &ids,
         0,
         initial_authorization.as_deref(),
-        None,
+        security_client.as_deref(),
         security_verify.as_deref(),
         &session.sip_instance,
         register_policy,
+        session.visited_network_header.as_deref(),
     );
     let mut authenticator = VolteRegisterAuthenticator::new(
         session.identity.clone(),
@@ -1968,6 +2457,8 @@ async fn unregister_live_session(
         register_policy,
         session.profile,
         session.effective_ims.clone(),
+        session.visited_network_header.clone(),
+        None,
     )
     .with_expires_seconds(0);
     run_unregister(&mut session.channel, &request, &mut authenticator).await
@@ -2099,6 +2590,10 @@ async fn live_receive_loop(
     let mut reassembler = MtReassembler::new();
     let mut operator_commands = live.operator.subscribe_commands();
     start_volte_mwi_subscription(&live).await;
+    let mut options_cseq = 1u32;
+    let mut options_due = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut pending_options: Option<PendingOptionsPing> = None;
+    let mut options_failures = 0u8;
     let mut refresh_at = {
         let sessions = live.session.lock().await;
         sessions
@@ -2112,6 +2607,69 @@ async fn live_receive_loop(
     loop {
         if runtime.generation() != generation {
             break;
+        }
+        if let Some(pending) = pending_options.as_ref() {
+            if tokio::time::Instant::now() >= pending.deadline {
+                pending_options = None;
+                options_failures = options_failures.saturating_add(1);
+                if options_failures >= OPTIONS_MAX_CONSECUTIVE_FAILURES {
+                    let error = format!("volte_options_ping_timeout:failures={options_failures}");
+                    tracing::warn!(error = %error, "VoLTE SIP liveness ping timed out");
+                    live.operator.set_ready(false);
+                    runtime
+                        .update(|state| {
+                            state.phase = VoltePhase::Degraded;
+                            state.stage = VolteStage::Registered;
+                            state.last_error = Some(error);
+                            state.last_failure_at = Some(now());
+                        })
+                        .await;
+                    cleanup_live_session(&live).await;
+                    break;
+                }
+                options_due = tokio::time::Instant::now() + OPTIONS_RETRY_INTERVAL;
+            }
+        }
+        if pending_options.is_none() && tokio::time::Instant::now() >= options_due {
+            let (call_id, cseq, send_result) = {
+                let mut sessions = live.session.lock().await;
+                let Some(session) = sessions.as_mut() else {
+                    break;
+                };
+                let cseq = options_cseq;
+                options_cseq = options_cseq.saturating_add(1);
+                let frame = sip::build_options(
+                    &session.identity,
+                    &session.channel.route(),
+                    session.registration.service_route.as_deref(),
+                    cseq,
+                    session.channel.security_verify(),
+                );
+                let call_id = sip::header_value(&frame, "Call-ID")
+                    .unwrap_or_else(|| format!("options-{cseq}@simadmin"));
+                let send_result = session.channel.send_sip(&frame).await;
+                (call_id, cseq, send_result)
+            };
+            if let Err(error) = send_result {
+                let error = map_channel_error(error);
+                live.operator.set_ready(false);
+                runtime
+                    .update(|state| {
+                        state.phase = VoltePhase::Degraded;
+                        state.last_error = Some(error.to_string());
+                        state.last_failure_at = Some(now());
+                    })
+                    .await;
+                cleanup_live_session(&live).await;
+                break;
+            }
+            runtime.update(|state| state.last_tx_at = Some(now())).await;
+            pending_options = Some(PendingOptionsPing {
+                call_id,
+                cseq,
+                deadline: tokio::time::Instant::now() + OPTIONS_RESPONSE_TIMEOUT,
+            });
+            continue;
         }
         if let Err(error) = expire_volte_renegotiations(&live).await {
             tracing::warn!(error = %error, "VoLTE re-INVITE timeout handling failed");
@@ -2211,6 +2769,38 @@ async fn live_receive_loop(
             }
             LiveLoopInput::Sip(Ok(frame)) => {
                 runtime.update(|state| state.last_rx_at = Some(now())).await;
+                if let Some(pending) = pending_options.as_ref() {
+                    let response_call_id = sip::header_value(&frame, "Call-ID");
+                    let response_cseq = sip::header_value(&frame, "CSeq").and_then(|value| {
+                        let mut parts = value.split_whitespace();
+                        parts.next()?.parse::<u32>().ok()
+                    });
+                    if response_call_id.as_deref() == Some(pending.call_id.as_str())
+                        && response_cseq == Some(pending.cseq)
+                    {
+                        let status = sip::parse_status(&frame).ok();
+                        pending_options = None;
+                        options_due = tokio::time::Instant::now() + OPTIONS_PING_INTERVAL;
+                        options_failures = 0;
+                        tracing::debug!(?status, "VoLTE SIP liveness response received");
+                        runtime
+                            .update(|state| {
+                                state.phase = VoltePhase::Registered;
+                                state.stage = VolteStage::Registered;
+                                state.last_error = None;
+                                state.last_rx_at = Some(now());
+                            })
+                            .await;
+                        continue;
+                    }
+                    // An INVITE, MESSAGE, NOTIFY, or unrelated SIP response is
+                    // equally strong proof that the protected inbound path is
+                    // alive. Do not tear down a working call leg merely because
+                    // the carrier chose not to answer OPTIONS.
+                    pending_options = None;
+                    options_failures = 0;
+                    options_due = tokio::time::Instant::now() + OPTIONS_PING_INTERVAL;
+                }
                 if let Err(error) = handle_live_frame(
                     LiveFrameContext {
                         live: &live,
@@ -2289,6 +2879,7 @@ async fn expire_volte_renegotiations(live: &VolteLiveHandle) -> Result<(), Volte
         live.operator.send_event(OperatorEvent::Rejected {
             call_id,
             status: 408,
+            diagnostic: ImsFailureDiagnostic::from_status(408),
         });
     }
     for call_id in transfer_timeouts {
@@ -2320,6 +2911,12 @@ async fn refresh_live_registration(
     let mut ids = session.register_ids.clone();
     ids.cseq = session.next_register_cseq;
     let security_verify = session.channel.security_verify().map(str::to_string);
+    let security_client = security_verify.as_ref().map(|_| {
+        session
+            .register_variant
+            .security_client_offer
+            .build(session.security_binding, session.profile)
+    });
     let require_sec_agree = security_verify.is_some();
     let request_uri = sip::register_request_uri_with_target(
         session.profile,
@@ -2335,7 +2932,7 @@ async fn refresh_live_registration(
         require_sec_agree,
         ..session.register_variant.policy
     };
-    let initial = sip::build_register_from_profile_with_target(
+    let initial = sip::build_register_from_profile_with_target_and_visited(
         session.profile,
         effective_register_target(&session.effective_ims),
         sip::RegisterPhase::Refresh,
@@ -2344,11 +2941,13 @@ async fn refresh_live_registration(
         &ids,
         session.profile.ims.register.expires_seconds,
         initial_authorization.as_deref(),
-        None,
+        security_client.as_deref(),
         security_verify.as_deref(),
         &session.sip_instance,
         register_policy,
+        session.visited_network_header.as_deref(),
     );
+    log_volte_register_request_metadata(session.register_variant, &session.channel, &initial);
     let mut authenticator = VolteRegisterAuthenticator::new(
         session.identity.clone(),
         ids.clone(),
@@ -2366,11 +2965,18 @@ async fn refresh_live_registration(
         register_policy,
         session.profile,
         session.effective_ims.clone(),
+        session.visited_network_header.clone(),
+        None,
     );
     let registration =
         match run_register_observed(&mut session.channel, &initial, &mut authenticator).await {
             Ok(registration) => registration,
             Err(failure) => {
+                log_volte_register_failure_metadata(
+                    session.register_variant,
+                    &failure,
+                    Some(&initial),
+                );
                 let loss_reason = RegistrationLossReason::from_register_failure(&failure);
                 let error = map_register_failure(&failure);
                 runtime
@@ -2402,6 +3008,10 @@ async fn refresh_live_registration(
         session.identity.public_uri = uri.to_string();
     }
     session.registration = registered.clone();
+    // A refresh can hand back a different identity set than the initial
+    // register did, so republish rather than assuming the first one still holds.
+    let refreshed_public_uri = session.identity.public_uri.clone();
+    let refreshed_associated_uris = registered.associated_uris.clone();
     runtime
         .record_attempt(
             VolteStage::RegisterRefresh,
@@ -2418,7 +3028,10 @@ async fn refresh_live_registration(
             state.last_error = None;
             state.last_register_refresh_at = Some(now());
             state.last_tx_at = Some(now());
+            state.last_rx_at = Some(now());
             state.register_refresh_count = state.register_refresh_count.saturating_add(1);
+            state.public_uri = Some(refreshed_public_uri);
+            state.associated_uris = refreshed_associated_uris;
         })
         .await;
     VolteRefreshAttempt {
@@ -2437,16 +3050,26 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
     let session = live.session.lock().await.take();
     if let Some(session) = session {
         if let Some(plan) = session.xfrm_plan.as_ref() {
-            ipsec::uninstall_plan(plan);
+            if let Some(worker) = session.xfrm_worker.as_ref() {
+                ipsec::uninstall_plan_in_worker(plan, worker).await;
+            } else {
+                ipsec::uninstall_plan(plan);
+            }
         }
-        teardown_bearer_network(&session.bearer).await;
         // A native bearer has no ModemManager object: its WDS session must be
         // stopped through the handle we kept, or the PDP context stays up on the
         // modem after the line is disconnected. `disconnect_bearer` ignores
         // native paths, so this is the only path that actually releases it.
         match session.native_bearer {
             Some(native) => native_bearer::release_native_ims_bearer(native).await,
-            None => disconnect_bearer(&session.bearer.path).await,
+            None => {
+                if let Some(worker) = session.network_worker.as_ref() {
+                    super::bearer::teardown_bearer_network_in_worker(&session.bearer, worker).await;
+                } else {
+                    teardown_bearer_network(&session.bearer).await;
+                }
+                disconnect_bearer(&session.bearer.path).await;
+            }
         }
         disable_pcscf_reporting(&session.device.modem_id, session.pcscf_reporting_cid).await;
         cleanup_ims_profile_lease(session.ims_profile_lease).await;
@@ -2467,10 +3090,16 @@ async fn cleanup_retained_failed_bearer(live: &VolteLiveHandle) {
     if elapsed < FAILED_BEARER_MIN_RETENTION {
         tokio::time::sleep(FAILED_BEARER_MIN_RETENTION - elapsed).await;
     }
-    teardown_bearer_network(&retained.bearer).await;
     match retained.native_bearer {
         Some(native) => native_bearer::release_native_ims_bearer(native).await,
-        None => disconnect_bearer(&retained.bearer.path).await,
+        None => {
+            if let Some(worker) = retained.network_worker.as_ref() {
+                super::bearer::teardown_bearer_network_in_worker(&retained.bearer, worker).await;
+            } else {
+                teardown_bearer_network(&retained.bearer).await;
+            }
+            disconnect_bearer(&retained.bearer.path).await;
+        }
     }
     disable_pcscf_reporting(&retained.modem_id, retained.pcscf_reporting_cid).await;
     cleanup_ims_profile_lease(retained.ims_profile_lease).await;
@@ -2514,6 +3143,7 @@ async fn handle_operator_command(
     let initial_call = matches!(&command, OperatorCommand::StartCall { .. });
     let renegotiate = matches!(&command, OperatorCommand::Renegotiate { .. });
     let transfer = matches!(&command, OperatorCommand::TransferCall { .. });
+    let connected = matches!(&command, OperatorCommand::AcceptCall { .. });
     let result = handle_operator_command_inner(live, runtime, command).await;
     if result.is_err() && initial_call {
         if result
@@ -2523,6 +3153,7 @@ async fn handle_operator_command(
             live.operator.send_event(OperatorEvent::Rejected {
                 call_id: call_id.clone(),
                 status: 486,
+                diagnostic: ImsFailureDiagnostic::from_status(486),
             });
         } else {
             live.operator.send_event(OperatorEvent::Unavailable {
@@ -2556,8 +3187,14 @@ async fn handle_operator_command(
                 }
             })
             .unwrap_or(500);
+        live.operator.send_event(OperatorEvent::TransferResponse {
+            call_id: call_id.clone(),
+            status,
+        });
+    }
+    if result.is_ok() && connected {
         live.operator
-            .send_event(OperatorEvent::TransferResponse { call_id, status });
+            .send_event(OperatorEvent::Connected { call_id });
     }
     result
 }
@@ -2589,12 +3226,14 @@ async fn handle_operator_command_inner(
                 return Err(VolteError::new("vilte_feature_disabled"));
             }
             let callee_uri = normalize_operator_callee(&callee, &session.identity.home_domain)?;
-            let relay =
-                PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-                    .await
-                    .map_err(|error| {
-                        VolteError::with_detail("volte_rtp_bind_failed", error.to_string())
-                    })?;
+            let relay = bind_volte_operator_relay(
+                session.channel.route().local_addr.ip(),
+                trunk_local_ip,
+                session.channel.interface().map(str::to_string),
+                session.media_operator_creator.clone(),
+            )
+            .await
+            .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
             let operator_local = relay.operator_local_addr().map_err(|error| {
                 VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
             })?;
@@ -2603,12 +3242,16 @@ async fn handle_operator_command_inner(
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay =
-                    PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-                        .await
-                        .map_err(|error| {
-                            VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
-                        })?;
+                let relay = bind_volte_operator_relay(
+                    session.channel.route().local_addr.ip(),
+                    trunk_local_ip,
+                    session.channel.interface().map(str::to_string),
+                    session.media_operator_creator.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
+                })?;
                 let operator_local = relay.operator_local_addr().map_err(|error| {
                     VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
                 })?;
@@ -2786,11 +3429,14 @@ async fn handle_operator_command_inner(
                 return Err(VolteError::new("vilte_feature_disabled"));
             }
             let operator_ip = session.channel.route().local_addr.ip();
-            let pending = PendingRtpRelay::bind(operator_ip, trunk_local_ip)
-                .await
-                .map_err(|error| {
-                    VolteError::with_detail("volte_rtp_bind_failed", error.to_string())
-                })?;
+            let pending = bind_volte_operator_relay(
+                operator_ip,
+                trunk_local_ip,
+                session.channel.interface().map(str::to_string),
+                session.media_operator_creator.clone(),
+            )
+            .await
+            .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
             let operator_local = pending.operator_local_addr().map_err(|error| {
                 VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
             })?;
@@ -2799,11 +3445,16 @@ async fn handle_operator_command_inner(
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay = PendingRtpRelay::bind(operator_ip, trunk_local_ip)
-                    .await
-                    .map_err(|error| {
-                        VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
-                    })?;
+                let relay = bind_volte_operator_relay(
+                    operator_ip,
+                    trunk_local_ip,
+                    session.channel.interface().map(str::to_string),
+                    session.media_operator_creator.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
+                })?;
                 let operator_local = relay.operator_local_addr().map_err(|error| {
                     VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
                 })?;
@@ -3142,11 +3793,34 @@ async fn handle_operator_sip_frame(
     runtime: &Arc<VolteRuntime>,
     frame: &[u8],
 ) -> Result<bool, VolteError> {
+    // An inbound INVITE left no trace until it had already been accepted, so a
+    // terminating call that we dropped on a missing Call-ID, an absent session
+    // or a local gate was indistinguishable from one the network never
+    // delivered. Log arrival first, then the outcome, so MT diagnosis can tell
+    // "no call reached us" from "a call reached us and we refused it".
+    let inbound_invite = sip::is_request(frame, "INVITE");
+    if inbound_invite {
+        tracing::info!(
+            call_id = ?sip::header_value(frame, "Call-ID"),
+            from = ?sip::header_value(frame, "From"),
+            has_sdp = !sip::sip_body(frame).is_empty(),
+            "VoLTE inbound INVITE received on the IMS leg"
+        );
+    }
     let Some(ims_call_id) = sip::header_value(frame, "Call-ID") else {
+        if inbound_invite {
+            tracing::warn!("VoLTE inbound INVITE dropped: no Call-ID header");
+        }
         return Ok(false);
     };
     let mut sessions = live.session.lock().await;
     let Some(session) = sessions.as_mut() else {
+        if inbound_invite {
+            tracing::warn!(
+                call_id = %ims_call_id,
+                "VoLTE inbound INVITE dropped: no live IMS session"
+            );
+        }
         return Ok(false);
     };
     let Some(trunk_call_id) = session
@@ -3222,6 +3896,12 @@ async fn handle_operator_sip_frame(
             VolteError::with_detail("volte_voice_sdp_invalid", error.to_string())
         })?;
         let operator_remote = media_socket_addr(&operator_audio)?;
+        ensure_operator_sdp_routes(
+            &session.bearer,
+            session.network_worker.as_ref(),
+            sip::sip_body(frame),
+        )
+        .await?;
         let operator_video = parse_video_sdp(sip::sip_body(frame))
             .ok()
             .and_then(|description| {
@@ -3236,12 +3916,14 @@ async fn handle_operator_sip_frame(
             send_incoming_rejection(session, runtime, frame, 488).await?;
             return Ok(true);
         }
-        let pending =
-            PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-                .await
-                .map_err(|error| {
-                    VolteError::with_detail("volte_rtp_bind_failed", error.to_string())
-                })?;
+        let pending = bind_volte_operator_relay(
+            session.channel.route().local_addr.ip(),
+            trunk_local_ip,
+            session.channel.interface().map(str::to_string),
+            session.media_operator_creator.clone(),
+        )
+        .await
+        .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
         let operator_local = pending.operator_local_addr().map_err(|error| {
             VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
         })?;
@@ -3250,12 +3932,14 @@ async fn handle_operator_sip_frame(
         })?;
         let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some()
         {
-            let relay =
-                PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-                    .await
-                    .map_err(|error| {
-                        VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
-                    })?;
+            let relay = bind_volte_operator_relay(
+                session.channel.route().local_addr.ip(),
+                trunk_local_ip,
+                session.channel.interface().map(str::to_string),
+                session.media_operator_creator.clone(),
+            )
+            .await
+            .map_err(|error| VolteError::with_detail("vilte_rtp_bind_failed", error.to_string()))?;
             let operator_local = relay.operator_local_addr().map_err(|error| {
                 VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
             })?;
@@ -3376,6 +4060,14 @@ async fn handle_operator_sip_frame(
     }
 
     if sip::is_request(frame, "BYE") {
+        let call = session.voice_calls.get(&trunk_call_id);
+        tracing::info!(
+            ims_call_id = %ims_call_id,
+            trunk_call_id = %trunk_call_id,
+            operator_reinvite_pending = call.is_some_and(|call| call.pending_operator_reinvite.is_some()),
+            asterisk_reinvite_pending = call.is_some_and(|call| call.pending_asterisk_reinvite),
+            "Received operator BYE for VoLTE call"
+        );
         let response = sip::build_response(frame, 200, "OK", None, None, None);
         session
             .channel
@@ -3451,6 +4143,14 @@ async fn handle_operator_sip_frame(
             }
             let identity = session.identity.clone();
             let route = session.channel.route();
+            if !sip::sip_body(frame).is_empty() {
+                ensure_operator_sdp_routes(
+                    &session.bearer,
+                    session.network_worker.as_ref(),
+                    sip::sip_body(frame),
+                )
+                .await?;
+            }
             let delayed_ip_connect =
                 live.operator.ip_connect_mode() == TrunkIpConnectMode::FirstRtp;
             let (body, prack, first_operator_rtp) = {
@@ -3522,6 +4222,14 @@ async fn handle_operator_sip_frame(
         if (200..300).contains(&status) {
             let identity = session.identity.clone();
             let route = session.channel.route();
+            if !sip::sip_body(frame).is_empty() {
+                ensure_operator_sdp_routes(
+                    &session.bearer,
+                    session.network_worker.as_ref(),
+                    sip::sip_body(frame),
+                )
+                .await?;
+            }
             let immediate_ip_connect =
                 live.operator.ip_connect_mode() == TrunkIpConnectMode::GsmAnswer;
             let (ack, answer, first_operator_rtp) = {
@@ -3602,6 +4310,7 @@ async fn handle_operator_sip_frame(
                     live.operator.send_event(OperatorEvent::Rejected {
                         call_id: trunk_call_id,
                         status: 488,
+                        diagnostic: ImsFailureDiagnostic::from_status(488),
                     });
                     tracing::warn!(error = %error, "Rejected IMS answer with unusable media");
                 }
@@ -3620,6 +4329,8 @@ async fn handle_operator_sip_frame(
         live.operator.send_event(OperatorEvent::Rejected {
             call_id: trunk_call_id,
             status,
+            diagnostic: ImsFailureDiagnostic::from_response(frame)
+                .unwrap_or_else(|_| ImsFailureDiagnostic::from_status(status)),
         });
         return Ok(true);
     }
@@ -3669,6 +4380,13 @@ async fn begin_incoming_operator_call(
                     endpoint,
                 })
         });
+    ensure_operator_media_routes(
+        &session.bearer,
+        session.network_worker.as_ref(),
+        operator_remote,
+        operator_video.as_ref(),
+    )
+    .await?;
     if operator_video.is_some() && !live.operator.video_enabled() {
         send_incoming_rejection(session, runtime, frame, 488).await?;
         return Ok(true);
@@ -3695,8 +4413,13 @@ async fn begin_incoming_operator_call(
         send_incoming_rejection(session, runtime, frame, 400).await?;
         return Ok(true);
     };
-    let relay = match PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-        .await
+    let relay = match bind_volte_operator_relay(
+        session.channel.route().local_addr.ip(),
+        trunk_local_ip,
+        session.channel.interface().map(str::to_string),
+        session.media_operator_creator.clone(),
+    )
+    .await
     {
         Ok(relay) => relay,
         Err(error) => {
@@ -3712,9 +4435,14 @@ async fn begin_incoming_operator_call(
         VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
     })?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-            .await
-            .map_err(|error| VolteError::with_detail("vilte_rtp_bind_failed", error.to_string()))?;
+        let relay = bind_volte_operator_relay(
+            session.channel.route().local_addr.ip(),
+            trunk_local_ip,
+            session.channel.interface().map(str::to_string),
+            session.media_operator_creator.clone(),
+        )
+        .await
+        .map_err(|error| VolteError::with_detail("vilte_rtp_bind_failed", error.to_string()))?;
         let operator_local = relay.operator_local_addr().map_err(|error| {
             VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
         })?;
@@ -3816,6 +4544,17 @@ async fn send_incoming_rejection(
     frame: &[u8],
     status: u16,
 ) -> Result<(), VolteError> {
+    // Every MT-call rejection used to be silent, which made "the call never
+    // arrived" and "we rejected the call" indistinguishable from the journal:
+    // an INVITE could be answered 480/486/488 without leaving a single line.
+    // Diagnosing MT delivery needs to tell those two apart.
+    tracing::warn!(
+        status,
+        reason = ims_reason(status),
+        is_invite = sip::is_request(frame, "INVITE"),
+        call_id = ?sip::header_value(frame, "Call-ID"),
+        "VoLTE MT call rejected locally"
+    );
     let response = sip::build_response(frame, status, ims_reason(status), None, None, None);
     session
         .channel
@@ -3911,40 +4650,50 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         call.operator_video_local,
         call.internal_video_local,
     ) {
-        negotiate_video(&internal_video.description, &operator_video).map_err(|error| {
-            VolteError::with_detail("vilte_video_negotiation_failed", error.to_string())
-        })?;
-        let operator_remote = media_endpoint_for_video(&operator_audio, &operator_video)?;
-        if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
-            let pending = call
-                .pending_video_relay
-                .take()
-                .ok_or_else(|| VolteError::new("vilte_rtp_relay_missing"))?;
-            let mappings = (operator_video.payload_type != internal_video.description.payload_type)
-                .then_some(PayloadTypeMapping {
-                    operator: operator_video.payload_type,
-                    internal: internal_video.description.payload_type,
-                });
-            call.active_video_relay = Some(pending.activate_with_metrics(
-                operator_remote,
-                internal_video.endpoint,
-                mappings,
-                call.media_metrics.clone(),
-            ));
-        }
-        let mut trunk_video = operator_video;
-        trunk_video.direction = trunk_video.direction.for_peer();
-        trunk_video.media_port = internal_local.port();
-        trunk_video.connection_addr = Some(internal_local.ip().to_string());
-        trunk_video.addr_type = Some(if internal_local.is_ipv4() {
-            SdpAddrType::Ip4
+        if operator_video.is_rejected() {
+            call.pending_video_relay = None;
+            call.active_video_relay = None;
+            answer.push_str(&internal_video.description.rejected_answer().media_lines());
         } else {
-            SdpAddrType::Ip6
-        });
-        answer.push_str(&trunk_video.media_lines());
+            negotiate_video(&internal_video.description, &operator_video).map_err(|error| {
+                VolteError::with_detail("vilte_video_negotiation_failed", error.to_string())
+            })?;
+            let operator_remote = media_endpoint_for_video(&operator_audio, &operator_video)?;
+            if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
+                let pending = call
+                    .pending_video_relay
+                    .take()
+                    .ok_or_else(|| VolteError::new("vilte_rtp_relay_missing"))?;
+                let mappings = (operator_video.payload_type
+                    != internal_video.description.payload_type)
+                    .then_some(PayloadTypeMapping {
+                        operator: operator_video.payload_type,
+                        internal: internal_video.description.payload_type,
+                    });
+                call.active_video_relay = Some(pending.activate_with_metrics(
+                    operator_remote,
+                    internal_video.endpoint,
+                    mappings,
+                    call.media_metrics.clone(),
+                ));
+            }
+            let mut trunk_video = operator_video;
+            trunk_video.direction = trunk_video.direction.for_peer();
+            trunk_video.media_port = internal_local.port();
+            trunk_video.connection_addr = Some(internal_local.ip().to_string());
+            trunk_video.addr_type = Some(if internal_local.is_ipv4() {
+                SdpAddrType::Ip4
+            } else {
+                SdpAddrType::Ip6
+            });
+            answer.push_str(&trunk_video.media_lines());
+        }
     } else {
         call.pending_video_relay = None;
         call.active_video_relay = None;
+        if let Some(internal_video) = call.internal_offer.video.as_ref() {
+            answer.push_str(&internal_video.description.rejected_answer().media_lines());
+        }
     }
     Ok(answer)
 }
@@ -3959,6 +4708,45 @@ fn prepare_final_operator_media(
         });
     }
     prepare_operator_media(call, body)
+}
+
+async fn ensure_operator_sdp_routes(
+    bearer: &BearerConnection,
+    worker: Option<&UeWorkerHandle>,
+    body: &[u8],
+) -> Result<(), VolteError> {
+    let audio = parse_audio_sdp(body)
+        .map_err(|error| VolteError::with_detail("volte_voice_sdp_invalid", error.to_string()))?;
+    let audio_remote = media_socket_addr(&audio)?;
+    let video = parse_video_sdp(body).ok().and_then(|description| {
+        let endpoint = media_endpoint_for_video(&audio, &description).ok()?;
+        Some(VideoOffer {
+            description,
+            endpoint,
+        })
+    });
+    ensure_operator_media_routes(bearer, worker, audio_remote, video.as_ref()).await
+}
+
+async fn ensure_operator_media_routes(
+    bearer: &BearerConnection,
+    worker: Option<&UeWorkerHandle>,
+    audio: SocketAddr,
+    video: Option<&VideoOffer>,
+) -> Result<(), VolteError> {
+    if let Some(worker) = worker {
+        route_media_host_in_worker(bearer, audio.ip(), worker).await?;
+    } else {
+        route_media_host(bearer, audio.ip()).await?;
+    }
+    if let Some(video) = video {
+        if let Some(worker) = worker {
+            route_media_host_in_worker(bearer, video.endpoint.ip(), worker).await?;
+        } else {
+            route_media_host(bearer, video.endpoint.ip()).await?;
+        }
+    }
+    Ok(())
 }
 
 fn arm_first_rtp_ip_answer(call: &mut LiveVoiceCall) -> Option<tokio::sync::watch::Receiver<bool>> {
@@ -4049,40 +4837,50 @@ fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         parse_video_sdp(body),
         call.operator_video_local,
     ) {
-        negotiate_video(&operator_video.description, &internal_video).map_err(|error| {
-            VolteError::with_detail("vilte_video_negotiation_failed", error.to_string())
-        })?;
-        let internal_remote = media_endpoint_for_video(&internal_audio, &internal_video)?;
-        if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
-            let pending = call
-                .pending_video_relay
-                .take()
-                .ok_or_else(|| VolteError::new("vilte_rtp_relay_missing"))?;
-            let mappings = (operator_video.description.payload_type != internal_video.payload_type)
-                .then_some(PayloadTypeMapping {
-                    operator: operator_video.description.payload_type,
-                    internal: internal_video.payload_type,
-                });
-            call.active_video_relay = Some(pending.activate_with_metrics(
-                operator_video.endpoint,
-                internal_remote,
-                mappings,
-                call.media_metrics.clone(),
-            ));
-        }
-        let mut ims_video = operator_video.description.clone();
-        ims_video.direction = internal_video.direction.for_peer();
-        ims_video.media_port = operator_local.port();
-        ims_video.connection_addr = Some(operator_local.ip().to_string());
-        ims_video.addr_type = Some(if operator_local.is_ipv4() {
-            SdpAddrType::Ip4
+        if internal_video.is_rejected() {
+            call.pending_video_relay = None;
+            call.active_video_relay = None;
+            answer.push_str(&operator_video.description.rejected_answer().media_lines());
         } else {
-            SdpAddrType::Ip6
-        });
-        answer.push_str(&ims_video.media_lines());
+            negotiate_video(&operator_video.description, &internal_video).map_err(|error| {
+                VolteError::with_detail("vilte_video_negotiation_failed", error.to_string())
+            })?;
+            let internal_remote = media_endpoint_for_video(&internal_audio, &internal_video)?;
+            if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
+                let pending = call
+                    .pending_video_relay
+                    .take()
+                    .ok_or_else(|| VolteError::new("vilte_rtp_relay_missing"))?;
+                let mappings = (operator_video.description.payload_type
+                    != internal_video.payload_type)
+                    .then_some(PayloadTypeMapping {
+                        operator: operator_video.description.payload_type,
+                        internal: internal_video.payload_type,
+                    });
+                call.active_video_relay = Some(pending.activate_with_metrics(
+                    operator_video.endpoint,
+                    internal_remote,
+                    mappings,
+                    call.media_metrics.clone(),
+                ));
+            }
+            let mut ims_video = operator_video.description.clone();
+            ims_video.direction = internal_video.direction.for_peer();
+            ims_video.media_port = operator_local.port();
+            ims_video.connection_addr = Some(operator_local.ip().to_string());
+            ims_video.addr_type = Some(if operator_local.is_ipv4() {
+                SdpAddrType::Ip4
+            } else {
+                SdpAddrType::Ip6
+            });
+            answer.push_str(&ims_video.media_lines());
+        }
     } else {
         call.pending_video_relay = None;
         call.active_video_relay = None;
+        if let Some(operator_video) = call.internal_offer.video.as_ref() {
+            answer.push_str(&operator_video.description.rejected_answer().media_lines());
+        }
     }
     Ok(answer)
 }
@@ -4649,6 +5447,7 @@ fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, V
 
 async fn load_device_identity(
     device: &VolteDeviceBinding,
+    runtime: &VolteRuntime,
     profile_store: &ProfileStore,
     sim_override: &SimOverride,
 ) -> Result<DeviceIdentity, VolteError> {
@@ -4657,46 +5456,92 @@ async fn load_device_identity(
         &["-m", device.modem_id.as_str(), "--output-keyvalue"],
     )
     .await?;
-    let sim_path = key_value(&modem, "modem.generic.sim")
-        .ok_or_else(|| VolteError::new(code::MM_IMSI_MISSING))?;
-    let sim = command_output("mmcli", &["-i", &sim_path, "--output-keyvalue"]).await?;
+    // ModemManager can expose the modem before its SIM object path is ready.
+    // Do not fail the whole IMS startup at that point: AT+CIMI and the cached
+    // SIM properties are valid identity sources while the object settles.
+    let sim_path =
+        key_value(&modem, "modem.generic.sim").filter(|value| !value.is_empty() && value != "/");
+    let sim = if let Some(path) = sim_path.as_deref() {
+        match command_output("mmcli", &["-i", path, "--output-keyvalue"]).await {
+            Ok(output) => output,
+            Err(error) => {
+                tracing::warn!(error = %error, sim_path = path, "ModemManager SIM object is not readable yet; continuing with modem identity");
+                String::new()
+            }
+        }
+    } else {
+        tracing::warn!(
+            "ModemManager has no SIM object path yet; continuing with AT identity probes"
+        );
+        String::new()
+    };
     let sim_imsi = key_value(&sim, "sim.properties.imsi")
         .filter(|value| value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit()));
     let cimi_argument = "--command=AT+CIMI";
-    let (imsi, imsi_source) = match command_output(
+    let (imsi, imsi_source, ef_ad_mnc_length) = match command_output(
         "mmcli",
         &["-m", device.modem_id.as_str(), cimi_argument],
     )
     .await
     {
         Ok(output) => match identity::parse_cimi_response(&output) {
-            Some(imsi) => (imsi, "at_cimi"),
+            Some(imsi) => (imsi, "at_cimi", None),
             None => {
                 tracing::warn!(
-                    "Native VoLTE AT+CIMI response did not contain an IMSI; using SIM fallback"
+                    "Native VoLTE AT+CIMI response did not contain an IMSI; using SIM/UIM fallback"
                 );
-                (
-                    sim_imsi.ok_or_else(|| VolteError::new(code::IMSI_MISSING))?,
-                    "sim_imsi_fallback",
-                )
+                resolve_fallback_imsi(device, sim_imsi.as_deref())
+                    .await
+                    .ok_or_else(|| {
+                        VolteError::with_detail(
+                            code::MM_IMSI_MISSING,
+                            "at_cimi_modemmanager_and_uim_imsi_invalid",
+                        )
+                    })
+                    .map(|identity| (identity.imsi, identity.source, identity.mnc_length))?
             }
         },
         Err(error) => {
-            tracing::warn!(error = %error, "Native VoLTE ModemManager AT+CIMI failed; using SIM IMSI fallback");
-            (
-                sim_imsi.ok_or_else(|| VolteError::new(code::IMSI_MISSING))?,
-                "sim_imsi_fallback",
-            )
+            tracing::warn!(error = %error, "Native VoLTE ModemManager AT+CIMI failed; using SIM/UIM IMSI fallback");
+            resolve_fallback_imsi(device, sim_imsi.as_deref())
+                .await
+                .ok_or_else(|| {
+                    VolteError::with_detail(
+                        code::MM_IMSI_MISSING,
+                        "modemmanager_sim_at_and_uim_identity_unavailable",
+                    )
+                })
+                .map(|identity| (identity.imsi, identity.source, identity.mnc_length))?
         }
     };
-    let home_plmn = [
+    let registered_plmn =
+        key_value(&modem, "modem.3gpp.operator-code").filter(|candidate| valid_plmn(candidate));
+    let mut home_plmn = [
+        key_value(&sim, "sim.properties.operator-code"),
         key_value(&sim, "sim.properties.operator-id"),
         key_value(&sim, "sim.properties.operator-identifier"),
-        key_value(&modem, "modem.3gpp.operator-code"),
+        registered_plmn.clone(),
     ]
     .into_iter()
     .flatten()
     .find(|candidate| valid_home_plmn(&imsi, candidate));
+    let mut ef_ad_mnc_length = ef_ad_mnc_length;
+    if home_plmn.is_none() && ef_ad_mnc_length.is_none() {
+        if let Some(uim_identity) = read_uim_identity(device).await {
+            if uim_identity.imsi == imsi {
+                ef_ad_mnc_length = uim_identity.mnc_length;
+            }
+        }
+    }
+    if home_plmn.is_none() && (ef_ad_mnc_length.is_some() || imsi.starts_with("460")) {
+        home_plmn = identity::resolve_home_plmn(
+            &imsi,
+            registered_plmn.as_deref(),
+            ef_ad_mnc_length.map(usize::from),
+        )
+        .ok()
+        .map(|resolved| format!("{}{}", resolved.mcc, resolved.mnc));
+    }
     let applications = match command_output(
         "qmicli",
         &[
@@ -4717,6 +5562,25 @@ async fn load_device_identity(
     let aka_aid = identity::resolve_usim_aid(applications.usim_aid.as_deref());
     let usim_aid = identity::aid_hex(&aka_aid);
     let isim_aid = applications.isim_aid.as_deref().map(identity::aid_hex);
+    let identity_source = match (imsi_source, isim_aid.is_some()) {
+        ("at_cimi", true) => "at_cimi_isim_detected",
+        ("at_cimi", false) => "at_cimi",
+        ("uim_ef_imsi_fallback", true) => "uim_ef_imsi_isim_detected",
+        ("uim_ef_imsi_fallback", false) => "uim_ef_imsi",
+        (_, true) => "sim_imsi_fallback_isim_detected",
+        (_, false) => "sim_imsi_fallback",
+    };
+    runtime
+        .update(|state| {
+            state.stage = VolteStage::CarrierProfile;
+            state.identity_source = Some(identity_source.to_string());
+            state.profile_id = None;
+            state.profile_source = None;
+            state.profile_fallback_reason = None;
+            state.usim_aid = Some(usim_aid.clone());
+            state.isim_aid = isim_aid.clone();
+        })
+        .await;
     let resolved = profile_store
         .resolve_for_imsi_access(
             sim_override.ims_volte.profile_id.as_deref(),
@@ -4725,9 +5589,34 @@ async fn load_device_identity(
             CatalogAccessKind::LteEpc,
         )
         .map_err(|detail| VolteError::with_detail(code::CARRIER_PROFILE_MISSING, detail))?
-        .ok_or_else(|| VolteError::new(code::CARRIER_PROFILE_MISSING))?;
+        .ok_or_else(|| {
+            let identity_hint = home_plmn
+                .as_deref()
+                .map(|plmn| format!("home_plmn:{plmn}"))
+                .unwrap_or_else(|| {
+                    let prefix = imsi.get(..imsi.len().min(6)).unwrap_or("unknown");
+                    format!("imsi_prefix:{prefix}")
+                });
+            VolteError::with_detail(
+                code::CARRIER_PROFILE_MISSING,
+                format!("{identity_hint}:access:lte_epc:no_ready_profile"),
+            )
+        })?;
     let profile = resolved.profile;
+    runtime
+        .update(|state| {
+            state.profile_id = Some(profile.meta.profile_id.to_string());
+            state.profile_source = Some(resolved.origin.as_str().to_string());
+            state.profile_fallback_reason = resolved.fallback_reason.clone();
+        })
+        .await;
     let effective_ims = resolve_effective_ims_profile(profile, Some(sim_override));
+    let visited_network_header = visited_network_header(
+        &imsi,
+        home_plmn.as_deref(),
+        registered_plmn.as_deref(),
+        profile.ims.register.include_visited_network || resolved.origin == ProfileOrigin::Derived,
+    );
     let effective_device_identity = resolve_effective_device_identity(
         Some(sim_override),
         (!device.equipment_identifier.trim().is_empty())
@@ -4736,7 +5625,11 @@ async fn load_device_identity(
     tracing::info!(
         profile_id = profile.meta.profile_id,
         profile_origin = resolved.origin.as_str(),
+        profile_fallback_reason = ?resolved.fallback_reason,
         ims_domain_source = ?effective_ims.domain.source,
+        home_plmn = ?home_plmn,
+        registered_plmn = ?registered_plmn,
+        roaming_visited_network = ?visited_network_header,
         "Resolved native VoLTE carrier profile"
     );
     Ok(DeviceIdentity {
@@ -4750,16 +5643,58 @@ async fn load_device_identity(
         profile,
         effective_ims,
         effective_device_identity,
+        visited_network_header,
         aka_aid,
         usim_aid,
-        source: match (imsi_source, isim_aid.is_some()) {
-            ("at_cimi", true) => "at_cimi_isim_detected",
-            ("at_cimi", false) => "at_cimi",
-            (_, true) => "sim_imsi_fallback_isim_detected",
-            (_, false) => "sim_imsi_fallback",
-        },
+        source: identity_source,
         isim_aid,
     })
+}
+
+async fn resolve_fallback_imsi(
+    device: &VolteDeviceBinding,
+    modemmanager_imsi: Option<&str>,
+) -> Option<FallbackImsi> {
+    if let Some(imsi) = modemmanager_imsi {
+        return Some(FallbackImsi {
+            imsi: imsi.to_string(),
+            source: "sim_imsi_fallback",
+            mnc_length: None,
+        });
+    }
+    read_uim_identity(device)
+        .await
+        .map(|identity| FallbackImsi {
+            imsi: identity.imsi,
+            source: "uim_ef_imsi_fallback",
+            mnc_length: identity.mnc_length,
+        })
+}
+
+async fn read_uim_identity(
+    device: &VolteDeviceBinding,
+) -> Option<crate::connectivity::modems::ims::vowifi::qmi_uim::UsimIdentity> {
+    let qmi_device = device.qmi_device.clone();
+    let uim_slot = device.uim_slot;
+    tokio::task::spawn_blocking(move || {
+        crate::connectivity::modems::ims::vowifi::qmi_uim::read_usim_identity_via_proxy_reason(
+            QMI_PROXY_SOCKET,
+            &qmi_device,
+            uim_slot,
+            crate::connectivity::modems::ims::vowifi::qmi_uim::USIM_AID_PREFIX,
+            Duration::from_secs(3),
+        )
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+struct FallbackImsi {
+    imsi: String,
+    source: &'static str,
+    mnc_length: Option<u8>,
 }
 
 async fn resolve_device_binding(
@@ -4777,11 +5712,74 @@ async fn resolve_device_binding(
             }
         }
 
+        // ModemManager renumbers its modem index on every re-probe, and
+        // restarting SimAdmin is itself enough to trigger one -- the device has
+        // walked modem6 -> modem9 -> modem10 across three restarts. A cached
+        // index therefore goes stale routinely, and polling it cannot recover:
+        // `mmcli -m <stale>` fails with "couldn't find modem" every time, so
+        // all ten attempts burn 20s and report a timeout for a modem that was
+        // registered throughout. The IMEI survives renumbering, so use it to
+        // find the modem's current index before spending another delay.
+        if let Some(found) = relocate_modem_by_equipment_id(requested).await {
+            tracing::info!(
+                previous_modem_id = %requested.modem_id,
+                modem_id = %found.modem_id,
+                attempt,
+                "Modem index changed; re-resolved the VoLTE binding by equipment id"
+            );
+            return Ok(found);
+        }
+
         if attempt + 1 < MM_MODEM_WAIT_ATTEMPTS {
             tokio::time::sleep(MM_MODEM_WAIT_DELAY).await;
         }
     }
     Err(VolteError::new(code::RUNTIME_MM_MODEM_WAIT_TIMEOUT))
+}
+
+/// Find the modem that currently carries this binding's equipment id (IMEI).
+///
+/// Returns `None` when the id is unknown, no listed modem matches, or the match
+/// is not yet ready -- all of which leave the ordinary wait loop in charge.
+/// Matching on the IMEI rather than the index is the point: the index is
+/// ModemManager's own enumeration order and is not stable across a re-probe.
+async fn relocate_modem_by_equipment_id(
+    requested: &VolteDeviceBinding,
+) -> Option<VolteDeviceBinding> {
+    let wanted = requested.equipment_identifier.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+
+    let listed = command_output("mmcli", &["-L", "--output-keyvalue"])
+        .await
+        .ok()?;
+    // `--output-keyvalue` separates with " : ", not "=", and the first line is a
+    // `modem-list.length` count rather than a path -- hence keying off the
+    // `modem-list.value` prefix instead of just taking every value.
+    for candidate in listed
+        .lines()
+        .filter(|line| line.trim_start().starts_with("modem-list.value"))
+        .filter_map(|line| line.split(':').nth(1))
+        .filter_map(|value| value.trim().rsplit('/').next())
+        .filter(|index| !index.is_empty() && *index != requested.modem_id)
+    {
+        let Ok(details) = command_output("mmcli", &["-m", candidate, "--output-keyvalue"]).await
+        else {
+            continue;
+        };
+        let matches_equipment = key_value(&details, "modem.generic.equipment-identifier")
+            .as_deref()
+            .map(str::trim)
+            == Some(wanted);
+        if matches_equipment && modem_is_ready(&details) {
+            return Some(VolteDeviceBinding {
+                modem_id: candidate.to_string(),
+                ..requested.clone()
+            });
+        }
+    }
+    None
 }
 
 fn modem_is_ready(output: &str) -> bool {
@@ -4825,9 +5823,37 @@ fn key_value(output: &str, key: &str) -> Option<String> {
 }
 
 fn valid_home_plmn(imsi: &str, candidate: &str) -> bool {
-    matches!(candidate.len(), 5 | 6)
-        && candidate.bytes().all(|byte| byte.is_ascii_digit())
-        && imsi.starts_with(candidate)
+    valid_plmn(candidate) && imsi.starts_with(candidate)
+}
+
+fn valid_plmn(candidate: &str) -> bool {
+    matches!(candidate.len(), 5 | 6) && candidate.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn visited_network_header(
+    imsi: &str,
+    home_plmn: Option<&str>,
+    registered_plmn: Option<&str>,
+    include_visited_network: bool,
+) -> Option<String> {
+    if !include_visited_network {
+        return None;
+    }
+    let registered = registered_plmn.filter(|plmn| valid_plmn(plmn))?;
+    let home = home_plmn.filter(|plmn| valid_home_plmn(imsi, plmn));
+    let roaming = home.map_or_else(
+        || !imsi.starts_with(registered),
+        |home| canonical_plmn(home) != canonical_plmn(registered),
+    );
+    roaming.then(|| {
+        let mcc = &registered[..3];
+        let mnc = &registered[3..];
+        format!("\"ims.mnc{:0>3}.mcc{}.3gppnetwork.org\"", mnc, mcc)
+    })
+}
+
+fn canonical_plmn(plmn: &str) -> String {
+    format!("{}{:0>3}", &plmn[..3], &plmn[3..])
 }
 
 fn offered_security(send_port: u16, receive_port: u16) -> SecAgree {
@@ -4851,28 +5877,23 @@ fn offered_security(send_port: u16, receive_port: u16) -> SecAgree {
     }
 }
 
-fn new_sip_instance() -> String {
-    let token = sip::hex_token(16);
-    format!(
-        "urn:uuid:{}-{}-{}-{}-{}",
-        &token[0..8],
-        &token[8..12],
-        &token[12..16],
-        &token[16..20],
-        &token[20..32]
+/// `+sip.instance` for this line's VoLTE registration.
+///
+/// Derived from the IMPI rather than randomised per registration, so this leg
+/// and the VoWiFi leg present the *same* instance id for the same subscription.
+/// See [`stable_sip_instance`] for why that matters to terminating calls.
+///
+/// [`stable_sip_instance`]: crate::connectivity::core::device_identity::stable_sip_instance
+fn sip_instance_for_profile(
+    profile: &CarrierProfile,
+    identity: &ImsIdentity,
+    effective_imei: Option<&str>,
+) -> String {
+    crate::connectivity::core::device_identity::stable_sip_instance(
+        &identity.private_user,
+        effective_imei,
+        profile.identity.device_identity_enabled && profile.ims.register.always_add_sip_instance,
     )
-}
-
-fn sip_instance_for_profile(profile: &CarrierProfile, effective_imei: Option<&str>) -> String {
-    if profile.identity.device_identity_enabled && profile.ims.register.always_add_sip_instance {
-        if let Some(imei) = effective_imei
-            .map(str::trim)
-            .filter(|imei| crate::connectivity::core::device_identity::is_valid_imei(imei))
-        {
-            return format!("urn:imei:{imei}");
-        }
-    }
-    new_sip_instance()
 }
 
 fn ensure_generation(runtime: &VolteRuntime, expected: u64) -> Result<(), VolteError> {
@@ -4924,6 +5945,28 @@ fn sec_agree_retry_variant(
     }
     let response = failure.response.as_deref()?;
     response_requires_only_extension(response, "sec-agree").then(|| variant.requiring_sec_agree())
+}
+
+/// Offer the security agreement once when the initial REGISTER draws no reply
+/// at all.
+///
+/// `sec_agree_retry_variant` keys on a 421 naming sec-agree, but a core is free
+/// to drop a REGISTER that offers `Security-Client` without declaring
+/// `Require`/`Proxy-Require` rather than answer it. Maxis does exactly that on
+/// the LTE leg: over VoWiFi the same shape comes back as 421 and escalates, but
+/// over the IMS APN the transaction just times out, so the 421-driven rung can
+/// never fire and every attempt repeats the rejected shape. A variant always
+/// carries a Security-Client offer, so a silent timeout is worth one compliant
+/// retry before moving on.
+fn sec_agree_timeout_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    if variant.policy.require_sec_agree || failure.auth_rounds != 0 || failure.response.is_some() {
+        return None;
+    }
+    (failure.error.code() == "ims_register_initial_receive_failed")
+        .then(|| variant.requiring_sec_agree())
 }
 
 fn sec_agree_require_only_retry_variant(
@@ -5058,6 +6101,19 @@ fn log_volte_register_request_metadata(
         sec_agree_required = variant.policy.require_sec_agree,
         proxy_sec_agree_required = variant.policy.proxy_require_sec_agree,
         mmtel_features_present = variant.policy.include_mmtel_features,
+        // Report what the Contact actually carries, not just what the policy
+        // asked for. These two disagreed while the builder silently dropped
+        // every feature tag for profiles with an empty contact_param_order,
+        // and the policy-only field made the REGISTER look correct.
+        icsi_ref_advertised = sip::header_values(request, "Contact")
+            .iter()
+            .any(|contact| contact.to_ascii_lowercase().contains("+g.3gpp.icsi-ref")),
+        audio_feature_advertised = sip::header_values(request, "Contact")
+            .iter()
+            .any(|contact| contact.to_ascii_lowercase().contains(";audio")),
+        sip_instance_advertised = sip::header_values(request, "Contact")
+            .iter()
+            .any(|contact| contact.to_ascii_lowercase().contains("+sip.instance")),
         sms_over_ip_advertised = sip::header_values(request, "Contact")
             .iter()
             .any(|contact| contact.to_ascii_lowercase().contains("+g.3gpp.smsip")),
@@ -5068,7 +6124,31 @@ fn log_volte_register_request_metadata(
     );
 }
 
-fn log_volte_register_failure_metadata(variant: VolteRegisterVariant, failure: &RegisterFailure) {
+fn log_volte_register_failure_metadata(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+    request: Option<&[u8]>,
+) {
+    if let Some(request) = request {
+        tracing::warn!(
+            register_phase = "refresh",
+            request_route_present = !sip::header_values(request, "Route").is_empty(),
+            request_authorization_present =
+                !sip::header_values(request, "Authorization").is_empty(),
+            request_security_verify_present =
+                !sip::header_values(request, "Security-Verify").is_empty(),
+            request_security_client_present =
+                !sip::header_values(request, "Security-Client").is_empty(),
+            request_require_present = !sip::header_values(request, "Require").is_empty(),
+            request_proxy_require_present =
+                !sip::header_values(request, "Proxy-Require").is_empty(),
+            request_pani_present = !sip::header_values(request, "P-Access-Network-Info").is_empty(),
+            request_cseq = sip::header_value(request, "CSeq")
+                .and_then(|value| value.split_whitespace().next().map(str::to_owned)),
+            sensitive_values = "redacted",
+            "VoLTE IMS REGISTER refresh request metadata"
+        );
+    }
     let Some(response) = failure.response.as_deref() else {
         tracing::warn!(
             register_variant = variant.label,
@@ -5090,6 +6170,9 @@ fn log_volte_register_failure_metadata(variant: VolteRegisterVariant, failure: &
         unsupported_present = !sip::header_values(response, "Unsupported").is_empty(),
         require_present = !sip::header_values(response, "Require").is_empty(),
         proxy_require_present = !sip::header_values(response, "Proxy-Require").is_empty(),
+        response_route_present = !sip::header_values(response, "Route").is_empty(),
+        response_security_server_count = sip::header_values(response, "Security-Server").len(),
+        response_cseq = sip::header_value(response, "CSeq"),
         sensitive_values = "redacted",
         "VoLTE IMS REGISTER terminal response metadata received"
     );
@@ -5107,6 +6190,31 @@ fn ip_family_name(address: IpAddr) -> &'static str {
 mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
+
+    #[test]
+    fn carrier_profile_failures_are_not_reported_as_sim_identity_failures() {
+        assert_eq!(
+            failure_stage(&VolteError::with_detail(
+                code::CARRIER_PROFILE_MISSING,
+                "home_plmn:46000:access:lte_epc:no_ready_profile",
+            )),
+            Some(VolteStage::CarrierProfile)
+        );
+        assert_eq!(
+            failure_stage(&VolteError::new(code::MM_IMSI_MISSING)),
+            Some(VolteStage::Identity)
+        );
+        for error_code in [
+            code::BEARER_NETDEV_RUNTIME_ERROR,
+            code::BEARER_NETDEV_NOT_UP,
+            code::BEARER_NETDEV_NOT_READY,
+        ] {
+            assert_eq!(
+                failure_stage(&VolteError::new(error_code)),
+                Some(VolteStage::IpConfig)
+            );
+        }
+    }
 
     fn register_variant(label: &str) -> VolteRegisterVariant {
         *VOLTE_REGISTER_VARIANTS
@@ -5232,6 +6340,8 @@ mod tests {
             pcscf: pcscf_addr,
             ip_family: "ipv4",
             xfrm_plan: None,
+            xfrm_worker: None,
+            network_worker: None,
             register_ids: RequestIds::fresh(1),
             next_register_cseq: 2,
             sip_instance: "urn:uuid:00000000-0000-4000-8000-000000000000".into(),
@@ -5252,6 +6362,8 @@ mod tests {
             aka_aid: Vec::new(),
             profile,
             effective_ims: resolve_effective_ims_profile(profile, None),
+            visited_network_header: None,
+            media_operator_creator: None,
             voice_calls: HashMap::new(),
             mwi_subscription: None,
         });
@@ -5269,27 +6381,75 @@ mod tests {
     }
 
     #[test]
-    fn bearer_backend_follows_the_selected_ims_endpoint() {
+    fn production_register_variants_keep_a_generic_second_attempt() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let variants = register_variants(&profile);
+        assert_eq!(variants.len(), 2);
+        assert_eq!(
+            variants[0].label,
+            profile.ims.register.live_header_variant_set
+        );
+        assert_eq!(variants[1].label, "generic_ims_register_fallback");
+        assert_eq!(variants[1].authorization, VolteInitialAuthorization::None);
+        assert!(!variants[1].policy.require_sec_agree);
+    }
+
+    /// Verbatim `mmcli -L --output-keyvalue` output from the 410. The separator
+    /// is " : " rather than "=", and the first line is a count -- parsing it as
+    /// a path would make the relocation silently never match, which is
+    /// indistinguishable from the stale-index bug it exists to fix.
+    #[test]
+    fn modem_list_keyvalue_parsing_yields_the_indices() {
+        let listed = "modem-list.length   : 1\n\
+                      modem-list.value[1] : /org/freedesktop/ModemManager1/Modem/10\n";
+
+        let indices: Vec<&str> = listed
+            .lines()
+            .filter(|line| line.trim_start().starts_with("modem-list.value"))
+            .filter_map(|line| line.split(':').nth(1))
+            .filter_map(|value| value.trim().rsplit('/').next())
+            .filter(|index| !index.is_empty())
+            .collect();
+
+        assert_eq!(indices, vec!["10"]);
+    }
+
+    /// The IMEI is what survives ModemManager renumbering, so the key name is
+    /// load-bearing. Verbatim from `mmcli -m 10 --output-keyvalue` on the 410.
+    #[test]
+    fn equipment_identifier_is_read_from_the_generic_key() {
+        let details = "modem.generic.equipment-identifier              : 861716071107730\n\
+                       modem.generic.state                             : connected\n";
+
+        assert_eq!(
+            key_value(details, "modem.generic.equipment-identifier").as_deref(),
+            Some("861716071107730")
+        );
+        assert!(modem_is_ready(details));
+    }
+
+    /// IMS is always on the ModemManager-owned port, so the native QMI bearer
+    /// path is never taken. It stayed reachable for as long as the allocator
+    /// could put IMS on DATA6, and driving it against that held device is what
+    /// crashed the baseband -- see docs/QCM410_BAM_DMUX_MODEM_CRASH.md §10.
+    #[test]
+    fn no_allocation_selects_the_native_ims_bearer_backend() {
         assert!(!native_ims_bearer_required(DataSlotMode::PrimaryImsOnly));
         assert!(!native_ims_bearer_required(
             DataSlotMode::PrimaryImsSecondaryData
         ));
-        assert!(native_ims_bearer_required(
-            DataSlotMode::SecondaryImsPrimaryData
-        ));
     }
 
+    /// The AT profile is only pre-activated for the native path. With that path
+    /// unreachable, ModemManager stays the sole PDP activation owner on qmi0 --
+    /// pre-activating the same CID first makes its bearer connect fail.
     #[test]
-    fn primary_ims_with_secondary_data_does_not_pre_activate_the_profile() {
+    fn no_allocation_pre_activates_the_ims_profile() {
         assert!(!active_ims_profile_prefetch_required(
             DataSlotMode::PrimaryImsSecondaryData
         ));
-    }
-
-    #[test]
-    fn secondary_ims_with_primary_data_keeps_native_profile_prefetch() {
-        assert!(active_ims_profile_prefetch_required(
-            DataSlotMode::SecondaryImsPrimaryData
+        assert!(!active_ims_profile_prefetch_required(
+            DataSlotMode::PrimaryImsOnly
         ));
     }
 
@@ -5310,22 +6470,53 @@ mod tests {
         assert_eq!(device.equipment_identifier, "490154203237518");
     }
 
+    fn instance_identity(impi: &str) -> ImsIdentity {
+        ImsIdentity {
+            private_user: impi.to_string(),
+            public_uri: format!("sip:{impi}"),
+            contact_user: impi.to_string(),
+            home_domain: "ims.example".to_string(),
+            contact_user_phone: false,
+        }
+    }
+
     #[test]
     fn sip_instance_imei_is_strictly_carrier_policy_gated() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let identity = instance_identity("460001234567890@ims.example");
         profile.ims.register.always_add_sip_instance = true;
         profile.identity.device_identity_enabled = false;
         assert!(
-            sip_instance_for_profile(&profile, Some("490154203237518")).starts_with("urn:uuid:")
+            sip_instance_for_profile(&profile, &identity, Some("490154203237518"))
+                .starts_with("urn:uuid:")
         );
 
         profile.identity.device_identity_enabled = true;
         assert_eq!(
-            sip_instance_for_profile(&profile, Some("490154203237518")),
+            sip_instance_for_profile(&profile, &identity, Some("490154203237518")),
             "urn:imei:490154203237518"
         );
-        assert!(sip_instance_for_profile(&profile, Some("12345")).starts_with("urn:uuid:"));
-        assert!(sip_instance_for_profile(&profile, None).starts_with("urn:uuid:"));
+        assert!(
+            sip_instance_for_profile(&profile, &identity, Some("12345")).starts_with("urn:uuid:")
+        );
+        assert!(sip_instance_for_profile(&profile, &identity, None).starts_with("urn:uuid:"));
+    }
+
+    #[test]
+    fn sip_instance_is_stable_per_subscription_not_per_registration() {
+        // RFC 5626 §4.1: the instance id names the UE. Re-registering, or
+        // registering the same IMPU over the other access leg, must present the
+        // same value or the S-CSCF keeps two bindings for one identity and a
+        // terminating INVITE can be delivered to the wrong one.
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let identity = instance_identity("460001234567890@ims.example");
+        let first = sip_instance_for_profile(&profile, &identity, None);
+        let second = sip_instance_for_profile(&profile, &identity, None);
+        assert_eq!(first, second);
+        assert!(first.starts_with("urn:uuid:"));
+
+        let other = instance_identity("460009999999999@ims.example");
+        assert_ne!(first, sip_instance_for_profile(&profile, &other, None));
     }
 
     #[test]
@@ -5341,6 +6532,31 @@ mod tests {
             Some("46011")
         );
         assert!(!format!("{modem:?}").contains("460111234567890"));
+    }
+
+    #[test]
+    fn roaming_visited_network_uses_current_registered_plmn() {
+        assert_eq!(
+            visited_network_header("234331234567890", Some("23433"), Some("46000"), true,)
+                .as_deref(),
+            Some("\"ims.mnc000.mcc460.3gppnetwork.org\"")
+        );
+    }
+
+    #[test]
+    fn home_registration_does_not_override_profile_visited_network() {
+        assert_eq!(
+            visited_network_header("460011234567890", Some("46001"), Some("46001"), true,),
+            None
+        );
+        assert_eq!(
+            visited_network_header("234331234567890", Some("23433"), Some("46000"), false,),
+            None
+        );
+        assert_eq!(
+            visited_network_header("460011234567890", Some("46001"), Some("460001"), true,),
+            None
+        );
     }
 
     #[test]
@@ -5446,6 +6662,45 @@ mod tests {
         let challenge = parse_digest_challenge(frame).unwrap();
         assert_eq!(challenge.realm, "ims.example");
         assert!(!challenge.proxy);
+    }
+
+    /// Maxis drops a non-compliant REGISTER on the LTE leg instead of answering
+    /// 421, so the 421-driven rung never fires and every retry repeats the
+    /// rejected shape. A silent timeout must escalate too.
+    #[test]
+    fn sec_agree_timeout_upgrades_when_the_core_never_answers() {
+        let timeout = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 0,
+        };
+        let base = register_variant("ims_features_aka_uri_first");
+        assert!(!base.policy.require_sec_agree);
+
+        let upgraded = sec_agree_timeout_retry_variant(base, &timeout).expect("escalates");
+        assert!(upgraded.policy.require_sec_agree);
+        assert!(upgraded.policy.proxy_require_sec_agree);
+        assert!(upgraded.policy.advertise_sec_agree);
+        assert!(upgraded.server_required_sec_agree);
+
+        // Already compliant: a second identical attempt would loop.
+        assert!(sec_agree_timeout_retry_variant(upgraded, &timeout).is_none());
+
+        // A timeout after authentication is a different problem.
+        let after_auth = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 1,
+        };
+        assert!(sec_agree_timeout_retry_variant(base, &after_auth).is_none());
+
+        // A real response is the 421 rung's job, not this one.
+        let answered = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+        assert!(sec_agree_timeout_retry_variant(base, &answered).is_none());
     }
 
     #[test]
@@ -5944,7 +7199,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status: 486 }
+            OperatorEvent::Rejected { call_id, status: 486, .. }
                 if call_id == "matrix-call-b"
         ));
 

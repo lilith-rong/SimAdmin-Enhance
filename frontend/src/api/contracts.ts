@@ -554,6 +554,9 @@ export interface VolteRuntimeStatus {
   bearer_ip_type?: string
   current_ip_family?: string
   identity_source?: string
+  profile_id?: string
+  profile_source?: 'carrier_catalog' | 'database' | 'derived'
+  profile_fallback_reason?: string
   usim_aid?: string
   isim_aid?: string
   connection_attempts: VolteConnectionAttempt[]
@@ -651,7 +654,6 @@ export interface LineProfileConfig {
   enabled: boolean
   volte_connection_enabled: boolean
   volte_auto_restore: AutoRestoreConfig
-  volte_voice_enabled: boolean
   vilte: VilteConfig
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
@@ -664,6 +666,8 @@ export interface LineProfileConfig {
    * "only that family".
    */
   volte_ip_families: VolteIpFamily[]
+  /** Whether the carrier catalog may choose the preferred fallback order. */
+  volte_ip_families_auto: boolean
   /**
    * Per-line eSIM management override. `null`/undefined = auto (managed only
    * when the SIM reports a eUICC chip), `true` = force eSIM controls on,
@@ -1023,6 +1027,8 @@ export interface VowifiLineConfigResponse {
   runtime_restore_in_progress: boolean
   runtime_error?: string | null
   matched_profile_id?: string | null
+  matched_profile_source?: 'database' | 'derived' | null
+  matched_profile_fallback_reason?: string | null
 }
 
 export interface LineRuntimeStatus {
@@ -1123,6 +1129,13 @@ export interface CallRecord {
   start_time: string
   end_time?: string
   answered: boolean
+  sip_status?: number
+  failure_code?: string
+  failure_category?: string
+  q850_cause?: number
+  failure_retryable?: boolean
+  retry_after_seconds?: number
+  carrier_reason?: string
 }
 
 export interface CallStats {
@@ -1151,6 +1164,71 @@ export interface CallSettingsResponse {
 }
 
 export type AccessPathKind = 'vowifi' | 'volte' | 'cs'
+
+export type ImsAccessFamily = 'three_gpp' | 'non_three_gpp'
+
+export type ImsAccessPathStage =
+  | 'disabled'
+  | 'down'
+  | 'transport_up'
+  | 'signaling_ready'
+  | 'registered'
+  | 'degraded'
+
+export interface ImsAccessPath {
+  kind: AccessPathKind
+  family: ImsAccessFamily
+  configured: boolean
+  stage: ImsAccessPathStage
+  registered: boolean
+  pcscf?: string | null
+  degraded_reason?: string | null
+}
+
+export interface ThreeGppAccess extends ImsAccessPath {
+  radio_available: boolean
+  bearer_up: boolean
+  registration_mode?: string | null
+}
+
+export interface NonThreeGppAccess extends ImsAccessPath {
+  epdg_host?: string | null
+  epdg_ready: boolean
+  ike_ready: boolean
+  child_sa_ready: boolean
+  esp_ready: boolean
+  tunnel_up: boolean
+}
+
+export interface ImsRegistrationState {
+  registered_over: AccessPathKind[]
+}
+
+export type VoiceRouteRejection =
+  | 'policy_disabled'
+  | 'feature_disabled'
+  | 'not_registered'
+  | 'media_gateway_unavailable'
+
+export interface RejectedVoiceLeg {
+  kind: AccessPathKind
+  reason: VoiceRouteRejection
+}
+
+export interface VoiceAccessSelection {
+  active?: AccessPathKind | null
+  candidates: AccessPathKind[]
+  rejected: RejectedVoiceLeg[]
+  gateway_mode: boolean
+}
+
+export interface ImsSubsystemState {
+  line_id: string
+  registration: ImsRegistrationState
+  three_gpp: ThreeGppAccess
+  non_three_gpp: NonThreeGppAccess
+  voice: VoiceAccessSelection
+}
 
 export interface PathLayerConfig {
   kind: AccessPathKind
@@ -1197,7 +1275,8 @@ export interface WebCallCapabilitiesResponse {
 }
 
 export interface VilteConfig {
-  feature_enabled: boolean
+  volte_enabled: boolean
+  vowifi_enabled: boolean
   codec: string
   video_payload_type: number
   h264_fmtp: string
@@ -1608,6 +1687,33 @@ export interface GithubDownloadProxyConfig {
   proxy_prefix: string
 }
 
+/** Lowest severity written to the on-disk diagnostic log. */
+export type DiagnosticLogSeverity = 'debug' | 'info' | 'warn' | 'error'
+
+export interface DiagnosticLogConfig {
+  enabled: boolean
+  retention_days: number
+  max_total_mb: number
+  min_severity: DiagnosticLogSeverity
+  redact_sensitive: boolean
+  directory: string | null
+}
+
+export interface DiagnosticLogStatus {
+  directory: string
+  file_count: number
+  total_bytes: number
+  earliest_date: string | null
+  latest_date: string | null
+  /** Records discarded because the writer fell behind; non-zero means gaps. */
+  dropped_records: number
+}
+
+export interface DiagnosticLogSettingsResponse {
+  config: DiagnosticLogConfig
+  status: DiagnosticLogStatus
+}
+
 export interface OtaReleaseAsset {
   name: string
   size: number
@@ -1666,6 +1772,8 @@ export interface VowifiMaskedSimIdentity {
 export interface VowifiProfileMatchResponse {
   matched: boolean
   matched_prefix?: string
+  profile_source?: 'database' | 'derived' | null
+  profile_fallback_reason?: string | null
   profile?: VowifiCarrierProfile
   sim_auth?: VowifiAkaAdapterPlan | null
   epdg?: VowifiEpdgPlan | null
@@ -2352,6 +2460,16 @@ export interface VowifiRuntimeEventEntry {
 export interface VowifiRuntimeEventsResponse {
   events: VowifiRuntimeEventEntry[]
   total: number
+}
+
+export interface AppEventEntry {
+  id: number
+  device_id: string
+  event_type: string
+  line_id?: string | null
+  transport?: string | null
+  payload: unknown
+  created_at: string
 }
 
 export interface VowifiSmsPartEntry {

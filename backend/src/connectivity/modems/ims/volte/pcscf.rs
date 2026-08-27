@@ -20,7 +20,10 @@ use std::{
 
 use tokio::{net::UdpSocket, process::Command, time::sleep};
 
-use crate::platform::config::VolteIpFamilyPreference;
+use crate::{
+    platform::config::VolteIpFamilyPreference,
+    services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle},
+};
 
 use super::errors::{code, VolteError};
 use super::plan::{ImsConnectionPlan, IpFamily};
@@ -94,6 +97,19 @@ impl ImsIpSettings {
     /// Choose the local UE address for SIP: prefer IPv6 (IMS is usually v6).
     pub fn local_addr(&self) -> Option<IpAddr> {
         self.ipv6_address.or(self.ipv4_address)
+    }
+
+    /// Select the bearer address that belongs to a destination family.
+    ///
+    /// A dual-stack IMS bearer can expose both addresses while a particular
+    /// REGISTER/media flow uses only one of them. Do not use `local_addr()`
+    /// for family validation because it is preference-ordered (IPv6 first).
+    pub fn local_addr_for_family(&self, destination: IpAddr) -> Option<IpAddr> {
+        if destination.is_ipv6() {
+            self.ipv6_address
+        } else {
+            self.ipv4_address
+        }
     }
 
     /// Available bearer addresses in the plan's family order.
@@ -539,6 +555,57 @@ pub async fn discover_pcscf(
     configured_pcscf: Option<&str>,
     local: IpAddr,
 ) -> Result<IpAddr, VolteError> {
+    discover_pcscf_on_interface(settings, home_domain, configured_pcscf, local, None).await
+}
+
+/// Variant used by a live bearer. DNS queries must carry the bearer interface
+/// as well as the source address: source-address policy rules are ambiguous if
+/// two modem interfaces happen to receive the same address.
+pub async fn discover_pcscf_on_interface(
+    settings: &ImsIpSettings,
+    home_domain: &str,
+    configured_pcscf: Option<&str>,
+    local: IpAddr,
+    interface: Option<&str>,
+) -> Result<IpAddr, VolteError> {
+    discover_pcscf_on_path(
+        settings,
+        home_domain,
+        configured_pcscf,
+        local,
+        interface,
+        None,
+    )
+    .await
+}
+
+pub async fn discover_pcscf_in_worker(
+    settings: &ImsIpSettings,
+    home_domain: &str,
+    configured_pcscf: Option<&str>,
+    local: IpAddr,
+    interface: &str,
+    worker: &UeWorkerHandle,
+) -> Result<IpAddr, VolteError> {
+    discover_pcscf_on_path(
+        settings,
+        home_domain,
+        configured_pcscf,
+        local,
+        Some(interface),
+        Some(worker),
+    )
+    .await
+}
+
+async fn discover_pcscf_on_path(
+    settings: &ImsIpSettings,
+    home_domain: &str,
+    configured_pcscf: Option<&str>,
+    local: IpAddr,
+    interface: Option<&str>,
+    worker: Option<&UeWorkerHandle>,
+) -> Result<IpAddr, VolteError> {
     if let Ok(explicit) = std::env::var(ENV_PCSCF) {
         if let Some(address) = parse_pcscf_override(&explicit)
             .into_iter()
@@ -576,7 +643,15 @@ pub async fn discover_pcscf(
         let address_type = if local.is_ipv6() { 28 } else { 1 };
         for server in dns_servers {
             if server.is_ipv4() == local.is_ipv4() {
-                if let Ok(records) = query_dns(local, *server, configured_host, address_type).await
+                if let Ok(records) = query_dns(
+                    local,
+                    *server,
+                    configured_host,
+                    address_type,
+                    interface,
+                    worker,
+                )
+                .await
                 {
                     if let Some(address) = records
                         .addresses
@@ -597,7 +672,7 @@ pub async fn discover_pcscf(
             continue;
         }
         let address_type = if local.is_ipv6() { 28 } else { 1 };
-        match query_dns(local, *server, &pcscf_name, address_type).await {
+        match query_dns(local, *server, &pcscf_name, address_type, interface, worker).await {
             Ok(records) => {
                 if let Some(address) = records
                     .addresses
@@ -615,7 +690,7 @@ pub async fn discover_pcscf(
         }
 
         for srv_name in &srv_names {
-            let records = match query_dns(local, *server, srv_name, 33).await {
+            let records = match query_dns(local, *server, srv_name, 33, interface, worker).await {
                 Ok(records) => records,
                 Err(error) => {
                     tracing::debug!(dns_server = %server, name = %srv_name, error = %error, "VoLTE P-CSCF DNS SRV query failed");
@@ -623,7 +698,9 @@ pub async fn discover_pcscf(
                 }
             };
             for target in records.srv_targets {
-                if let Ok(target_records) = query_dns(local, *server, &target, address_type).await {
+                if let Ok(target_records) =
+                    query_dns(local, *server, &target, address_type, interface, worker).await
+                {
                     if let Some(address) = target_records
                         .addresses
                         .into_iter()
@@ -663,22 +740,90 @@ async fn query_dns(
     server: IpAddr,
     name: &str,
     record_type: u16,
+    interface: Option<&str>,
+    worker: Option<&UeWorkerHandle>,
 ) -> Result<DnsRecords, VolteError> {
     let query_id = dns_query_id(name, record_type);
     let query = build_dns_query(query_id, name, record_type)?;
-    let socket = UdpSocket::bind(SocketAddr::new(local, 0))
-        .await
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-    socket
-        .send_to(&query, SocketAddr::new(server, DNS_PORT))
-        .await
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    let remote = SocketAddr::new(server, DNS_PORT);
+    let socket = if let Some(worker) = worker {
+        let spec = UeSocketSpec::udp_connected(
+            SocketAddr::new(local, 0),
+            remote,
+            interface.map(str::to_string),
+        );
+        match worker.create_socket(spec).await {
+            Ok(UeSocket::Udp(socket)) => socket,
+            _ => return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)),
+        }
+    } else {
+        bind_dns_socket(SocketAddr::new(local, 0), interface)
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+    };
+    if worker.is_some() {
+        socket
+            .send(&query)
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    } else {
+        socket
+            .send_to(&query, remote)
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    }
     let mut response = [0u8; 4096];
-    let (read, _) = tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
-        .await
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    let read = if worker.is_some() {
+        tokio::time::timeout(DNS_TIMEOUT, socket.recv(&mut response))
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+    } else {
+        tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+            .0
+    };
     parse_dns_response(query_id, &response[..read])
+}
+
+async fn bind_dns_socket(local: SocketAddr, interface: Option<&str>) -> std::io::Result<UdpSocket> {
+    let Some(interface) = interface.filter(|name| !name.trim().is_empty()) else {
+        return Ok(UdpSocket::bind(local).await?);
+    };
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(local),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::fd::AsRawFd};
+        let name = CString::new(interface).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface contains NUL")
+        })?;
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_ptr().cast(),
+                name.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = interface;
+    }
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket.into())
 }
 
 fn dns_query_id(name: &str, record_type: u16) -> u16 {
@@ -913,6 +1058,20 @@ IPv4 primary DNS: 10.0.0.53";
             )),
             vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]
         );
+    }
+
+    #[test]
+    fn local_addr_for_family_does_not_follow_preferred_family() {
+        let settings = parse_ip_settings(SAMPLE);
+        assert_eq!(
+            settings.local_addr_for_family("198.51.100.10".parse().unwrap()),
+            Some("10.0.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            settings.local_addr_for_family("2001:db8::10".parse().unwrap()),
+            Some("2001:db8::2".parse().unwrap())
+        );
+        assert_eq!(settings.local_addr(), Some("2001:db8::2".parse().unwrap()));
     }
 
     #[test]

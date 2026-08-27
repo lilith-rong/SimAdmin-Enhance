@@ -22,11 +22,14 @@
 //! live adapter drive relays of this type against the same Trunk seam.
 
 use std::{
+    future::Future,
     io as std_io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::Arc,
 };
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket, sync::watch, task::JoinHandle};
 
 use crate::connectivity::core::voice::{MediaDirection, RtpPacket};
@@ -344,15 +347,64 @@ pub fn rewrite_rtp_payload_type(datagram: &[u8], payload_type: u8) -> Option<Vec
 pub struct PendingRtpRelay {
     operator_socket: Arc<UdpSocket>,
     internal_socket: Arc<UdpSocket>,
+    /// Keeps a UE worker (if any) alive for the lifetime of the relay so the
+    /// operator-side socket stays bound to its namespace-owned fd.
+    _operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+}
+
+/// Creates the operator-facing UDP socket on behalf of a media relay.
+///
+/// The host path binds in the current namespace; the per-UE isolation path
+/// asks the line's UE worker to create the socket inside the UE network
+/// namespace and returns the fd. Keeping the creator in the relay prevents
+/// the worker handle from being dropped while the socket is still in use.
+pub trait OperatorSocketCreator: Send + Sync {
+    fn create_udp<'a>(
+        &'a self,
+        local: SocketAddr,
+        bind_to_device: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = std_io::Result<UdpSocket>> + Send + 'a>>;
 }
 
 impl PendingRtpRelay {
     pub async fn bind(operator_ip: IpAddr, internal_ip: IpAddr) -> std_io::Result<Self> {
-        let operator_socket = Arc::new(UdpSocket::bind(SocketAddr::new(operator_ip, 0)).await?);
+        Self::bind_with_operator_interface(operator_ip, internal_ip, None).await
+    }
+
+    /// Bind the operator-facing socket to the access interface as well as its
+    /// local address. The address alone is not a unique selector when two
+    /// modem interfaces receive the same private IP, so Linux must carry the
+    /// interface identity on the socket itself.
+    pub async fn bind_with_operator_interface(
+        operator_ip: IpAddr,
+        internal_ip: IpAddr,
+        operator_interface: Option<&str>,
+    ) -> std_io::Result<Self> {
+        Self::bind_with_operator_source(operator_ip, internal_ip, operator_interface, None).await
+    }
+
+    /// Bind the operator-facing socket either in this namespace or inside the
+    /// UE namespace through `operator_creator`. The internal (Asterisk/Trunk)
+    /// socket always stays in the host namespace.
+    pub async fn bind_with_operator_source(
+        operator_ip: IpAddr,
+        internal_ip: IpAddr,
+        operator_interface: Option<&str>,
+        operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+    ) -> std_io::Result<Self> {
+        let operator_socket = Arc::new(match &operator_creator {
+            Some(creator) => {
+                creator
+                    .create_udp(SocketAddr::new(operator_ip, 0), operator_interface)
+                    .await?
+            }
+            None => bind_udp_socket(SocketAddr::new(operator_ip, 0), operator_interface)?,
+        });
         let internal_socket = Arc::new(UdpSocket::bind(SocketAddr::new(internal_ip, 0)).await?);
         Ok(Self {
             operator_socket,
             internal_socket,
+            _operator_creator: operator_creator,
         })
     }
 
@@ -427,6 +479,53 @@ impl PendingRtpRelay {
     }
 }
 
+fn bind_udp_socket(local: SocketAddr, interface: Option<&str>) -> std_io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    bind_socket_to_interface(&socket, interface)?;
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_socket_to_interface(socket: &Socket, interface: Option<&str>) -> std_io::Result<()> {
+    use std::{ffi::CString, os::fd::AsRawFd};
+
+    let Some(interface) = interface.filter(|name| !name.trim().is_empty()) else {
+        return Ok(());
+    };
+    let name = CString::new(interface).map_err(|_| {
+        std_io::Error::new(std_io::ErrorKind::InvalidInput, "interface contains NUL")
+    })?;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr().cast(),
+            name.as_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std_io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_socket_to_interface(_socket: &Socket, interface: Option<&str>) -> std_io::Result<()> {
+    if interface.is_some() {
+        return Err(std_io::Error::new(
+            std_io::ErrorKind::Unsupported,
+            "SO_BINDTODEVICE is Linux-only",
+        ));
+    }
+    Ok(())
+}
+
 pub struct ActiveRtpRelay {
     stop: watch::Sender<bool>,
     first_operator_rtp: watch::Receiver<bool>,
@@ -468,6 +567,8 @@ async fn run_async_relay(
 ) -> std_io::Result<()> {
     let mut operator_buf = vec![0u8; 65_535];
     let mut internal_buf = vec![0u8; 65_535];
+    let mut operator_send_failed = false;
+    let mut internal_send_failed = false;
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -477,8 +578,7 @@ async fn run_async_relay(
             }
             received = operator_socket.recv_from(&mut operator_buf) => {
                 let (len, source) = received?;
-                if matches!(
-                    forward_async(
+                match forward_async(
                     &mut core,
                     RelayLeg::Operator,
                     source,
@@ -486,19 +586,30 @@ async fn run_async_relay(
                     &internal_socket,
                     policy.allows_rtp_from(RelayLeg::Operator),
                 )
-                .await,
-                    Some(MediaDatagramKind::Rtp)
-                ) {
-                    if let Some(metrics) = metrics.as_ref() {
-                        metrics.record_rtp_to_asterisk(len);
+                .await {
+                    Ok(Some(MediaDatagramKind::Rtp)) => {
+                        internal_send_failed = false;
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_rtp_to_asterisk(len);
+                        }
+                        let _ = first_operator_rtp.send(true);
                     }
-                    let _ = first_operator_rtp.send(true);
+                    Ok(_) => internal_send_failed = false,
+                    Err(error) => {
+                        if !internal_send_failed {
+                            tracing::warn!(
+                                from_leg = RelayLeg::Operator.as_str(),
+                                %error,
+                                "IMS media relay UDP send failed"
+                            );
+                        }
+                        internal_send_failed = true;
+                    }
                 }
             }
             received = internal_socket.recv_from(&mut internal_buf) => {
                 let (len, source) = received?;
-                if matches!(
-                    forward_async(
+                match forward_async(
                     &mut core,
                     RelayLeg::Internal,
                     source,
@@ -506,11 +617,23 @@ async fn run_async_relay(
                     &operator_socket,
                     policy.allows_rtp_from(RelayLeg::Internal),
                 )
-                .await,
-                    Some(MediaDatagramKind::Rtp)
-                ) {
-                    if let Some(metrics) = metrics.as_ref() {
-                        metrics.record_rtp_from_asterisk(len);
+                .await {
+                    Ok(Some(MediaDatagramKind::Rtp)) => {
+                        operator_send_failed = false;
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_rtp_from_asterisk(len);
+                        }
+                    }
+                    Ok(_) => operator_send_failed = false,
+                    Err(error) => {
+                        if !operator_send_failed {
+                            tracing::warn!(
+                                from_leg = RelayLeg::Internal.as_str(),
+                                %error,
+                                "IMS media relay UDP send failed"
+                            );
+                        }
+                        operator_send_failed = true;
                     }
                 }
             }
@@ -525,25 +648,25 @@ async fn forward_async(
     datagram: &[u8],
     send_socket: &UdpSocket,
     allow_rtp: bool,
-) -> Option<MediaDatagramKind> {
+) -> std_io::Result<Option<MediaDatagramKind>> {
     let Ok(decision) = core.ingest(leg, source, datagram) else {
-        return None;
+        return Ok(None);
     };
     if decision.kind == MediaDatagramKind::Rtp && !allow_rtp {
-        return None;
+        return Ok(None);
     }
     if decision.kind == MediaDatagramKind::Rtp {
         if let Some(payload_type) = decision.rewrite_payload_type {
             if let Some(rewritten) = rewrite_rtp_payload_type(datagram, payload_type) {
-                let _ = send_socket.send_to(&rewritten, decision.dest).await;
+                send_socket.send_to(&rewritten, decision.dest).await?;
             }
         } else {
-            let _ = send_socket.send_to(datagram, decision.dest).await;
+            send_socket.send_to(datagram, decision.dest).await?;
         }
     } else {
-        let _ = send_socket.send_to(datagram, decision.dest).await;
+        send_socket.send_to(datagram, decision.dest).await?;
     }
-    Some(decision.kind)
+    Ok(Some(decision.kind))
 }
 
 #[cfg(test)]

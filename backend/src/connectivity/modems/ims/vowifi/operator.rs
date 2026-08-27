@@ -20,8 +20,12 @@ use crate::{
         core::{
             access::ImsChannel,
             context::{ImsIdentity, ImsRoute},
+            ims_failure::ImsFailureDiagnostic,
             ims_video::{negotiate_video, parse_video_sdp},
-            media::{ActiveRtpRelay, MediaRelayPolicy, PayloadTypeMapping, PendingRtpRelay},
+            media::{
+                ActiveRtpRelay, MediaRelayPolicy, OperatorSocketCreator, PayloadTypeMapping,
+                PendingRtpRelay,
+            },
             register::{run_unregister, RegisterAuthenticator},
             registration::{ImsRegistrationAccess, RegisteredImsContext, UnregisterResult},
             sip_frame,
@@ -44,6 +48,7 @@ use crate::{
             },
             operator::OperatorLink,
         },
+        ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle},
     },
 };
 
@@ -117,6 +122,73 @@ pub struct RegisteredVoiceContext {
     pub tcp_keepalive_interval: Option<Duration>,
     pub options_ping_interval: Option<Duration>,
     pub(crate) unregister: Option<Arc<dyn RegisteredUnregister>>,
+    pub(crate) media_route_installer: Option<Arc<dyn MediaRouteInstaller>>,
+    /// Per-line ePDG TUN carrying operator SIP/RTP. Keeping the interface in
+    /// the registered context lets media sockets remain distinguishable even
+    /// when two tunnels receive the same inner IMS address.
+    pub(crate) media_interface: Option<String>,
+    /// Worker-backed socket factory used when the line's VoWiFi TUN lives in
+    /// its own UE network namespace. `None` keeps the host-namespace socket
+    /// creation path (Linux `SO_BINDTODEVICE` on the host TUN).
+    pub(crate) media_operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+}
+
+pub(crate) trait MediaRouteInstaller: Send + Sync {
+    fn ensure_media_route(&self, remote: IpAddr) -> Result<(), String>;
+}
+
+/// Creates operator-facing RTP sockets inside the line's UE namespace through
+/// the UE worker. The worker handle is kept alive by the relay that stores the
+/// creator, so an active call never drops the namespace-owned fd.
+pub(crate) struct UeWorkerOperatorSocketCreator {
+    worker: UeWorkerHandle,
+}
+
+impl UeWorkerOperatorSocketCreator {
+    pub(crate) fn new(worker: UeWorkerHandle) -> Self {
+        Self { worker }
+    }
+}
+
+impl OperatorSocketCreator for UeWorkerOperatorSocketCreator {
+    fn create_udp<'a>(
+        &'a self,
+        local: SocketAddr,
+        bind_to_device: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<tokio::net::UdpSocket>> + Send + 'a>,
+    > {
+        let spec = UeSocketSpec::udp_bound(local, bind_to_device.map(str::to_string));
+        Box::pin(async move {
+            match self.worker.create_socket(spec).await {
+                Ok(UeSocket::Udp(socket)) => Ok(socket),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "UE worker returned a non-UDP socket for RTP",
+                )),
+                Err(error) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    error.to_string(),
+                )),
+            }
+        })
+    }
+}
+
+/// Bind one RTP relay using the session context's opted-in UE socket factory.
+async fn bind_operator_relay(
+    context: &RegisteredVoiceContext,
+    trunk_local_ip: IpAddr,
+    failure_label: &str,
+) -> Result<PendingRtpRelay, String> {
+    PendingRtpRelay::bind_with_operator_source(
+        context.route.local_addr.ip(),
+        trunk_local_ip,
+        context.media_interface.as_deref(),
+        context.media_operator_creator.clone(),
+    )
+    .await
+    .map_err(|error| format!("{failure_label}:{error}"))
 }
 
 pub(crate) trait RegisteredUnregister: Send + Sync {
@@ -677,13 +749,14 @@ async fn expire_renegotiations(
         }
     }
     for (request, local_tag) in network_timeouts {
-        let response = sip::build_response(
+        let response = sip::build_response_for_access(
             &request,
             504,
             "Server Time-out",
             Some(&local_tag),
             None,
             None,
+            &session.context.user_agent,
         );
         session
             .channel
@@ -695,6 +768,7 @@ async fn expire_renegotiations(
         link.send_event(OperatorEvent::Rejected {
             call_id,
             status: 408,
+            diagnostic: ImsFailureDiagnostic::from_status(408),
         });
     }
     for call_id in transfer_timeouts {
@@ -711,6 +785,7 @@ async fn handle_command(session: &mut VoiceSession, link: &OperatorLink, command
     let start = matches!(&command, OperatorCommand::StartCall { .. });
     let renegotiate = matches!(&command, OperatorCommand::Renegotiate { .. });
     let transfer = matches!(&command, OperatorCommand::TransferCall { .. });
+    let connected = matches!(&command, OperatorCommand::AcceptCall { .. });
     if let Err(reason) = handle_command_inner(session, link, command).await {
         tracing::warn!(call_id, reason, "VoWiFi operator command failed");
         if start {
@@ -719,6 +794,7 @@ async fn handle_command(session: &mut VoiceSession, link: &OperatorLink, command
                 link.send_event(OperatorEvent::Rejected {
                     call_id,
                     status: 486,
+                    diagnostic: ImsFailureDiagnostic::from_status(486),
                 });
             } else {
                 link.send_event(OperatorEvent::Unavailable { call_id });
@@ -732,6 +808,7 @@ async fn handle_command(session: &mut VoiceSession, link: &OperatorLink, command
             link.send_event(OperatorEvent::Rejected {
                 call_id,
                 status: 488,
+                diagnostic: ImsFailureDiagnostic::from_status(488),
             });
         } else if transfer {
             let status = if reason.ends_with("_pending") {
@@ -743,6 +820,8 @@ async fn handle_command(session: &mut VoiceSession, link: &OperatorLink, command
             };
             link.send_event(OperatorEvent::TransferResponse { call_id, status });
         }
+    } else if connected {
+        link.send_event(OperatorEvent::Connected { call_id });
     }
 }
 
@@ -770,9 +849,8 @@ async fn handle_command_inner(
             }
             let remote_uri = normalize_callee(&callee, &session.context.identity.home_domain)?;
             let pending =
-                PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-                    .await
-                    .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+                bind_operator_relay(&session.context, trunk_local_ip, "vowifi_rtp_bind_failed")
+                    .await?;
             let operator_local = pending
                 .operator_local_addr()
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -781,10 +859,12 @@ async fn handle_command_inner(
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay =
-                    PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-                        .await
-                        .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+                let relay = bind_operator_relay(
+                    &session.context,
+                    trunk_local_ip,
+                    "vowifi_video_rtp_bind_failed",
+                )
+                .await?;
                 let operator_local = relay
                     .operator_local_addr()
                     .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -843,13 +923,14 @@ async fn handle_command_inner(
                 .calls
                 .remove(&call_id)
                 .ok_or_else(|| "vowifi_call_unknown".to_string())?;
-            sip::build_cancel(
+            sip::build_cancel_for_access(
                 &session.context.identity,
                 &session.context.route,
                 session.context.registration.service_route.as_deref(),
                 &call.dialog,
                 &call.remote_uri,
                 &call.invite_branch,
+                &session.context.user_agent,
             )
         }
         OperatorCommand::HangupCall { call_id } => {
@@ -858,22 +939,24 @@ async fn handle_command_inner(
                 .remove(&call_id)
                 .ok_or_else(|| "vowifi_call_unknown".to_string())?;
             if call.dialog.remote_tag.is_some() {
-                sip::build_bye(
+                sip::build_bye_for_access(
                     &session.context.identity,
                     &session.context.route,
                     session.context.registration.service_route.as_deref(),
                     &call.dialog,
                     &call.remote_uri,
                     call.next_cseq,
+                    &session.context.user_agent,
                 )
             } else {
-                sip::build_cancel(
+                sip::build_cancel_for_access(
                     &session.context.identity,
                     &session.context.route,
                     session.context.registration.service_route.as_deref(),
                     &call.dialog,
                     &call.remote_uri,
                     &call.invite_branch,
+                    &session.context.user_agent,
                 )
             }
         }
@@ -960,9 +1043,8 @@ async fn handle_command_inner(
                 return Err("vowifi_video_feature_disabled".into());
             }
             let pending =
-                PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-                    .await
-                    .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+                bind_operator_relay(&session.context, trunk_local_ip, "vowifi_rtp_bind_failed")
+                    .await?;
             let operator_local = pending
                 .operator_local_addr()
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -971,10 +1053,12 @@ async fn handle_command_inner(
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay =
-                    PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-                        .await
-                        .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+                let relay = bind_operator_relay(
+                    &session.context,
+                    trunk_local_ip,
+                    "vowifi_video_rtp_bind_failed",
+                )
+                .await?;
                 let operator_local = relay
                     .operator_local_addr()
                     .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -1032,7 +1116,7 @@ async fn handle_command_inner(
                 .initial_invite
                 .as_deref()
                 .ok_or_else(|| "vowifi_incoming_invite_missing".to_string())?;
-            sip::build_response(
+            sip::build_response_for_access(
                 request,
                 200,
                 "OK",
@@ -1042,6 +1126,7 @@ async fn handle_command_inner(
                     &session.context.route,
                 )),
                 Some(answer.as_bytes()),
+                &session.context.user_agent,
             )
         }
         OperatorCommand::RejectCall { call_id, status } => {
@@ -1053,13 +1138,14 @@ async fn handle_command_inner(
                 .initial_invite
                 .as_deref()
                 .ok_or_else(|| "vowifi_incoming_invite_missing".to_string())?;
-            sip::build_response(
+            sip::build_response_for_access(
                 request,
                 status,
                 sip_reason(status),
                 Some(&call.dialog.local_tag),
                 None,
                 None,
+                &session.context.user_agent,
             )
         }
         OperatorCommand::ReportProvisional {
@@ -1079,7 +1165,7 @@ async fn handle_command_inner(
                 .initial_invite
                 .as_deref()
                 .ok_or_else(|| "vowifi_incoming_invite_missing".to_string())?;
-            sip::build_response(
+            sip::build_response_for_access(
                 request,
                 status,
                 sip_reason(status),
@@ -1089,6 +1175,7 @@ async fn handle_command_inner(
                     &session.context.route,
                 )),
                 answer.as_deref().map(str::as_bytes),
+                &session.context.user_agent,
             )
         }
         OperatorCommand::AcceptRenegotiation { call_id, body } => {
@@ -1103,7 +1190,7 @@ async fn handle_command_inner(
                 .ok_or_else(|| "vowifi_network_reinvite_missing".to_string())?;
             call.renegotiation_deadline = None;
             call.commit_media_update();
-            sip::build_response(
+            sip::build_response_for_access(
                 &request,
                 200,
                 "OK",
@@ -1113,6 +1200,7 @@ async fn handle_command_inner(
                     &session.context.route,
                 )),
                 Some(answer.as_bytes()),
+                &session.context.user_agent,
             )
         }
         OperatorCommand::RejectRenegotiation { call_id, status } => {
@@ -1126,13 +1214,14 @@ async fn handle_command_inner(
                 .ok_or_else(|| "vowifi_network_reinvite_missing".to_string())?;
             call.rollback_media_update();
             call.renegotiation_deadline = None;
-            sip::build_response(
+            sip::build_response_for_access(
                 &request,
                 status,
                 sip_reason(status),
                 Some(&call.dialog.local_tag),
                 None,
                 None,
+                &session.context.user_agent,
             )
         }
     };
@@ -1163,7 +1252,15 @@ async fn handle_frame(
             } else {
                 "Call/Transaction Does Not Exist"
             };
-            let response = sip::build_response(frame, response_status, reason, None, None, None);
+            let response = sip::build_response_for_access(
+                frame,
+                response_status,
+                reason,
+                None,
+                None,
+                None,
+                &session.context.user_agent,
+            );
             session
                 .channel
                 .send_sip(&response)
@@ -1238,13 +1335,14 @@ async fn handle_frame(
         })
     {
         let Some(call_id) = trunk_call_id else {
-            let response = sip::build_response(
+            let response = sip::build_response_for_access(
                 frame,
                 481,
                 "Call/Transaction Does Not Exist",
                 None,
                 None,
                 None,
+                &session.context.user_agent,
             );
             session
                 .channel
@@ -1268,7 +1366,15 @@ async fn handle_frame(
         } else {
             (481, "Call/Transaction Does Not Exist")
         };
-        let response = sip::build_response(frame, status, reason, None, None, None);
+        let response = sip::build_response_for_access(
+            frame,
+            status,
+            reason,
+            None,
+            None,
+            None,
+            &session.context.user_agent,
+        );
         session
             .channel
             .send_sip(&response)
@@ -1284,7 +1390,15 @@ async fn handle_frame(
     }
 
     if sip_frame::is_request(frame, "OPTIONS") {
-        let response = sip::build_response(frame, 200, "OK", None, None, None);
+        let response = sip::build_response_for_access(
+            frame,
+            200,
+            "OK",
+            None,
+            None,
+            None,
+            &session.context.user_agent,
+        );
         session
             .channel
             .send_sip(&response)
@@ -1294,7 +1408,15 @@ async fn handle_frame(
     }
 
     if sip_frame::is_request(frame, "MESSAGE") {
-        let response = sip::build_response(frame, 200, "OK", None, None, None);
+        let response = sip::build_response_for_access(
+            frame,
+            200,
+            "OK",
+            None,
+            None,
+            None,
+            &session.context.user_agent,
+        );
         session
             .channel
             .send_sip(&response)
@@ -1350,7 +1472,23 @@ async fn handle_frame(
     }
     if let Some(call_id) = trunk_call_id {
         if sip_frame::is_request(frame, "BYE") {
-            let response = sip::build_response(frame, 200, "OK", None, None, None);
+            let call = session.calls.get(&call_id);
+            tracing::info!(
+                ims_call_id = %ims_call_id,
+                trunk_call_id = %call_id,
+                network_reinvite_pending = call.is_some_and(|call| call.pending_network_reinvite.is_some()),
+                trunk_reinvite_pending = call.is_some_and(|call| call.pending_trunk_reinvite),
+                "Received operator BYE for VoWiFi call"
+            );
+            let response = sip::build_response_for_access(
+                frame,
+                200,
+                "OK",
+                None,
+                None,
+                None,
+                &session.context.user_agent,
+            );
             session
                 .channel
                 .send_sip(&response)
@@ -1361,7 +1499,15 @@ async fn handle_frame(
             return Ok(());
         }
         if sip_frame::is_request(frame, "CANCEL") {
-            let ok = sip::build_response(frame, 200, "OK", None, None, None);
+            let ok = sip::build_response_for_access(
+                frame,
+                200,
+                "OK",
+                None,
+                None,
+                None,
+                &session.context.user_agent,
+            );
             session
                 .channel
                 .send_sip(&ok)
@@ -1369,13 +1515,14 @@ async fn handle_frame(
                 .map_err(|error| error.code().to_string())?;
             if let Some(call) = session.calls.remove(&call_id) {
                 if let Some(invite) = call.initial_invite.as_deref() {
-                    let terminated = sip::build_response(
+                    let terminated = sip::build_response_for_access(
                         invite,
                         487,
                         "Request Terminated",
                         Some(&call.dialog.local_tag),
                         None,
                         None,
+                        &session.context.user_agent,
                     );
                     session
                         .channel
@@ -1388,7 +1535,15 @@ async fn handle_frame(
             return Ok(());
         }
         if sip_frame::is_request(frame, "INFO") {
-            let response = sip::build_response(frame, 200, "OK", None, None, None);
+            let response = sip::build_response_for_access(
+                frame,
+                200,
+                "OK",
+                None,
+                None,
+                None,
+                &session.context.user_agent,
+            );
             session
                 .channel
                 .send_sip(&response)
@@ -1490,6 +1645,7 @@ async fn handle_response(
     if !cseq_method.eq_ignore_ascii_case("INVITE") {
         return Ok(());
     }
+    let media_route_installer = session.context.media_route_installer.clone();
     let call = session
         .calls
         .get_mut(call_id)
@@ -1499,7 +1655,14 @@ async fn handle_response(
     }
     if (100..200).contains(&status) {
         let body = (!sip_frame::body(frame).is_empty())
-            .then(|| prepare_operator_media(call, sip_frame::body(frame), link))
+            .then(|| {
+                prepare_operator_media(
+                    call,
+                    sip_frame::body(frame),
+                    link,
+                    media_route_installer.as_deref(),
+                )
+            })
             .transpose()?;
         if sip_frame::header_value(frame, "Require").is_some_and(|value| {
             value
@@ -1511,7 +1674,7 @@ async fn handle_response(
             {
                 let cseq = call.next_cseq;
                 call.next_cseq = call.next_cseq.saturating_add(1);
-                let prack = sip::build_prack(
+                let prack = sip::build_prack_for_access(
                     &session.context.identity,
                     &session.context.route,
                     session.context.registration.service_route.as_deref(),
@@ -1520,6 +1683,7 @@ async fn handle_response(
                     cseq,
                     rseq,
                     call.dialog.cseq,
+                    &session.context.user_agent,
                 );
                 session
                     .channel
@@ -1536,13 +1700,19 @@ async fn handle_response(
         return Ok(());
     }
     if (200..300).contains(&status) {
-        let answer = prepare_operator_media(call, sip_frame::body(frame), link)?;
-        let ack = sip::build_ack(
+        let answer = prepare_operator_media(
+            call,
+            sip_frame::body(frame),
+            link,
+            media_route_installer.as_deref(),
+        )?;
+        let ack = sip::build_ack_for_access(
             &session.context.identity,
             &session.context.route,
             session.context.registration.service_route.as_deref(),
             &call.dialog,
             &call.remote_uri,
+            &session.context.user_agent,
         );
         session
             .channel
@@ -1582,9 +1752,21 @@ async fn handle_response(
     call.pending_trunk_reinvite = false;
     call.renegotiation_deadline = None;
     call.rollback_media_update();
+    let reason = sip_frame::header_value(frame, "Reason").unwrap_or_default();
+    let warning = sip_frame::header_value(frame, "Warning").unwrap_or_default();
+    tracing::warn!(
+        line_id = session.context.line_id,
+        call_id,
+        status,
+        reason,
+        warning,
+        "VoWiFi IMS voice INVITE rejected"
+    );
     link.send_event(OperatorEvent::Rejected {
         call_id: call_id.to_string(),
         status,
+        diagnostic: ImsFailureDiagnostic::from_response(frame)
+            .unwrap_or_else(|_| ImsFailureDiagnostic::from_status(status)),
     });
     if !was_reinvite {
         session.calls.remove(call_id);
@@ -1610,6 +1792,10 @@ async fn begin_incoming_call(
     let operator_audio =
         parse_audio_sdp(sip_frame::body(frame)).map_err(|error| error.to_string())?;
     let operator_remote = media_endpoint(&operator_audio)?;
+    ensure_media_route(
+        session.context.media_route_installer.as_deref(),
+        operator_remote,
+    )?;
     let operator_video = parse_video_sdp(sip_frame::body(frame))
         .ok()
         .and_then(|description| {
@@ -1620,13 +1806,18 @@ async fn begin_incoming_call(
                     endpoint,
                 })
         });
+    if let Some(video) = operator_video.as_ref() {
+        ensure_media_route(
+            session.context.media_route_installer.as_deref(),
+            video.endpoint,
+        )?;
+    }
     if operator_video.is_some() && !link.video_enabled() {
         return reject_request(session, frame, 488).await;
     }
     let operator_dtmf = parse_rtp_telephone_event(sip_frame::body(frame));
-    let pending = PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-        .await
-        .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+    let pending =
+        bind_operator_relay(&session.context, trunk_local_ip, "vowifi_rtp_bind_failed").await?;
     let operator_local = pending
         .operator_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -1634,9 +1825,12 @@ async fn begin_incoming_call(
         .internal_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-            .await
-            .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+        let relay = bind_operator_relay(
+            &session.context,
+            trunk_local_ip,
+            "vowifi_video_rtp_bind_failed",
+        )
+        .await?;
         let operator_local = relay
             .operator_local_addr()
             .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -1681,7 +1875,15 @@ async fn begin_incoming_call(
         remote_tag: Some(remote_tag),
         cseq: invite_cseq,
     };
-    let trying = sip::build_response(frame, 100, "Trying", Some(&dialog.local_tag), None, None);
+    let trying = sip::build_response_for_access(
+        frame,
+        100,
+        "Trying",
+        Some(&dialog.local_tag),
+        None,
+        None,
+        &session.context.user_agent,
+    );
     session
         .channel
         .send_sip(&trying)
@@ -1690,7 +1892,7 @@ async fn begin_incoming_call(
     let operator_answered = link.incoming_mode() == TrunkIncomingMode::BoundImmediate;
     if operator_answered {
         let answer = relay_media_sdp(&offer, operator_local, operator_video_local);
-        let accepted = sip::build_response(
+        let accepted = sip::build_response_for_access(
             frame,
             200,
             "OK",
@@ -1700,6 +1902,7 @@ async fn begin_incoming_call(
                 &session.context.route,
             )),
             Some(answer.as_bytes()),
+            &session.context.user_agent,
         );
         session
             .channel
@@ -1762,6 +1965,10 @@ async fn begin_network_reinvite(
     let operator_audio =
         parse_audio_sdp(sip_frame::body(frame)).map_err(|error| error.to_string())?;
     let operator_remote = media_endpoint(&operator_audio)?;
+    ensure_media_route(
+        session.context.media_route_installer.as_deref(),
+        operator_remote,
+    )?;
     let operator_video = parse_video_sdp(sip_frame::body(frame))
         .ok()
         .and_then(|description| {
@@ -1772,13 +1979,18 @@ async fn begin_network_reinvite(
                     endpoint,
                 })
         });
+    if let Some(video) = operator_video.as_ref() {
+        ensure_media_route(
+            session.context.media_route_installer.as_deref(),
+            video.endpoint,
+        )?;
+    }
     if operator_video.is_some() && !link.video_enabled() {
         return reject_request(session, frame, 488).await;
     }
     let operator_dtmf = parse_rtp_telephone_event(sip_frame::body(frame));
-    let pending = PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-        .await
-        .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+    let pending =
+        bind_operator_relay(&session.context, trunk_local_ip, "vowifi_rtp_bind_failed").await?;
     let operator_local = pending
         .operator_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -1786,9 +1998,12 @@ async fn begin_network_reinvite(
         .internal_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-            .await
-            .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+        let relay = bind_operator_relay(
+            &session.context,
+            trunk_local_ip,
+            "vowifi_video_rtp_bind_failed",
+        )
+        .await?;
         let operator_local = relay
             .operator_local_addr()
             .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -1825,13 +2040,14 @@ async fn begin_network_reinvite(
     );
     call.pending_network_reinvite = Some(frame.to_vec());
     call.renegotiation_deadline = Some(Instant::now() + REINVITE_TIMEOUT);
-    let trying = sip::build_response(
+    let trying = sip::build_response_for_access(
         frame,
         100,
         "Trying",
         Some(&call.dialog.local_tag),
         None,
         None,
+        &session.context.user_agent,
     );
     session
         .channel
@@ -1850,7 +2066,15 @@ async fn reject_request(
     frame: &[u8],
     status: u16,
 ) -> Result<(), String> {
-    let response = sip::build_response(frame, status, sip_reason(status), None, None, None);
+    let response = sip::build_response_for_access(
+        frame,
+        status,
+        sip_reason(status),
+        None,
+        None,
+        None,
+        &session.context.user_agent,
+    );
     session
         .channel
         .send_sip(&response)
@@ -1862,9 +2086,11 @@ fn prepare_operator_media(
     call: &mut VoiceCall,
     body: &[u8],
     link: &OperatorLink,
+    media_route_installer: Option<&dyn MediaRouteInstaller>,
 ) -> Result<String, String> {
     let operator_audio = parse_audio_sdp(body).map_err(|error| error.to_string())?;
     let operator_remote = media_endpoint(&operator_audio)?;
+    ensure_media_route(media_route_installer, operator_remote)?;
     let mut internal_answer = operator_audio.clone();
     internal_answer.direction = operator_audio.direction.for_peer();
     internal_answer.codecs = operator_audio
@@ -1911,41 +2137,64 @@ fn prepare_operator_media(
         call.operator_video_local,
         call.internal_video_local,
     ) {
-        negotiate_video(&internal_video.description, &operator_video)
-            .map_err(|error| format!("vowifi_video_negotiation_failed:{error}"))?;
-        let operator_remote = media_endpoint_for_video(&operator_audio, &operator_video)?;
-        if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
-            let pending = call
-                .pending_video_relay
-                .take()
-                .ok_or_else(|| "vowifi_video_rtp_relay_missing".to_string())?;
-            let mappings = (operator_video.payload_type != internal_video.description.payload_type)
-                .then_some(PayloadTypeMapping {
-                    operator: operator_video.payload_type,
-                    internal: internal_video.description.payload_type,
-                });
-            call.active_video_relay = Some(pending.activate_with_metrics(
-                operator_remote,
-                internal_video.endpoint,
-                mappings,
-                Some(link.media_metrics()),
-            ));
-        }
-        let mut trunk_video = operator_video;
-        trunk_video.direction = trunk_video.direction.for_peer();
-        trunk_video.media_port = internal_local.port();
-        trunk_video.connection_addr = Some(internal_local.ip().to_string());
-        trunk_video.addr_type = Some(if internal_local.is_ipv4() {
-            SdpAddrType::Ip4
+        if operator_video.is_rejected() {
+            call.pending_video_relay = None;
+            call.active_video_relay = None;
+            answer.push_str(&internal_video.description.rejected_answer().media_lines());
         } else {
-            SdpAddrType::Ip6
-        });
-        answer.push_str(&trunk_video.media_lines());
+            negotiate_video(&internal_video.description, &operator_video)
+                .map_err(|error| format!("vowifi_video_negotiation_failed:{error}"))?;
+            let operator_remote = media_endpoint_for_video(&operator_audio, &operator_video)?;
+            ensure_media_route(media_route_installer, operator_remote)?;
+            if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
+                let pending = call
+                    .pending_video_relay
+                    .take()
+                    .ok_or_else(|| "vowifi_video_rtp_relay_missing".to_string())?;
+                let mappings = (operator_video.payload_type
+                    != internal_video.description.payload_type)
+                    .then_some(PayloadTypeMapping {
+                        operator: operator_video.payload_type,
+                        internal: internal_video.description.payload_type,
+                    });
+                call.active_video_relay = Some(pending.activate_with_metrics(
+                    operator_remote,
+                    internal_video.endpoint,
+                    mappings,
+                    Some(link.media_metrics()),
+                ));
+            }
+            let mut trunk_video = operator_video;
+            trunk_video.direction = trunk_video.direction.for_peer();
+            trunk_video.media_port = internal_local.port();
+            trunk_video.connection_addr = Some(internal_local.ip().to_string());
+            trunk_video.addr_type = Some(if internal_local.is_ipv4() {
+                SdpAddrType::Ip4
+            } else {
+                SdpAddrType::Ip6
+            });
+            answer.push_str(&trunk_video.media_lines());
+        }
     } else {
         call.pending_video_relay = None;
         call.active_video_relay = None;
+        if let Some(internal_video) = call.internal_offer.video.as_ref() {
+            answer.push_str(&internal_video.description.rejected_answer().media_lines());
+        }
     }
     Ok(answer)
+}
+
+fn ensure_media_route(
+    installer: Option<&dyn MediaRouteInstaller>,
+    endpoint: SocketAddr,
+) -> Result<(), String> {
+    let Some(installer) = installer else {
+        return Ok(());
+    };
+    installer
+        .ensure_media_route(endpoint.ip())
+        .map_err(|reason| format!("vowifi_media_route_failed:{reason}"))
 }
 
 fn prepare_incoming_media(
@@ -1993,39 +2242,49 @@ fn prepare_incoming_media(
         parse_video_sdp(body),
         call.operator_video_local,
     ) {
-        negotiate_video(&operator_video.description, &internal_video)
-            .map_err(|error| format!("vowifi_video_negotiation_failed:{error}"))?;
-        let internal_remote = media_endpoint_for_video(&internal_audio, &internal_video)?;
-        if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
-            let pending = call
-                .pending_video_relay
-                .take()
-                .ok_or_else(|| "vowifi_video_rtp_relay_missing".to_string())?;
-            let mappings = (operator_video.description.payload_type != internal_video.payload_type)
-                .then_some(PayloadTypeMapping {
-                    operator: operator_video.description.payload_type,
-                    internal: internal_video.payload_type,
-                });
-            call.active_video_relay = Some(pending.activate_with_metrics(
-                operator_video.endpoint,
-                internal_remote,
-                mappings,
-                Some(link.media_metrics()),
-            ));
-        }
-        let mut ims_video = operator_video.description.clone();
-        ims_video.direction = internal_video.direction.for_peer();
-        ims_video.media_port = operator_local.port();
-        ims_video.connection_addr = Some(operator_local.ip().to_string());
-        ims_video.addr_type = Some(if operator_local.is_ipv4() {
-            SdpAddrType::Ip4
+        if internal_video.is_rejected() {
+            call.pending_video_relay = None;
+            call.active_video_relay = None;
+            answer.push_str(&operator_video.description.rejected_answer().media_lines());
         } else {
-            SdpAddrType::Ip6
-        });
-        answer.push_str(&ims_video.media_lines());
+            negotiate_video(&operator_video.description, &internal_video)
+                .map_err(|error| format!("vowifi_video_negotiation_failed:{error}"))?;
+            let internal_remote = media_endpoint_for_video(&internal_audio, &internal_video)?;
+            if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
+                let pending = call
+                    .pending_video_relay
+                    .take()
+                    .ok_or_else(|| "vowifi_video_rtp_relay_missing".to_string())?;
+                let mappings = (operator_video.description.payload_type
+                    != internal_video.payload_type)
+                    .then_some(PayloadTypeMapping {
+                        operator: operator_video.description.payload_type,
+                        internal: internal_video.payload_type,
+                    });
+                call.active_video_relay = Some(pending.activate_with_metrics(
+                    operator_video.endpoint,
+                    internal_remote,
+                    mappings,
+                    Some(link.media_metrics()),
+                ));
+            }
+            let mut ims_video = operator_video.description.clone();
+            ims_video.direction = internal_video.direction.for_peer();
+            ims_video.media_port = operator_local.port();
+            ims_video.connection_addr = Some(operator_local.ip().to_string());
+            ims_video.addr_type = Some(if operator_local.is_ipv4() {
+                SdpAddrType::Ip4
+            } else {
+                SdpAddrType::Ip6
+            });
+            answer.push_str(&ims_video.media_lines());
+        }
     } else {
         call.pending_video_relay = None;
         call.active_video_relay = None;
+        if let Some(operator_video) = call.internal_offer.video.as_ref() {
+            answer.push_str(&operator_video.description.rejected_answer().media_lines());
+        }
     }
     Ok(answer)
 }
@@ -2363,6 +2622,18 @@ mod tests {
 
     struct TestUnregister;
 
+    #[derive(Default)]
+    struct RecordingMediaRouteInstaller {
+        remotes: std::sync::Mutex<Vec<IpAddr>>,
+    }
+
+    impl MediaRouteInstaller for RecordingMediaRouteInstaller {
+        fn ensure_media_route(&self, remote: IpAddr) -> Result<(), String> {
+            self.remotes.lock().unwrap().push(remote);
+            Ok(())
+        }
+    }
+
     impl RegisteredUnregister for TestUnregister {
         fn initial_request(&self) -> Result<Vec<u8>, crate::connectivity::core::ImsError> {
             Ok(b"REGISTER sip:ims.example SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKunregister-1\r\nFrom: <sip:user@ims.example>;tag=register-tag\r\nTo: <sip:user@ims.example>\r\nCall-ID: register-dialog@simadmin\r\nCSeq: 3 REGISTER\r\nExpires: 0\r\nContent-Length: 0\r\n\r\n".to_vec())
@@ -2458,6 +2729,9 @@ mod tests {
             tcp_keepalive_interval: None,
             options_ping_interval: None,
             unregister: None,
+            media_route_installer: None,
+            media_interface: None,
+            media_operator_creator: None,
         }
     }
 
@@ -2729,6 +3003,10 @@ mod tests {
         assert_eq!(
             sip_frame::header_value(&invite, "Route").as_deref(),
             Some("<sip:service-route.ims.example;lr>")
+        );
+        assert_eq!(
+            sip_frame::header_value(&invite, "Supported").as_deref(),
+            Some("100rel, timer")
         );
         let from_tag = header_tag(&sip_frame::header_value(&invite, "From").unwrap()).unwrap();
         let call_id = sip_frame::header_value(&invite, "Call-ID").unwrap();
@@ -3017,7 +3295,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status: 488 } if call_id == "trunk-call-a"
+            OperatorEvent::Rejected { call_id, status: 488, .. } if call_id == "trunk-call-a"
         ));
 
         link.send_command(OperatorCommand::HangupCall {
@@ -3154,7 +3432,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status: 486 }
+            OperatorEvent::Rejected { call_id, status: 486, .. }
                 if call_id == "matrix-call-b"
         ));
 
@@ -3709,7 +3987,9 @@ mod tests {
         let link = operator_link_for_line(line_id);
         link.set_trunk_local_ip(Some("127.0.0.1".parse().unwrap()));
         let mut events = link.subscribe_events();
-        let route_context = context(line_id, &client, &server);
+        let route_installer = Arc::new(RecordingMediaRouteInstaller::default());
+        let mut route_context = context(line_id, &client, &server);
+        route_context.media_route_installer = Some(route_installer.clone());
         install_registered_channel(
             route_context.clone(),
             SipChannel::Tcp(EpdgSipChannel::new(
@@ -3754,6 +4034,10 @@ mod tests {
             trunk_offer.media_port,
             operator_rtp.local_addr().unwrap().port()
         );
+        assert_eq!(
+            route_installer.remotes.lock().unwrap().as_slice(),
+            &[operator_rtp.local_addr().unwrap().ip()]
+        );
 
         let asterisk_rtp = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         let answer = audio_offer(asterisk_rtp.local_addr().unwrap())
@@ -3768,6 +4052,13 @@ mod tests {
         let accepted = read_frame(&mut server, &mut pending).await;
         assert!(accepted.starts_with(b"SIP/2.0 200 OK"));
         assert!(header_tag(&sip_frame::header_value(&accepted, "To").unwrap()).is_some());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Connected { call_id: connected } if connected == call_id
+        ));
 
         let bye = format!(
             "BYE sip:+601100000001@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKbye\r\nFrom: <sip:+601112023012@ims.example>;tag=remote-in\r\nTo: <sip:+601100000001@ims.example>;tag=local\r\nCall-ID: ims-incoming-a\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n"
@@ -3836,7 +4127,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status }
+            OperatorEvent::Rejected { call_id, status, .. }
                 if call_id == "capacity-call-c" && status == 486
         ));
 

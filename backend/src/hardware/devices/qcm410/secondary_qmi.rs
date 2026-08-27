@@ -71,9 +71,100 @@ const NET_CLASS_DIR: &str = "/sys/class/net";
 pub const SECONDARY_QMI_STATE_FILE: &str = "/run/simadmin/secondary-qmi-device";
 pub const SECONDARY_QMI_ENDPOINTS_STATE_FILE: &str = "/run/simadmin/secondary-qmi-endpoints.json";
 
+/// DATA6 is an optional hardware capability, not a safe default on every
+/// MSM8916 firmware.  In particular, the 410 firmware used by SimAdmin can
+/// crash the modem when the AT-labelled DATA6 channel is force-opened as QMI.
+/// Keep the primary ModemManager QMI path usable unless an operator explicitly
+/// opts in after validating the device firmware.
+pub fn secondary_qmi_enabled() -> bool {
+    std::env::var("SIMADMIN_ENABLE_SECONDARY_QMI")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 /// Timeout for the kernel to publish a port after `bind`.
 const PORT_APPEAR_TIMEOUT: Duration = Duration::from_secs(6);
 const PORT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the primary-port set must stay unchanged before it counts as final.
+/// Long enough for a second baseband attaching a little later to be picked up,
+/// short enough not to delay ModemManager on a single-modem host.
+const PRIMARY_PORT_SETTLE: Duration = Duration::from_secs(2);
+/// Upper bound on waiting for the first primary QMI port to appear. Hosts with
+/// no QMI hardware at all pay this once per boot and then fall through.
+pub const PRIMARY_PORT_WAIT: Duration = Duration::from_secs(45);
+
+/// Where an older install may have left the out-of-tree multi-port module.
+const LEGACY_MODULE_SYSFS: &str = "/sys/module/rpmsg_wwan_ctrl_multi";
+const LEGACY_MODULE_FILES: &[&str] = &[
+    "/opt/simadmin/modules/rpmsg_wwan_ctrl_multi.ko",
+    "/lib/modules/{kver}/extra/simadmin/rpmsg_wwan_ctrl_multi.ko",
+    "/lib/modules/{kver}/extra/rpmsg_wwan_ctrl_multi.ko",
+];
+
+/// Unload and delete the legacy out-of-tree multi-port RPMSG module.
+///
+/// `rpmsg_wwan_ctrl_multi` published one WWAN port per channel in its id_table.
+/// DATA6 now binds through the in-tree `rpmsg_wwan_ctrl` instead, so the module
+/// is redundant — but leaving it installed is not merely untidy. While it stays
+/// loaded it keeps auto-binding *every* matching `DATA*_CNTL` channel on each
+/// boot, and those extra binds land on the modem while it is still bringing up
+/// Data Services Memory. On this MSM8916 firmware that is what takes the DSP
+/// down with `smd_dsm_memcpy.c` a second after mpss starts, which in turn
+/// latches `bam-dmux` runtime PM at `error` and leaves every `wwanN` unusable
+/// for the rest of the boot.
+///
+/// Deliberately runs whether or not DATA6 is enabled: with DATA6 off the module
+/// has no purpose whatsoever, so keeping it loaded is pure risk. Every step is
+/// best-effort — a read-only rootfs or a module built into the kernel must not
+/// stop the rest of initialization.
+pub async fn purge_legacy_rpmsg_module() -> bool {
+    let mut changed = false;
+
+    if Path::new(LEGACY_MODULE_SYSFS).exists() {
+        match Command::new("rmmod")
+            .arg(LEGACY_RPMSG_WWAN_DRIVER)
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {
+                info!(
+                    module = LEGACY_RPMSG_WWAN_DRIVER,
+                    "Unloaded the legacy multi-port RPMSG module"
+                );
+                changed = true;
+            }
+            Ok(status) => debug!(
+                module = LEGACY_RPMSG_WWAN_DRIVER,
+                ?status,
+                "rmmod refused; the module may still be in use"
+            ),
+            Err(error) => debug!(error = %error, "rmmod is unavailable"),
+        }
+    }
+
+    let kver = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    for template in LEGACY_MODULE_FILES {
+        let path = template.replace("{kver}", &kver);
+        if Path::new(&path).exists() && std::fs::remove_file(&path).is_ok() {
+            info!(path = %path, "Removed the legacy multi-port RPMSG module file");
+            changed = true;
+        }
+    }
+
+    if changed && !kver.is_empty() {
+        let _ = Command::new("depmod").arg("-a").arg(&kver).status().await;
+    }
+    changed
+}
+
 /// Timeout for one capability probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -249,6 +340,49 @@ pub fn discover_primary_qmi_ports() -> Vec<String> {
         .into_values()
         .map(|port| format!("/dev/{port}"))
         .collect()
+}
+
+/// Wait for the basebands to publish their primary QMI control ports.
+///
+/// `secondary-qmi-init` is ordered before ModemManager, which puts it well ahead
+/// of the modem: on this hardware the firmware finishes booting and attaches its
+/// wwan ports around 13 s after kernel start, and the rpmsg channels land later
+/// still. Enumerating immediately therefore finds nothing and the whole DATA6
+/// preparation is skipped for the rest of the boot.
+///
+/// `udevadm settle` cannot substitute for this. It waits for the *event queue* to
+/// drain and returns at once when the device does not exist yet, which is exactly
+/// the situation here.
+///
+/// Once a port shows up this keeps polling until the count holds steady for
+/// [`PRIMARY_PORT_SETTLE`]. A host with two modems can attach them seconds apart,
+/// and returning on the first one would silently leave the second baseband
+/// without an IMS endpoint.
+pub async fn wait_for_primary_qmi_ports(timeout: Duration) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut ports = discover_primary_qmi_ports();
+    let mut stable_since = None;
+
+    while tokio::time::Instant::now() < deadline {
+        if !ports.is_empty() {
+            match stable_since {
+                Some(since) if tokio::time::Instant::now().duration_since(since) >= PRIMARY_PORT_SETTLE => {
+                    break;
+                }
+                Some(_) => {}
+                None => stable_since = Some(tokio::time::Instant::now()),
+            }
+        }
+        tokio::time::sleep(PORT_POLL_INTERVAL).await;
+        let latest = discover_primary_qmi_ports();
+        if latest != ports {
+            // Something changed: restart the settle window.
+            stable_since = (!latest.is_empty()).then(tokio::time::Instant::now);
+            ports = latest;
+        }
+    }
+
+    ports
 }
 
 /// Extract the owning `<addr>.remoteproc` component from a resolved sysfs path.
@@ -463,6 +597,11 @@ async fn run_qmicli(args: &[&str]) -> Option<Output> {
 pub async fn ensure_endpoint(
     primary_device: &str,
 ) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
+    if !secondary_qmi_enabled() {
+        return Err(SecondaryQmiError::Unsupported(
+            "DATA6 probing requires SIMADMIN_ENABLE_SECONDARY_QMI=1".to_string(),
+        ));
+    }
     let baseband = baseband_key_for_device(primary_device)?;
     let primary_port = primary_device
         .rsplit('/')
@@ -509,10 +648,27 @@ pub async fn ensure_endpoint(
 pub async fn runtime_endpoint(
     primary_device: &str,
 ) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
+    if !secondary_qmi_enabled() {
+        return Err(SecondaryQmiError::Unsupported(
+            "DATA6 is disabled by default; set SIMADMIN_ENABLE_SECONDARY_QMI=1 after firmware validation".to_string(),
+        ));
+    }
     if let Some(endpoint) = endpoint_from_runtime_state(primary_device)? {
         return Ok(endpoint);
     }
-    ensure_endpoint(primary_device).await
+    Err(SecondaryQmiError::Unsupported(
+        "DATA6 was not prepared by the opt-in secondary-QMI initializer".to_string(),
+    ))
+}
+
+/// Report whether the boot initializer published a valid secondary endpoint
+/// for this exact baseband.  This never binds or probes a channel.
+pub fn runtime_endpoint_available(primary_device: &str) -> bool {
+    secondary_qmi_enabled()
+        && endpoint_from_runtime_state(primary_device)
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 fn endpoint_from_runtime_state(
@@ -765,24 +921,13 @@ async fn prepare_data6_netdev(
             SecondaryQmiError::BindFailed(format!("no DATA6 netdev appeared under {baseband}"))
         })?;
 
-    let output = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        Command::new("ip")
-            .args(["link", "set", netdev.as_str(), "up"])
-            .output(),
-    )
-    .await
-    .map_err(|_| SecondaryQmiError::BindFailed(format!("ip link set {netdev} up timed out")))?
-    .map_err(|error| {
-        SecondaryQmiError::BindFailed(format!("failed to run ip for {netdev}: {error}"))
-    })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(SecondaryQmiError::BindFailed(format!(
-            "ip link set {netdev} up failed ({}): {detail}",
-            output.status.code().unwrap_or(-1)
-        )));
-    }
+    // Binding DATA6 must not issue an administrative OPEN. On MSM8916 the
+    // bam-dmux firmware treats an OPEN without an active WDS session as a
+    // data-plane operation; during remoteproc recovery it can crash in
+    // dhcp_client_mgr/smd_dsm_memcpy and wedge every WWAN netdev. The actual
+    // IMS/data session setup calls qmi_netdev::resolve, which opens only the
+    // selected interface after it has a valid address. Here we only resolve
+    // and retain the netdev identity.
     Ok(netdev)
 }
 
@@ -1465,6 +1610,91 @@ mod tests {
         // A channel held by an unrelated driver must not be stolen.
         assert!(!is_wwan_ctrl_driver("rpmsg_chrdev"));
         assert!(!is_wwan_ctrl_driver("qcom_smd_qrtr"));
+    }
+
+    /// The port wait lives in the binary, but the deadline that can cut it short
+    /// lives in the systemd unit. They are edited in different files, so pin the
+    /// relationship: a `TimeoutStartSec` below the wait means systemd kills the
+    /// initializer mid-probe and DATA6 is skipped for the rest of the boot.
+    #[test]
+    fn the_unit_allows_more_startup_time_than_the_port_wait_needs() {
+        let unit = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../deploy/system/simadmin-secondary-qmi.service"),
+        )
+        .expect("the packaged unit must exist");
+
+        let timeout: u64 = unit
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("TimeoutStartSec="))
+            .expect("the unit must set TimeoutStartSec")
+            .trim()
+            .parse()
+            .expect("TimeoutStartSec must be plain seconds");
+
+        assert!(
+            timeout > PRIMARY_PORT_WAIT.as_secs(),
+            "TimeoutStartSec={timeout}s must exceed the {}s port wait",
+            PRIMARY_PORT_WAIT.as_secs()
+        );
+
+        // No *directive* may name a channel, driver, or port: the whole point of
+        // discovering the layout at runtime is that these differ per platform,
+        // and a hardcoded name once skipped the unit entirely. Comments are
+        // exempt on purpose -- they carry the history of why that is banned.
+        let directives: String = unit
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for forbidden in ["DATA6_CNTL", "wwan0qmi1", "wwan0at2", "rpmsg_wwan_ctrl_multi"] {
+            assert!(
+                !directives.contains(forbidden),
+                "the unit must not hardcode {forbidden}"
+            );
+        }
+        assert!(
+            !directives.contains("ExecCondition="),
+            "an ExecCondition can skip the unit, and with it the legacy-module purge"
+        );
+    }
+
+    /// The settle window exists to catch a second baseband attaching late; it is
+    /// useless if it is not comfortably shorter than the overall wait.
+    #[test]
+    fn the_settle_window_fits_inside_the_port_wait() {
+        assert!(PRIMARY_PORT_SETTLE < PRIMARY_PORT_WAIT);
+        assert!(PORT_POLL_INTERVAL < PRIMARY_PORT_SETTLE);
+    }
+
+    /// The purge has to reach every location an older install could have used,
+    /// because a module left loaded keeps auto-binding spare DATA*_CNTL
+    /// channels at boot and that is what crashes the DSP.
+    #[test]
+    fn legacy_module_purge_covers_every_known_install_location() {
+        let expanded: Vec<String> = LEGACY_MODULE_FILES
+            .iter()
+            .map(|t| t.replace("{kver}", "6.17.0-rc6-lkiuyu-compile+"))
+            .collect();
+
+        // Where beta8 kept it, and where deploy/install.sh puts it.
+        assert!(expanded
+            .iter()
+            .any(|p| p == "/opt/simadmin/modules/rpmsg_wwan_ctrl_multi.ko"));
+        assert!(expanded.iter().any(|p| p
+            == "/lib/modules/6.17.0-rc6-lkiuyu-compile+/extra/simadmin/rpmsg_wwan_ctrl_multi.ko"));
+
+        // Every entry must name the legacy module and no template may be left
+        // unexpanded, or the removal silently misses.
+        for path in &expanded {
+            assert!(path.ends_with("rpmsg_wwan_ctrl_multi.ko"), "{path}");
+            assert!(!path.contains("{kver}"), "{path}");
+        }
+        // The purge must never target the in-tree driver.
+        assert!(!expanded.iter().any(|p| p.contains("rpmsg_wwan_ctrl.ko")));
+        assert_eq!(LEGACY_MODULE_SYSFS, "/sys/module/rpmsg_wwan_ctrl_multi");
     }
 
     #[test]

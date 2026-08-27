@@ -14,6 +14,7 @@
 
 pub mod automation;
 pub mod e911;
+pub mod event_bus;
 pub mod line_registry;
 pub mod messaging;
 pub mod network;
@@ -22,3 +23,6 @@ pub mod orchestrator;
 pub mod supplementary;
 pub mod system;
 pub mod trunk;
+pub mod ue_context;
+pub mod ue_netcfg;
+pub mod ue_worker;

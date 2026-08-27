@@ -37,6 +37,7 @@ use hardware::sim::esim::EsimSupervisor;
 use platform::config::{get_default_config_path, ConfigManager};
 use platform::config_maintenance::{backup_database, export_json, import_json, restore_database};
 use platform::db::Database;
+use services::event_bus::AppEventBus;
 use services::network::device_network::DdnsManager;
 use services::notify::notification::NotificationSender;
 use services::notify::notification_queue::*;
@@ -79,6 +80,83 @@ fn get_default_carrier_catalog_path() -> PathBuf {
         .parent()
         .expect("Failed to get executable directory")
         .join("carrier-bundles.sqlite3")
+}
+
+fn spawn_runtime_event_bridge(app: AppState) {
+    tokio::spawn(async move {
+        use std::collections::{HashMap, VecDeque};
+
+        let mut seen_volte_attempts: HashMap<String, VecDeque<String>> = HashMap::new();
+        let mut trunk_fingerprints: HashMap<String, String> = HashMap::new();
+        let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            for line in app.line_registry.all().await {
+                let line_id = line.binding().line_id;
+                // This poller is one shared task, but everything it publishes in
+                // here describes a single line's UE. Scoping the body attributes
+                // those records to that UE instead of to the poller, which is
+                // what keeps the diagnostic log readable when several cards are
+                // retrying at the same time.
+                services::system::diagnostic_log::with_ue_worker_context(async {
+                    let volte = line.volte.snapshot().await;
+                    let seen = seen_volte_attempts.entry(line_id.clone()).or_default();
+
+                    for attempt in &volte.connection_attempts {
+                        let key = format!("{}:{}", attempt.sequence, attempt.at);
+                        if seen.contains(&key) {
+                            continue;
+                        }
+                        if let Err(error) = app.event_bus.publish(
+                            "volte.connection_attempt",
+                            Some(&line_id),
+                            Some("volte_ims"),
+                            serde_json::json!({ "attempt": attempt }),
+                        ) {
+                            tracing::warn!(line_id, error = %error, "Failed to publish VoLTE connection event");
+                        }
+                        seen.push_back(key);
+                        while seen.len() > 200 {
+                            seen.pop_front();
+                        }
+                    }
+
+                    let trunk = line.trunk.status().await;
+                    let fingerprint = serde_json::json!({
+                        "phase": &trunk.phase,
+                        "stage": &trunk.stage,
+                        "enabled": trunk.enabled,
+                        "registered": trunk.registered,
+                        "last_sip_status": trunk.last_sip_status,
+                        "last_error": &trunk.last_error,
+                        "register_attempts": trunk.register_attempts,
+                        "reconnect_count": trunk.reconnect_count,
+                        "active_calls": trunk.active_calls,
+                        "media_negotiations": trunk.media_negotiations,
+                        "video_negotiations": trunk.video_negotiations,
+                        "dtmf_events": trunk.dtmf_events,
+                    })
+                    .to_string();
+                    let previous = trunk_fingerprints.insert(line_id.clone(), fingerprint.clone());
+                    if previous.as_deref() != Some(&fingerprint)
+                        && (previous.is_some() || trunk.enabled || trunk.phase != "disabled")
+                    {
+                        if let Err(error) = app.event_bus.publish(
+                            "trunk.status_changed",
+                            Some(&line_id),
+                            Some("trunk"),
+                            serde_json::to_value(&trunk).unwrap_or_else(|_| serde_json::json!({})),
+                        ) {
+                            tracing::warn!(line_id, error = %error, "Failed to publish Trunk status event");
+                        }
+                    }
+                })
+                .await;
+            }
+        }
+    });
 }
 
 /// SPA fallback handler - 对于所有前端路由返回 index.html
@@ -186,7 +264,94 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
     }
 }
 
-/// Prepare each baseband's secondary QMI endpoint, and hide every spare QMI port
+/// The udev rules that reserve one prepared endpoint for SimAdmin.
+///
+/// Two devices have to be reserved, not one. The control port (`wwan0at2`,
+/// `wwan0qmi1`, ...) lives in the `wwan` subsystem and is what `qmicli -d`
+/// talks to. Its data interface (`wwan1`, ...) is a *separate* udev device in
+/// the `net` subsystem, and ModemManager tags it `ID_MM_CANDIDATE=1` and will
+/// bind a bearer of its own to it. That was observed on the reference device:
+/// with only the control port hidden, ModemManager took `wwan1` for an `ims`
+/// APN bearer, leaving this line's user data with no interface and making every
+/// DATA6 activation fail with `CallFailed` / `PolicyMismatch`. Whoever asks
+/// first wins, so the interface must be reserved rather than raced for.
+///
+/// Pure so the subsystem/name pairing is testable without udev or a modem.
+fn secondary_qmi_udev_rules(port_name: &str, netdev: Option<&str>) -> Vec<String> {
+    let mut rules = vec![format!(
+        "SUBSYSTEM==\"wwan\", KERNEL==\"{port_name}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\""
+    )];
+    if let Some(netdev) = netdev {
+        rules.push(format!(
+            "SUBSYSTEM==\"net\", KERNEL==\"{netdev}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\""
+        ));
+    }
+    rules
+}
+
+/// Reconcile the udev rules that keep ModemManager off SimAdmin's IMS endpoints.
+///
+/// The rule set is derived entirely at runtime from the ports that were actually
+/// bound, and lives in `/run` because the port-to-baseband mapping is only valid
+/// for the current boot. Nothing here may key off a port *name*: the same
+/// channel surfaces as `wwan0qmi1` on one platform and `wwan0at2` on another,
+/// and a guessed name is either a no-op or, worse, hides a port that
+/// ModemManager legitimately owns on hardware we have never seen.
+///
+/// Passing an empty rule set removes the file. That matters when DATA6 is turned
+/// off or every endpoint failed: a rule left behind from an earlier run in the
+/// same boot would keep a port hidden that should now go back to ModemManager.
+async fn reconcile_secondary_qmi_udev_rules(path: &str, rules: &[String]) {
+    let mut changed = false;
+
+    if rules.is_empty() {
+        if std::path::Path::new(path).exists() {
+            match std::fs::remove_file(path) {
+                Ok(()) => {
+                    println!("removed stale {path}");
+                    changed = true;
+                }
+                Err(error) => eprintln!("could not remove {path}: {error}"),
+            }
+        }
+    } else {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = format!(
+            "# Generated by `simadmin secondary-qmi-init`.\n\
+             # These endpoints carry IMS/VoLTE and must stay under SimAdmin's control;\n\
+             # ModemManager must not claim them as extra modem ports.\n{}\n",
+            rules.join("\n")
+        );
+        match std::fs::write(path, body) {
+            Ok(()) => {
+                println!("wrote {path}");
+                changed = true;
+            }
+            Err(error) => eprintln!("could not write {path}: {error}"),
+        }
+    }
+
+    if !changed {
+        return;
+    }
+    let _ = tokio::process::Command::new("udevadm")
+        .args(["control", "--reload-rules"])
+        .status()
+        .await;
+    // The ports already exist by the time the rule lands, so the tag has to be
+    // re-applied rather than waiting for the next hotplug. Both subsystems
+    // matter: the QMI control port lives in `wwan`, its data interface in `net`.
+    for subsystem in ["wwan", "net"] {
+        let _ = tokio::process::Command::new("udevadm")
+            .args(["trigger", &format!("--subsystem-match={subsystem}")])
+            .status()
+            .await;
+    }
+}
+
+/// Prepare each baseband's secondary QMI endpoint, and hide the ports it binds
 /// from ModemManager.
 ///
 /// Intended to run before ModemManager starts. For every discovered modem this
@@ -198,23 +363,74 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
 /// bearer remains on qmi0, so both functions coexist without sharing one WDS
 /// slot.
 ///
-/// The udev rules cover *every* spare QMI port, not just the one bound here:
-/// the kernel module publishes one port per registered channel, and any spare
-/// left visible gets claimed by ModemManager as an extra modem port.
+/// Only ports this function actually bound are hidden. Hiding anything else
+/// would take a port away from ModemManager on hardware whose channel layout we
+/// have not seen -- see [`reconcile_secondary_qmi_udev_rules`].
 async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<()> {
     use hardware::devices::qcm410::secondary_qmi;
 
     const STATE_DIR: &str = "/run/simadmin";
-    // Keep a distinct basename from the packaged /etc fallback rule. udev gives
-    // /etc precedence over /run for duplicate basenames, which would otherwise
-    // hide the runtime DATA6-specific rule completely.
     const UDEV_RULE_PATH: &str = "/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules";
+
+    // Runs before the DATA6 gate on purpose. An older install may have left the
+    // out-of-tree multi-port module loaded, and while it is loaded it keeps
+    // auto-binding spare DATA*_CNTL channels at every boot -- which is what
+    // crashes this firmware's DSP during Data Services Memory bring-up and
+    // latches bam-dmux at runtime_status=error. With DATA6 disabled the module
+    // is not merely unused, it is the one thing that can still break the modem.
+    if !dry_run && secondary_qmi::purge_legacy_rpmsg_module().await {
+        println!("secondary-qmi-init: removed the legacy multi-port RPMSG module");
+    }
+
+    if !secondary_qmi::secondary_qmi_enabled() {
+        // Do not enumerate, bind, probe, or open DATA6 on firmware where the
+        // AT-labelled endpoint is known to take down the modem DSP.  The
+        // ModemManager primary QMI bearer remains the supported IMS fallback.
+        let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_STATE_FILE);
+        let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_ENDPOINTS_STATE_FILE);
+        // Drop any rule from an earlier run: with DATA6 off, every port belongs
+        // to ModemManager again and must not stay hidden.
+        if write_udev_rule && !dry_run {
+            reconcile_secondary_qmi_udev_rules(UDEV_RULE_PATH, &[]).await;
+        }
+        println!("secondary-qmi-init: DATA6 disabled; using the ModemManager primary QMI bearer");
+        if std::env::var_os("NOTIFY_SOCKET").is_some() {
+            let _ = tokio::process::Command::new("systemd-notify")
+                .args(["--ready", "--status=DATA6 disabled; primary QMI fallback"])
+                .status()
+                .await;
+        }
+        return Ok(());
+    }
 
     // Discovering modems needs ModemManager, which by design is not up yet. Fall
     // back to enumerating the primary QMI control ports straight from sysfs.
-    let primaries = secondary_qmi::discover_primary_qmi_ports();
+    //
+    // This unit is ordered ahead of ModemManager and therefore well ahead of the
+    // modem itself, so the ports usually do not exist yet: wait for them rather
+    // than concluding the host has no QMI hardware. `--dry-run` reports what is
+    // visible right now instead of blocking an operator at a shell.
+    let primaries = if dry_run {
+        secondary_qmi::discover_primary_qmi_ports()
+    } else {
+        secondary_qmi::wait_for_primary_qmi_ports(secondary_qmi::PRIMARY_PORT_WAIT).await
+    };
     if primaries.is_empty() {
+        // Not an error: plenty of supported hardware has no spare QMI channel,
+        // and every line falls back to the ModemManager bearer. Still has to
+        // reconcile and report ready -- the unit is Type=notify, so returning
+        // silently here would stall it until TimeoutStartSec and then restart it
+        // on a loop for the rest of the boot.
+        if write_udev_rule && !dry_run {
+            reconcile_secondary_qmi_udev_rules(UDEV_RULE_PATH, &[]).await;
+        }
         println!("secondary-qmi-init: no QMI control port found; nothing to do");
+        if !dry_run && std::env::var_os("NOTIFY_SOCKET").is_some() {
+            let _ = tokio::process::Command::new("systemd-notify")
+                .args(["--ready", "--status=no QMI control port; primary QMI fallback"])
+                .status()
+                .await;
+        }
         return Ok(());
     }
 
@@ -240,9 +456,9 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
                     endpoint.remoteproc,
                     endpoint.open_mode
                 );
-                rules.push(format!(
-                    "SUBSYSTEM==\"wwan\", KERNEL==\"{}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\"",
-                    endpoint.port_name
+                rules.extend(secondary_qmi_udev_rules(
+                    &endpoint.port_name,
+                    endpoint.netdev.as_deref(),
                 ));
                 prepared.push(endpoint);
             }
@@ -258,30 +474,9 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         return Ok(());
     }
 
-    if write_udev_rule && !rules.is_empty() {
-        if let Some(parent) = std::path::Path::new(UDEV_RULE_PATH).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let body = format!(
-            "# Generated by `simadmin secondary-qmi-init`.\n\
-             # These endpoints carry IMS/VoLTE and must stay under SimAdmin's control;\n\
-             # ModemManager must not claim them as extra modem ports.\n{}\n",
-            rules.join("\n")
-        );
-        match std::fs::write(UDEV_RULE_PATH, body) {
-            Ok(()) => {
-                println!("wrote {UDEV_RULE_PATH}");
-                let _ = tokio::process::Command::new("udevadm")
-                    .args(["control", "--reload-rules"])
-                    .status()
-                    .await;
-                let _ = tokio::process::Command::new("udevadm")
-                    .args(["trigger", "--subsystem-match=wwan"])
-                    .status()
-                    .await;
-            }
-            Err(error) => eprintln!("could not write {UDEV_RULE_PATH}: {error}"),
-        }
+    // `dry_run` already returned above.
+    if write_udev_rule {
+        reconcile_secondary_qmi_udev_rules(UDEV_RULE_PATH, &rules).await;
     }
 
     // Publish the endpoint map for the running service.
@@ -468,6 +663,11 @@ enum CliCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Internal: per-UE worker process, spawned by the manager with `setns`.
+    /// The worker is born inside the UE network namespace and serves the
+    /// control protocol over a JSON-lines Unix socket.
+    #[command(hide = true)]
+    UeWorker,
 }
 
 #[derive(Subcommand, Debug)]
@@ -599,6 +799,9 @@ async fn main() -> Result<()> {
     {
         return run_secondary_qmi_init(*write_udev_rule, *dry_run).await;
     }
+    if matches!(&cli.command, Some(CliCommand::UeWorker)) {
+        return services::ue_worker::run_worker_from_env().await;
+    }
     let args = match cli.command {
         Some(CliCommand::Serve(args)) => args,
         None => cli.serve,
@@ -665,6 +868,15 @@ async fn main() -> Result<()> {
         Arc::clone(&config_manager),
         Arc::clone(&app_db),
     ));
+    // Must precede the first discovery pass. A previous process that was killed
+    // before `deactivate` ran leaves its data netdev inside a UE namespace, and
+    // namespace names are stable per line, so this process re-attaches to the
+    // namespace still holding it. The resolver only enumerates the host, so the
+    // interface would be invisible and the session would come up as `Assumed`
+    // (unverified), which makes SIP fail silently. Nothing owns a netdev yet at
+    // this point, so anything found inside a namespace is a leftover.
+    platform::netns::reclaim_all_stranded_hardware_links().await;
+
     match line_registry.refresh(dbus_conn.as_ref()).await {
         Ok(count) => info!(count, "Discovered modem/SIM lines"),
         Err(error) => warn!(error = %error, "Initial modem/SIM line discovery failed"),
@@ -693,7 +905,19 @@ async fn main() -> Result<()> {
         Arc::clone(&dbus_conn),
         Arc::clone(&app_db),
     ));
-    let system_event_emitter = Arc::new(SystemEventEmitter::new(Arc::clone(&notification_sender)));
+    // On-disk diagnostic log. Created before the event bus so published events
+    // can be mirrored to the file; the writer task owns the file and drains a
+    // bounded queue, so a slow or full disk never blocks a request path.
+    let diagnostic_log_sink =
+        services::system::diagnostic_log::spawn_diagnostic_logger(Arc::clone(&config_manager));
+    let event_bus = Arc::new(
+        AppEventBus::new(Arc::clone(&app_db))
+            .with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
+    );
+    let system_event_emitter = Arc::new(SystemEventEmitter::new(
+        Arc::clone(&notification_sender),
+        Arc::clone(&event_bus),
+    ));
     let (sms_resync, sms_resync_rx) = services::messaging::sms_listener::sms_resync_channel();
     let ddns_manager = Arc::new(DdnsManager::new());
     {
@@ -807,13 +1031,22 @@ async fn main() -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Announced to long-lived responses (the SSE stream) so they can end. An
+    // SSE response never completes on its own, and `with_graceful_shutdown`
+    // waits for in-flight connections, so without this a single open browser
+    // tab holds the drain until the force-exit watchdog fires.
+    let (shutdown_controller, shutdown_signal) = platform::shutdown::channel();
+
     // 创建统一的应用状态
     let app_state = AppState::new(AppStateDependencies {
+        shutdown: shutdown_signal,
         dbus_conn,
         database: app_db,
         config_manager,
+        diagnostic_log_sink: Arc::clone(&diagnostic_log_sink),
         notification_sender,
         system_event_emitter,
+        event_bus,
         ddns_manager,
         esim_supervisor: Arc::clone(&esim_supervisor),
         sms_resync,
@@ -824,7 +1057,12 @@ async fn main() -> Result<()> {
         e911,
     });
 
+    // Kept out of the router's state so session teardown can still run after
+    // `serve` returns and the state itself has been consumed.
+    let shutdown_registry = Arc::clone(&app_state.line_registry);
+
     api::handlers::spawn_call_monitor(app_state.clone());
+    spawn_runtime_event_bridge(app_state.clone());
 
     // Restore only explicitly enabled per-line data and airplane-mode intents.
     {
@@ -994,6 +1232,10 @@ async fn main() -> Result<()> {
     spawn_volte_auto_restore(app_state.clone());
 
     let protected_routes = Router::new()
+        .route(
+            "/api/events",
+            get(api::events::stream_app_events).options(options_handler),
+        )
         // ========== 设备信息接口 ==========
         .route(
             "/api/modem/lines/{line_id}/device",
@@ -1484,13 +1726,18 @@ async fn main() -> Result<()> {
             get(get_volte_call_status_handler).options(options_handler),
         )
         .route(
-            "/api/modem/lines/{line_id}/volte/voice",
-            post(set_volte_voice_handler).options(options_handler),
-        )
-        .route(
             "/api/modem/lines/{line_id}/voice/path-policy",
             get(get_voice_path_policy_handler)
                 .post(set_voice_path_policy_handler)
+                .options(options_handler),
+        )
+        // Which access legs may hold an IMS *registration*. Deliberately a
+        // separate endpoint from voice/path-policy above, which orders
+        // originating calls over legs that are already registered.
+        .route(
+            "/api/modem/lines/{line_id}/ims/access-preference",
+            get(get_ims_access_preference_handler)
+                .post(set_ims_access_preference_handler)
                 .options(options_handler),
         )
         .route(
@@ -1505,9 +1752,7 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/modem/lines/{line_id}/vilte/control",
-            get(get_vilte_control_handler)
-                .post(set_vilte_feature_handler)
-                .options(options_handler),
+            get(get_vilte_control_handler).options(options_handler),
         )
         .route(
             "/api/modem/lines/{line_id}/vilte/config",
@@ -1579,6 +1824,17 @@ async fn main() -> Result<()> {
             get(get_github_download_proxy_handler)
                 .post(set_github_download_proxy_handler)
                 .options(options_handler),
+        )
+        // ========== 诊断日志接口 ==========
+        .route(
+            "/api/settings/diagnostic-log",
+            get(get_diagnostic_log_handler)
+                .post(set_diagnostic_log_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/settings/diagnostic-log/download",
+            get(download_diagnostic_log_handler).options(options_handler),
         )
         // ========== 通知配置接口 ==========
         .route(
@@ -1717,10 +1973,74 @@ async fn main() -> Result<()> {
     info!(addr = %bind_addr, "Server listening");
     // 使用优雅关闭
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_controller))
         .await?;
 
-    Ok(())
+    // Only reached once the drain completes, which is what the shutdown signal
+    // above makes possible. Releasing the data sessions here is what keeps the
+    // DATA netdev from being left inside a UE namespace.
+    release_data_sessions(&shutdown_registry).await;
+
+    // Exit explicitly rather than returning. Returning drops the tokio runtime,
+    // and that drop blocks until every `spawn_blocking` task has finished --
+    // but several of them never finish by design. `spawn_tun_reader` is the
+    // clearest: it re-checks its shutdown flag only at the top of its loop and
+    // otherwise parks in a blocking `read()` on the IMS TUN fd, so once the
+    // flag is set it still waits for a packet that may never arrive.
+    //
+    // That drop, not the drain, is what held the process for the full 8s
+    // watchdog on the device: the drain finished in 8ms and the bearers were
+    // released 155ms in, after which the log went completely silent until the
+    // watchdog called `exit`. Everything that has to outlive the process has
+    // already happened by this point, so exiting here is deliberate rather
+    // than a shortcut -- and it demotes the watchdog to the backstop it was
+    // meant to be.
+    info!("Shutdown complete; exiting");
+    std::process::exit(0);
+}
+
+/// Deactivate every DATA bearer before the process exits.
+///
+/// `SecondaryDataRuntime::stop` is what moves the DATA netdev back out of the UE
+/// namespace and releases the retained QMI client. Every other caller is either
+/// an API handler or the reconcile path that reacts to a SIM going away, so
+/// before this existed a normal `systemctl restart simadmin` never ran it at
+/// all: the netdev stayed in the namespace, the next process re-attached to that
+/// same namespace, and the data interface was invisible to a resolver that only
+/// enumerates the host. See
+/// [`crate::platform::netns::reclaim_all_stranded_hardware_links`], which cleans
+/// up after the cases this cannot cover (SIGKILL, power loss).
+///
+/// Bounded, because systemd's `TimeoutStopSec` is the next thing in line and a
+/// QMI deactivate can hang on a wedged baseband. Exceeding the bound is not
+/// fatal: the startup reclaim recovers whatever is left behind.
+async fn release_data_sessions(line_registry: &services::line_registry::LineRuntimeRegistry) {
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let lines = line_registry.all().await;
+    if lines.is_empty() {
+        return;
+    }
+
+    let released = tokio::time::timeout(BUDGET, async {
+        for line in lines {
+            let line_id = line.binding().line_id;
+            if line.secondary_data.interface().await.is_none() {
+                continue;
+            }
+            info!(line_id = %line_id, "Releasing DATA bearer for shutdown");
+            line.secondary_data.stop().await;
+        }
+    })
+    .await;
+
+    if released.is_err() {
+        warn!(
+            timeout_s = BUDGET.as_secs(),
+            "DATA bearer release did not finish before the shutdown budget; \
+             the next start will reclaim any netdev left in a namespace"
+        );
+    }
 }
 
 /// 绑定端口，如果被占用则轮询等待
@@ -1776,7 +2096,13 @@ async fn bind_with_retry(
 }
 
 /// 监听 Ctrl+C 和 SIGTERM 信号，用于优雅关闭
-async fn shutdown_signal() {
+///
+/// Firing `controller` is what lets the drain finish at all. Axum waits for
+/// in-flight responses, and the SSE stream at `/api/events` never ends on its
+/// own, so an open browser tab would otherwise hold the drain until the
+/// watchdog below force-exits -- skipping the session teardown that returns
+/// DATA netdevs to the host namespace.
+async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownController) {
     use tokio::signal;
 
     let ctrl_c = async {
@@ -1802,9 +2128,75 @@ async fn shutdown_signal() {
     }
 
     warn!("Shutdown signal received; starting graceful shutdown");
+    // Before the watchdog, so long-lived responses get the whole window to end.
+    controller.trigger();
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(8));
         eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
         std::process::exit(0);
     });
+}
+
+#[cfg(test)]
+mod udev_rule_tests {
+    use super::secondary_qmi_udev_rules;
+
+    /// The two rules live in different subsystems and getting that wrong is
+    /// silent: a `net` device never matches `SUBSYSTEM=="wwan"`, so the rule
+    /// loads, does nothing, and the interface stays available to ModemManager.
+    #[test]
+    fn the_control_port_and_the_netdev_use_their_own_subsystems() {
+        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+        assert_eq!(rules.len(), 2, "{rules:?}");
+
+        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
+        assert!(rules[0].contains(r#"KERNEL=="wwan0at2""#), "{rules:?}");
+
+        assert!(rules[1].contains(r#"SUBSYSTEM=="net""#), "{rules:?}");
+        assert!(rules[1].contains(r#"KERNEL=="wwan1""#), "{rules:?}");
+
+        for rule in &rules {
+            assert!(rule.contains(r#"ENV{ID_MM_PORT_IGNORE}="1""#), "{rule}");
+        }
+    }
+
+    /// Reserving the data interface is the whole point of the second rule:
+    /// ModemManager tags it ID_MM_CANDIDATE=1 and was observed binding its own
+    /// `ims` APN bearer to wwan1, after which every DATA6 activation failed
+    /// with CallFailed / PolicyMismatch.
+    #[test]
+    fn the_data_interface_is_reserved_whenever_one_is_known() {
+        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+        assert!(
+            rules.iter().any(|rule| rule.contains(r#"KERNEL=="wwan1""#)),
+            "the netdev must be hidden, not just the control port: {rules:?}"
+        );
+    }
+
+    /// A platform may expose the control port without a paired interface.
+    /// Emitting a rule with an empty KERNEL== would match everything in the
+    /// `net` subsystem and hide every interface on the host.
+    #[test]
+    fn no_netdev_means_no_net_rule_at_all() {
+        let rules = secondary_qmi_udev_rules("wwan0qmi1", None);
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
+        assert!(
+            !rules.iter().any(|rule| rule.contains(r#"SUBSYSTEM=="net""#)),
+            "{rules:?}"
+        );
+        assert!(
+            !rules.iter().any(|rule| rule.contains(r#"KERNEL=="""#)),
+            "an empty KERNEL== would match every net device: {rules:?}"
+        );
+    }
+
+    /// Port names are per-platform, so nothing may be hardcoded: the same
+    /// channel surfaces as wwan0at2 here and wwan0qmi1 elsewhere.
+    #[test]
+    fn rules_follow_the_observed_names() {
+        let rules = secondary_qmi_udev_rules("wwan3qmi7", Some("wwan9"));
+        assert!(rules[0].contains(r#"KERNEL=="wwan3qmi7""#), "{rules:?}");
+        assert!(rules[1].contains(r#"KERNEL=="wwan9""#), "{rules:?}");
+    }
 }

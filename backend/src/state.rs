@@ -15,11 +15,14 @@ use crate::hardware::cellular::cell_lock_store::CellLockStore;
 use crate::hardware::sim::esim::EsimSupervisor;
 use crate::platform::config::ConfigManager;
 use crate::platform::db::Database;
+use crate::platform::shutdown::ShutdownSignal;
 use crate::services::e911::orchestrator::E911Orchestrator;
+use crate::services::event_bus::AppEventBus;
 use crate::services::line_registry::LineRuntimeRegistry;
 use crate::services::messaging::sms_listener::SmsResyncHandle;
 use crate::services::network::device_network::DdnsManager;
 use crate::services::notify::notification::NotificationSender;
+use crate::services::system::diagnostic_log::DiagnosticLogSink;
 use crate::services::system::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
@@ -51,6 +54,10 @@ pub struct AppState {
     /// 通知发送器（用于转发 SMS、通话和 DDNS 通知）
     pub notification_sender: Arc<NotificationSender>,
     pub system_event_emitter: Arc<SystemEventEmitter>,
+    pub event_bus: Arc<AppEventBus>,
+    /// On-disk diagnostic log writer. Producers hand it records without
+    /// blocking; the background task owns the file handles.
+    pub diagnostic_log_sink: Arc<DiagnosticLogSink>,
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -73,6 +80,10 @@ pub struct AppState {
     pub sim_overrides: Arc<SimOverrideStore>,
     /// E911 entitlement orchestrator (query/status/websheet operations).
     pub e911: Arc<E911Orchestrator>,
+    /// Announced when the process starts going down. Long-lived responses (the
+    /// SSE event stream) must observe this and end, or the graceful drain never
+    /// completes and the force-exit watchdog skips every teardown path.
+    pub shutdown: ShutdownSignal,
 }
 
 /// Named startup dependencies prevent positional mix-ups as application state grows.
@@ -82,6 +93,8 @@ pub struct AppStateDependencies {
     pub config_manager: Arc<ConfigManager>,
     pub notification_sender: Arc<NotificationSender>,
     pub system_event_emitter: Arc<SystemEventEmitter>,
+    pub event_bus: Arc<AppEventBus>,
+    pub diagnostic_log_sink: Arc<DiagnosticLogSink>,
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -90,6 +103,7 @@ pub struct AppStateDependencies {
     pub carrier_catalog: Arc<CarrierCatalog>,
     pub sim_overrides: Arc<SimOverrideStore>,
     pub e911: Arc<E911Orchestrator>,
+    pub shutdown: ShutdownSignal,
 }
 
 impl AppState {
@@ -101,6 +115,8 @@ impl AppState {
             config_manager,
             notification_sender,
             system_event_emitter,
+            event_bus,
+            diagnostic_log_sink,
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -109,6 +125,7 @@ impl AppState {
             carrier_catalog,
             sim_overrides,
             e911,
+            shutdown,
         } = dependencies;
         Self {
             dbus_conn,
@@ -116,6 +133,8 @@ impl AppState {
             config_manager,
             notification_sender,
             system_event_emitter,
+            event_bus,
+            diagnostic_log_sink,
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -128,6 +147,7 @@ impl AppState {
             carrier_catalog,
             sim_overrides,
             e911,
+            shutdown,
         }
     }
 }
@@ -162,6 +182,24 @@ impl FromRef<AppState> for Arc<NotificationSender> {
 impl FromRef<AppState> for Arc<SystemEventEmitter> {
     fn from_ref(state: &AppState) -> Self {
         state.system_event_emitter.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<AppEventBus> {
+    fn from_ref(state: &AppState) -> Self {
+        state.event_bus.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<DiagnosticLogSink> {
+    fn from_ref(state: &AppState) -> Self {
+        state.diagnostic_log_sink.clone()
+    }
+}
+
+impl FromRef<AppState> for ShutdownSignal {
+    fn from_ref(state: &AppState) -> Self {
+        state.shutdown.clone()
     }
 }
 

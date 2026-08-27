@@ -19,7 +19,8 @@ use crate::hardware::cellular::cgcontrdp::{self, CgcontrdpSettings};
 use crate::hardware::cellular::qmi_netdev::{self, NetdevConfig};
 use crate::hardware::devices::qcm410::secondary_qmi::{self, ImsSession, SecondaryQmiEndpoint};
 use crate::hardware::devices::transport::{
-    ImsBearerError, ImsBearerErrorKind, ImsBearerHandle, ImsBearerInfo, ImsBearerTransport,
+    BearerInterfaceOwnership, ImsBearerError, ImsBearerErrorKind, ImsBearerHandle, ImsBearerInfo,
+    ImsBearerTransport,
 };
 
 /// The qcm410 IMS bearer driver. Stateless; one instance serves every line.
@@ -145,7 +146,10 @@ async fn establish_bearer(
             "native_ims_session_has_no_address".to_string(),
         ));
     };
-    let resolution = match qmi_netdev::resolve(baseband, &config).await {
+    // IMS is the runtime that legitimately owns the primary netdev, so nothing is
+    // reserved against it. The reservation exists to keep the *data* runtime off
+    // this interface; see DATA_RESERVED_NETDEVS in secondary_qmi_data.
+    let resolution = match qmi_netdev::resolve(baseband, &config, &[]).await {
         Ok(resolution) => resolution,
         Err(error) => {
             stop_sessions(endpoint, &sessions).await;
@@ -171,6 +175,8 @@ async fn establish_bearer(
         ipv6_dns: settings.ipv6_dns,
         ipv6_prefix: settings.ipv6_prefix,
         pcscf: settings.pcscf,
+        interface_ownership: BearerInterfaceOwnership::SimAdminOwnedSecondary,
+        ..Default::default()
     };
     Ok(Established {
         info,

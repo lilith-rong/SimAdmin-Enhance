@@ -33,6 +33,8 @@ import type {
   DdnsStatusResponse,
   DdnsSyncResponse,
   DeviceInfo,
+  DiagnosticLogConfig,
+  DiagnosticLogSettingsResponse,
   EsimCommandResponse,
   EsimDownloadRequest,
   EsimConfig,
@@ -51,6 +53,7 @@ import type {
   VowifiLineConfigResponse,
   LineVowifiConfig,
   ImsOverrideResponse,
+  ImsSubsystemState,
   SimImsOverride,
   TrunkProfileResponse,
   VolteLineControlResponse,
@@ -80,6 +83,7 @@ import type {
   SmsPathPolicy,
   SystemStatsResponse,
   VowifiProfilesResponse,
+  VowifiRuntimeEventsResponse,
   WebhookTestResponse,
   LineEsimControlResponse,
   VoicePathPolicy,
@@ -661,6 +665,12 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<LineRuntimeStatus[]>>('/modems')
   }
 
+  async getLineImsStatus(lineId: string) {
+    return request<ApiResponse<ImsSubsystemState>>(
+      modemLinePath(lineId, '/ims/status'),
+    )
+  }
+
   async getImsSupplementary(lineId: string) {
     return request<ApiResponse<SupplementarySnapshot>>(
       `/ims/lines/${encodeURIComponent(lineId)}/supplementary`,
@@ -698,6 +708,17 @@ class SimAdminCurrentAPI {
 
   async getVowifiLine(lineId: string) {
     return request<ApiResponse<VowifiLineConfigResponse>>(`/vowifi/lines/${encodeURIComponent(lineId)}`)
+  }
+
+  async getVowifiEvents(lineId: string, params?: { limit?: number; offset?: number; trace_id?: string }) {
+    const query = new URLSearchParams()
+    if (params?.limit !== undefined) query.set('limit', String(params.limit))
+    if (params?.offset !== undefined) query.set('offset', String(params.offset))
+    if (params?.trace_id) query.set('trace_id', params.trace_id)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<ApiResponse<VowifiRuntimeEventsResponse>>(
+      `/vowifi/lines/${encodeURIComponent(lineId)}/events${suffix}`,
+    )
   }
 
   async setVowifiLineConnection(lineId: string, enabled: boolean) {
@@ -784,6 +805,14 @@ class SimAdminCurrentAPI {
   async getSmsStats(channelId?: string) {
     const query = channelId ? `?channel_id=${encodeURIComponent(channelId)}` : ''
     return request<ApiResponse<SmsStats>>(`/sms/stats${query}`)
+  }
+
+  openAppEventStream(params?: { lineId?: string; afterId?: number }) {
+    const query = new URLSearchParams()
+    if (params?.lineId) query.set('line_id', params.lineId)
+    if (params?.afterId !== undefined) query.set('after_id', String(params.afterId))
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return new EventSource(`/api/events${suffix}`)
   }
 
   async getSmsPathPolicy(lineId: string) {
@@ -898,22 +927,8 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<VolteVoiceStatusResponse>>(modemLinePath(lineId, '/volte/call/status'))
   }
 
-  async setVolteVoice(lineId: string, enabled: boolean) {
-    return request<ApiResponse<VolteVoiceStatusResponse>>(modemLinePath(lineId, '/volte/voice'), {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    })
-  }
-
   async getVilteStatus(lineId: string) {
     return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/control'))
-  }
-
-  async setVilteFeature(lineId: string, enabled: boolean) {
-    return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/control'), {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    })
   }
 
   async setVilteConfig(lineId: string, config: VilteConfig) {
@@ -1017,6 +1032,40 @@ class SimAdminCurrentAPI {
       method: 'POST',
       body: JSON.stringify(config),
     })
+  }
+
+  async getDiagnosticLog() {
+    return request<ApiResponse<DiagnosticLogSettingsResponse>>('/settings/diagnostic-log')
+  }
+
+  async setDiagnosticLog(config: DiagnosticLogConfig) {
+    return request<ApiResponse<DiagnosticLogSettingsResponse>>('/settings/diagnostic-log', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  /**
+   * Fetch the log archive as a Blob.
+   *
+   * Not a plain `<a href>`: the endpoint sits behind the session cookie and
+   * answers 401 by redirecting to the login page, which a naive link would
+   * silently save as an HTML file named like a log.
+   */
+  async downloadDiagnosticLog(): Promise<Blob> {
+    const response = await fetch(`${API_BASE}/settings/diagnostic-log/download`, {
+      credentials: 'same-origin',
+    })
+    if (!response.ok) {
+      if (response.status === 401) {
+        redirectToLogin()
+      }
+      if (response.status === 404) {
+        throw new Error('诊断日志文件尚未生成')
+      }
+      throw new Error(httpStatusMessage(response.status))
+    }
+    return response.blob()
   }
 
   async uploadOta(file: File) {

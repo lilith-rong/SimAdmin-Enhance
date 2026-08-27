@@ -21,6 +21,10 @@ use tokio::{
 };
 
 use crate::platform::config::LineDataProxyConfig;
+use crate::services::ue_worker::{
+    worker_for_line_feature, UeSocket, UeSocketSpec, UeWorkerBinding, UeWorkerFeatures,
+    UeWorkerHandle,
+};
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 
@@ -243,6 +247,12 @@ impl Default for DataProxyStatus {
 struct ProxyState {
     status: DataProxyStatus,
     auth: Option<(String, String)>,
+    /// Worker generation that owns outbound sockets for the listener.  The
+    /// listener itself stays in the host namespace, but every accepted client
+    /// captures this handle; retaining the binding here lets reconciliation
+    /// detect a stale listener when a line worker is replaced, respawned or
+    /// disabled.
+    worker: Option<UeWorkerBinding>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -295,6 +305,55 @@ impl DataProxyRuntime {
         interface_name: &str,
         config: &LineDataProxyConfig,
     ) -> Result<DataProxyStatus, String> {
+        self.start_with_worker(interface_name, config, None).await
+    }
+
+    /// Start a proxy with an optional per-line worker for outbound sockets.
+    /// The listener remains host-side so existing clients keep the same API;
+    /// only the cellular egress is moved into the UE namespace.
+    pub async fn start_for_line(
+        &self,
+        line_id: &str,
+        interface_name: &str,
+        config: &LineDataProxyConfig,
+    ) -> Result<DataProxyStatus, String> {
+        let worker = match worker_for_line_feature(line_id, data_proxy_worker_enabled) {
+            Some(worker) => {
+                let status = worker.status().await;
+                if !status.ready {
+                    None
+                } else {
+                    // Capture the generation before probing so a worker that
+                    // restarts mid-check yields a stale binding rather than a
+                    // fresh one backed by an unverified namespace.
+                    let binding = worker.bind();
+                    // Do not trust a cached namespace snapshot here. A
+                    // worker can restart, or a bearer can move back to the
+                    // host, since the last reconcile.
+                    match worker.refresh_net_status().await {
+                        Ok(snapshot)
+                            if snapshot
+                                .interfaces
+                                .iter()
+                                .any(|name| name == interface_name) =>
+                        {
+                            Some(binding)
+                        }
+                        _ => None,
+                    }
+                }
+            }
+            None => None,
+        };
+        self.start_with_worker(interface_name, config, worker).await
+    }
+
+    async fn start_with_worker(
+        &self,
+        interface_name: &str,
+        config: &LineDataProxyConfig,
+        worker: Option<UeWorkerBinding>,
+    ) -> Result<DataProxyStatus, String> {
         let interface_name = interface_name.trim();
         if interface_name.is_empty() {
             return Err("cellular_data_interface_unavailable".to_string());
@@ -307,6 +366,7 @@ impl DataProxyRuntime {
             && (config.listen_port == 0 || state.status.port == Some(config.listen_port))
             && state.status.auth_required == !config.username.is_empty()
             && state.auth.as_ref() == Some(&(config.username.clone(), config.password.clone()))
+            && worker_binding_matches_state(state.worker.as_ref(), worker.as_ref())
         {
             return Ok(state.status.clone());
         }
@@ -325,6 +385,7 @@ impl DataProxyRuntime {
             .port();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let outbound_interface = interface_name.to_string();
+        let outbound_worker = worker.as_ref().map(|binding| binding.worker().clone());
         let username = config.username.clone();
         let password = config.password.clone();
         let counters = Arc::clone(&self.counters);
@@ -338,11 +399,19 @@ impl DataProxyRuntime {
                         match accepted {
                             Ok((stream, _)) => {
                                 let interface = outbound_interface.clone();
+                                let worker = outbound_worker.clone();
                                 let auth = ProxyAuth::new(username.clone(), password.clone());
                                 let counters = Arc::clone(&counters);
                                 clients.spawn(async move {
                                     counters.connection_opened();
-                                    let result = serve_client(stream, &interface, &auth, &counters).await;
+                                    let result = serve_client(
+                                        stream,
+                                        &interface,
+                                        worker.as_ref(),
+                                        &auth,
+                                        &counters,
+                                    )
+                                    .await;
                                     counters.connection_closed();
                                     if let Err(error) = result {
                                         tracing::debug!(interface = %interface, error = %error, "Cellular data proxy client closed");
@@ -380,6 +449,7 @@ impl DataProxyRuntime {
         state.shutdown = Some(shutdown_tx);
         state.task = Some(task);
         state.auth = Some((config.username.clone(), config.password.clone()));
+        state.worker = worker;
         Ok(state.status.clone())
     }
 
@@ -397,6 +467,19 @@ impl DataProxyRuntime {
         state.status.last_error = Some(error);
         state.status.clone()
     }
+
+    /// Whether the running listener is bound to the requested UE worker
+    /// generation.  The listener remains valid when both sides are host-side
+    /// (`None`), while a worker replacement or respawn forces the caller to
+    /// restart it so newly accepted sockets cannot use a stale namespace.
+    pub async fn worker_binding_matches(&self, expected: Option<&UeWorkerBinding>) -> bool {
+        let state = self.state.lock().await;
+        state.status.running && worker_binding_matches_state(state.worker.as_ref(), expected)
+    }
+}
+
+fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
+    features.data_proxy
 }
 
 async fn stop_locked(state: &mut ProxyState) {
@@ -416,6 +499,18 @@ async fn stop_locked(state: &mut ProxyState) {
     state.status.auth_required = false;
     state.status.last_error = None;
     state.auth = None;
+    state.worker = None;
+}
+
+fn worker_binding_matches_state(
+    current: Option<&UeWorkerBinding>,
+    expected: Option<&UeWorkerBinding>,
+) -> bool {
+    match (current, expected) {
+        (None, None) => true,
+        (Some(current), Some(expected)) => current.matches(expected),
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -441,6 +536,7 @@ impl ProxyAuth {
 async fn serve_client(
     inbound: TcpStream,
     interface_name: &str,
+    worker: Option<&UeWorkerHandle>,
     auth: &ProxyAuth,
     counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
@@ -450,15 +546,16 @@ async fn serve_client(
         return Ok(());
     }
     if first[0] == 0x05 {
-        serve_socks5(inbound, interface_name, auth, counters).await
+        serve_socks5(inbound, interface_name, worker, auth, counters).await
     } else {
-        serve_http_proxy(inbound, interface_name, auth, counters).await
+        serve_http_proxy(inbound, interface_name, worker, auth, counters).await
     }
 }
 
 async fn serve_socks5(
     mut inbound: TcpStream,
     interface_name: &str,
+    worker: Option<&UeWorkerHandle>,
     auth: &ProxyAuth,
     counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
@@ -508,7 +605,7 @@ async fn serve_socks5(
         }
     };
     let port = inbound.read_u16().await?;
-    match connect_bound(&host, port, interface_name).await {
+    match connect_bound(&host, port, interface_name, worker).await {
         Ok(outbound) => {
             write_socks_reply(&mut inbound, 0).await?;
             relay_counted(inbound, outbound, counters).await?;
@@ -538,6 +635,7 @@ async fn write_socks_reply(stream: &mut TcpStream, code: u8) -> io::Result<()> {
 async fn serve_http_proxy(
     mut inbound: TcpStream,
     interface_name: &str,
+    worker: Option<&UeWorkerHandle>,
     auth: &ProxyAuth,
     counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
@@ -572,7 +670,7 @@ async fn serve_http_proxy(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(target, 443)?;
-        match connect_bound(&host, port, interface_name).await {
+        match connect_bound(&host, port, interface_name, worker).await {
             Ok(outbound) => {
                 inbound
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -589,7 +687,7 @@ async fn serve_http_proxy(
         name.eq_ignore_ascii_case("host").then(|| value.trim())
     });
     let (host, port, origin_target) = parse_http_target(target, host_header)?;
-    let mut outbound = match connect_bound(&host, port, interface_name).await {
+    let mut outbound = match connect_bound(&host, port, interface_name, worker).await {
         Ok(stream) => stream,
         Err(_) => {
             write_http_error(&mut inbound, 502, "Bad Gateway").await?;
@@ -713,12 +811,44 @@ async fn write_http_error(stream: &mut TcpStream, code: u16, reason: &str) -> io
     stream.write_all(response.as_bytes()).await
 }
 
-async fn connect_bound(host: &str, port: u16, interface_name: &str) -> io::Result<TcpStream> {
+async fn connect_bound(
+    host: &str,
+    port: u16,
+    interface_name: &str,
+    worker: Option<&UeWorkerHandle>,
+) -> io::Result<TcpStream> {
     let addresses = lookup_host((host, port))
         .await?
         .collect::<Vec<SocketAddr>>();
     let mut last_error = None;
     for address in addresses {
+        if let Some(worker) = worker {
+            let local = if address.is_ipv4() {
+                "0.0.0.0:0".parse().expect("valid IPv4 wildcard")
+            } else {
+                "[::]:0".parse().expect("valid IPv6 wildcard")
+            };
+            let spec =
+                UeSocketSpec::tcp_connected(local, address, Some(interface_name.to_string()), 10);
+            match worker.create_socket(spec).await {
+                Ok(UeSocket::Tcp(stream)) => return Ok(stream),
+                Ok(_) => {
+                    tracing::warn!(interface = %interface_name, "UE worker returned a non-TCP proxy socket");
+                    last_error = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UE worker returned a non-TCP proxy socket",
+                    ));
+                }
+                Err(error) => {
+                    tracing::debug!(interface = %interface_name, error = %error, "UE worker proxy connect failed");
+                    last_error = Some(io::Error::other(error.to_string()));
+                }
+            }
+            // The selected cellular interface belongs to the worker
+            // namespace. A host fallback cannot bind it and must not escape
+            // through Wi-Fi or another modem.
+            continue;
+        }
         let socket = if address.is_ipv4() {
             TcpSocket::new_v4()?
         } else {
@@ -765,6 +895,50 @@ fn bind_socket_to_device(_socket: &TcpSocket, _interface_name: &str) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::netns::NetnsName;
+
+    /// The listener stays host-side, but its accepted sockets are created by a
+    /// specific worker process. A respawn behind the same handle must invalidate
+    /// the listener so reconciliation rebuilds it against the new namespace.
+    #[test]
+    fn listener_binding_follows_the_worker_generation() {
+        let handle = UeWorkerHandle::for_line("line-a", NetnsName::for_line("sa-ue", "line-a"));
+        let bound = handle.bind();
+        assert!(worker_binding_matches_state(
+            Some(&bound),
+            Some(&handle.bind())
+        ));
+
+        // Host-path listeners have no worker on either side.
+        assert!(worker_binding_matches_state(None, None));
+        // Enabling or disabling isolation must force a restart.
+        assert!(!worker_binding_matches_state(Some(&bound), None));
+        assert!(!worker_binding_matches_state(None, Some(&bound)));
+    }
+
+    #[tokio::test]
+    async fn running_listener_reports_its_worker_binding() {
+        let runtime = DataProxyRuntime::default();
+        runtime
+            .start(
+                "test-interface",
+                &LineDataProxyConfig {
+                    listen_ip: "127.0.0.1".to_string(),
+                    listen_port: 0,
+                    ..LineDataProxyConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Started without a worker, so only the host-path binding matches.
+        assert!(runtime.worker_binding_matches(None).await);
+        let handle = UeWorkerHandle::for_line("line-a", NetnsName::for_line("sa-ue", "line-a"));
+        assert!(!runtime.worker_binding_matches(Some(&handle.bind())).await);
+
+        // A stopped listener never counts as correctly bound.
+        runtime.stop().await;
+        assert!(!runtime.worker_binding_matches(None).await);
+    }
 
     #[tokio::test]
     async fn binds_configured_listener_and_reports_stage() {
@@ -790,7 +964,22 @@ mod tests {
         assert_eq!(stopped.stage, "流量未启用");
     }
 
+    /// Hangs forever under WSL2, so it is gated rather than left to wedge the
+    /// suite. `connect_bound` applies `SO_BINDTODEVICE` to the outbound socket,
+    /// and on kernel 6.18.33.2-microsoft-standard-WSL2 a socket bound to `lo`
+    /// that connects to 127.0.0.1 never completes the handshake -- it sits in
+    /// `SYN-SENT` indefinitely, with the client->proxy leg `ESTAB` and the
+    /// proxy->upstream leg stuck, so the relay never starts and the client's
+    /// `read_to_end` never sees EOF. Reproduced as root with a plain Python
+    /// socket and no SimAdmin code involved: the same connect succeeds without
+    /// the bind and times out with it.
+    ///
+    /// The bind is deliberate -- it is the boundary that stops proxy traffic
+    /// from escaping through Wi-Fi or another modem's default route -- so this
+    /// is gated on the environment, not worked around in the proxy.
+    /// Run it on real Linux with `cargo test -- --ignored`.
     #[tokio::test]
+    #[ignore = "SO_BINDTODEVICE(lo) + 127.0.0.1 never completes the handshake under WSL2"]
     async fn socks5_relay_counts_uplink_and_downlink_separately() {
         // An echo-ish upstream that reads a request and answers with a longer
         // body, so uplink and downlink cannot be confused for each other.

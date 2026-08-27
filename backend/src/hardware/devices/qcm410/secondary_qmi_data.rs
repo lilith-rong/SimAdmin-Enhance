@@ -17,7 +17,10 @@ use crate::{
         qmi_netdev::{self, NetdevConfig, ResolvedNetdev},
         qmi_wds,
     },
-    platform::config::ApnConfig,
+    platform::{config::ApnConfig, netns},
+    services::ue_worker::{
+        worker_for_line_feature, NetConfigOp, UeWorkerBinding, UeWorkerFeatures, UeWorkerHandle,
+    },
 };
 
 use super::secondary_qmi::{self, SecondaryQmiEndpoint};
@@ -31,6 +34,7 @@ struct SecondaryDataSession {
     endpoint: SecondaryQmiEndpoint,
     netdev: ResolvedNetdev,
     netdev_config: NetdevConfig,
+    worker: Option<UeWorkerBinding>,
 }
 
 #[derive(Default)]
@@ -47,16 +51,78 @@ impl SecondaryDataRuntime {
             .map(|session| session.netdev.interface.clone())
     }
 
+    /// True when the retained DATA session lives inside a UE worker namespace.
+    ///
+    /// Only such a session is tied to the isolation lifecycle: its interface sits
+    /// in a namespace that disappears with the worker. A host-side session
+    /// belongs to the legacy path and has to survive isolation teardown, or
+    /// simply running with `ue_isolation.enabled = false` would destroy working
+    /// cellular data on every line refresh.
+    pub async fn is_worker_bound(&self) -> bool {
+        self.session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|session| session.worker.is_some())
+    }
+
     pub async fn start(
         &self,
-        _modem_id: &str,
+        line_id: &str,
         primary_qmi: &str,
         apn: &ApnConfig,
     ) -> Result<String, String> {
         let mut guard = self.session.lock().await;
-        if let Some(session) = guard.as_ref() {
-            if retained_session_is_active(session).await {
-                return Ok(session.netdev.interface.clone());
+        if guard.is_some() {
+            let (active, host_namespace, interface) = {
+                let session = guard.as_ref().expect("session checked above");
+                (
+                    retained_session_is_active(session).await,
+                    session.worker.is_none(),
+                    session.netdev.interface.clone(),
+                )
+            };
+            if active {
+                // Isolation can be enabled after the DATA6 session was
+                // created. In that case migrate the still-healthy host
+                // session into the newly ready line worker instead of
+                // silently keeping the old namespace path forever.
+                if host_namespace {
+                    if let Some(worker) = data_worker_for_line(line_id).await {
+                        let mut existing = guard
+                            .take()
+                            .expect("secondary DATA session disappeared while locked");
+                        if let Err(error) =
+                            move_data_session_into_worker(&mut existing, worker).await
+                        {
+                            warn!(
+                                line_id,
+                                interface = %interface,
+                                error = %error,
+                                "Existing secondary DATA session stayed in host namespace"
+                            );
+                        }
+                        *guard = Some(existing);
+                        return Ok(interface);
+                    }
+                    // No worker is currently available; preserve the healthy
+                    // host-namespace session and let a later call migrate it
+                    // when the feature worker becomes ready.
+                    return Ok(interface);
+                } else {
+                    let usable = {
+                        let session = guard.as_ref().expect("session checked above");
+                        retained_session_worker_is_usable(line_id, session).await
+                    };
+                    if usable {
+                        return Ok(interface);
+                    }
+                    warn!(
+                        line_id,
+                        interface = %interface,
+                        "Retained secondary DATA session is bound to a stale worker"
+                    );
+                }
             }
         }
         if let Some(session) = guard.take() {
@@ -67,12 +133,36 @@ impl SecondaryDataRuntime {
             .await
             .map_err(|error| format!("cellular_secondary_qmi_unavailable:{error}"))?;
         let apn_name = normalized_data_apn(&apn.apn)?;
+        let baseband = baseband_key(&endpoint);
+
+        // A latched baseband cannot carry this session: the kernel refuses an
+        // administrative UP on every candidate netdev, so resolution is certain to
+        // fail. Refusing here rather than inside the family loop is what keeps the
+        // failure cheap. Each family attempt allocates a WDS client and starts a
+        // network before resolution runs, and a session whose netdev was never
+        // resolved cannot be torn down cleanly -- the firmware leaves the CID
+        // behind. Retried every watchdog pass, that accumulated one leaked
+        // `wds` client per attempt and kept issuing start-network requests at a
+        // baseband that was still recovering from a crash.
+        if let Some(status) = qmi_netdev::baseband_runtime_is_latched(&baseband) {
+            return Err(format!(
+                "cellular_secondary_data_baseband_latched:{baseband}: bam-dmux runtime_status={status}"
+            ));
+        }
+
         let families = data_family_attempts(&apn.protocol);
         let mut errors = Vec::new();
 
         for family in families {
-            match start_family(&endpoint, apn, &apn_name, family).await {
-                Ok(session) => {
+            match start_family(&endpoint, &baseband, apn, &apn_name, family).await {
+                Ok(mut session) => {
+                    if let Some(worker) = data_worker_for_line(line_id).await {
+                        if let Err(error) =
+                            move_data_session_into_worker(&mut session, worker).await
+                        {
+                            warn!(line_id, error = %error, "Secondary DATA worker migration failed; retaining host namespace");
+                        }
+                    }
                     let interface = session.netdev.interface.clone();
                     info!(
                         device = %endpoint.device_path,
@@ -103,12 +193,42 @@ impl SecondaryDataRuntime {
     }
 }
 
+/// The netdev DATA6 must never land on.
+///
+/// `wwan0` is the netdev of the primary QMI port, which ModemManager holds and
+/// IMS registers through. If a DATA6 session takes it, the IMS PDN cannot come
+/// up at all, and the VoLTE REGISTER then has no policy route to its P-CSCF --
+/// it falls through to the host default and leaves over Wi-Fi toward a
+/// carrier-private address that can never answer.
+const DATA_RESERVED_NETDEVS: &[&str] = &["wwan0"];
+
+/// The sysfs key every candidate netdev of this endpoint's baseband contains.
+///
+/// Resolved from the QMI device path, then the port name, falling back to the
+/// endpoint's own remoteproc name. Hoisted out of `start_family` so the latch
+/// check can run once, before the first WDS client is allocated.
+fn baseband_key(endpoint: &SecondaryQmiEndpoint) -> String {
+    secondary_qmi::baseband_key_for_device(&endpoint.device_path)
+        .or_else(|_| secondary_qmi::baseband_key_for_device(&endpoint.port_name))
+        .unwrap_or_else(|_| endpoint.remoteproc.clone())
+}
+
 async fn start_family(
     endpoint: &SecondaryQmiEndpoint,
+    baseband: &str,
     apn: &ApnConfig,
     apn_name: &str,
     family: u8,
 ) -> Result<SecondaryDataSession, String> {
+    // The previous family's attempt can itself crash the baseband, and a start
+    // issued into a latched one only leaks another client. Re-read rather than
+    // trusting the check the caller made before the loop.
+    if let Some(status) = qmi_netdev::baseband_runtime_is_latched(baseband) {
+        return Err(format!(
+            "cellular_secondary_data_baseband_latched:{baseband}: bam-dmux runtime_status={status}"
+        ));
+    }
+
     let retained = start_retained_session(endpoint, apn, apn_name, family).await?;
 
     let settings = match wait_for_current_settings(endpoint, &retained.client_id, family).await {
@@ -118,10 +238,7 @@ async fn start_family(
             return Err(error);
         }
     };
-    let baseband = secondary_qmi::baseband_key_for_device(&endpoint.device_path)
-        .or_else(|_| secondary_qmi::baseband_key_for_device(&endpoint.port_name))
-        .unwrap_or_else(|_| endpoint.remoteproc.clone());
-    let netdev = match qmi_netdev::resolve(&baseband, &settings).await {
+    let netdev = match qmi_netdev::resolve(baseband, &settings, DATA_RESERVED_NETDEVS).await {
         Ok(netdev) => netdev,
         Err(error) => {
             stop_retained_session(endpoint, &retained).await;
@@ -140,7 +257,127 @@ async fn start_family(
         endpoint: endpoint.clone(),
         netdev,
         netdev_config: settings,
+        worker: None,
     })
+}
+
+fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
+    features.data_proxy
+}
+
+async fn data_worker_for_line(line_id: &str) -> Option<UeWorkerHandle> {
+    let worker = worker_for_line_feature(line_id, data_proxy_worker_enabled)?;
+    worker.status().await.ready.then_some(worker)
+}
+
+/// Verify that a retained DATA bearer still belongs to the currently
+/// registered worker generation. A QMI CID can remain connected after a
+/// worker exits or its namespace is recreated, so checking only modem status
+/// would return an interface that no caller can reach.
+async fn retained_session_worker_is_usable(line_id: &str, session: &SecondaryDataSession) -> bool {
+    let Some(session_worker) = session.worker.as_ref() else {
+        // Host-namespace sessions do not depend on a worker generation.
+        return true;
+    };
+    let Some(current_worker) = data_worker_for_line(line_id).await else {
+        return false;
+    };
+    if !session_worker.matches(&current_worker.bind()) {
+        return false;
+    }
+    match current_worker.refresh_net_status().await {
+        Ok(snapshot) => snapshot
+            .interfaces
+            .iter()
+            .any(|name| name == &session.netdev.interface),
+        Err(error) => {
+            warn!(
+                line_id,
+                interface = %session.netdev.interface,
+                error = %error,
+                "Secondary DATA worker is no longer reachable"
+            );
+            false
+        }
+    }
+}
+
+async fn move_data_session_into_worker(
+    session: &mut SecondaryDataSession,
+    worker: UeWorkerHandle,
+) -> Result<(), String> {
+    let interface = session.netdev.interface.as_str();
+    // Belt to the resolver's braces. Resolution can no longer hand back a
+    // reserved interface, so reaching this is a bug rather than a race -- but a
+    // DATA6 session on the IMS netdev is silent breakage several layers up, so
+    // keep refusing it here too. Both checks read the same list so they cannot
+    // drift apart.
+    if DATA_RESERVED_NETDEVS.contains(&interface) {
+        return Err(format!(
+            "cellular_data_refuses_primary_interface_{interface}"
+        ));
+    }
+    // Capture the generation before the interface crosses namespaces. A worker
+    // that respawns during migration must invalidate this session rather than
+    // inherit an interface it never configured.
+    let binding = worker.bind();
+    // Remove host policy state before the interface crosses namespaces. The
+    // retained WDS session remains alive and owns the raw-IP data channel.
+    qmi_netdev::teardown(interface, &session.netdev_config).await;
+    if let Err(error) = netns::move_iface_in(worker.namespace(), interface).await {
+        let _ = qmi_netdev::configure_host_data_path(interface, &session.netdev_config).await;
+        return Err(format!("cellular_data_move_into_worker_failed:{error}"));
+    }
+    let config = &session.netdev_config;
+    let mut ops = Vec::new();
+    if let Some(mtu) = config.mtu {
+        ops.push(NetConfigOp::LinkSetMtu {
+            ifname: interface.to_string(),
+            mtu,
+        });
+    }
+    ops.extend([
+        NetConfigOp::AddrReplace {
+            ifname: interface.to_string(),
+            cidr: format!("{}/{}", config.address, config.prefix),
+        },
+        NetConfigOp::LinkSetUp {
+            ifname: interface.to_string(),
+        },
+        NetConfigOp::DefaultRouteDeviceReplace {
+            dev: interface.to_string(),
+            ipv6: config.address.is_ipv6(),
+            // Keep the veth default preferred for IKE/VoWiFi. Proxy sockets
+            // use SO_BINDTODEVICE, so route lookup selects this WWAN default.
+            metric: 500,
+        },
+    ]);
+    let outcome = worker
+        .apply_net_config(ops)
+        .await
+        .map_err(|error| format!("cellular_data_worker_config_failed:{error}"));
+    if !matches!(&outcome, Ok(result) if result.ok) {
+        let _ = netns::move_iface_out(worker.namespace(), interface).await;
+        let _ = qmi_netdev::configure_host_data_path(interface, config).await;
+        return Err(outcome
+            .err()
+            .unwrap_or_else(|| "cellular_data_worker_config_failed".to_string()));
+    }
+    let snapshot = match worker.refresh_net_status().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = netns::move_iface_out(worker.namespace(), interface).await;
+            let _ = qmi_netdev::configure_host_data_path(interface, config).await;
+            return Err(format!("cellular_data_worker_status_failed:{error}"));
+        }
+    };
+    if !snapshot.interfaces.iter().any(|name| name == interface) {
+        let _ = netns::move_iface_out(worker.namespace(), interface).await;
+        let _ = qmi_netdev::configure_host_data_path(interface, config).await;
+        return Err("cellular_data_worker_interface_missing".to_string());
+    }
+    session.worker = Some(binding);
+    Ok(())
 }
 
 struct RetainedSession {
@@ -388,8 +625,39 @@ async fn stop_session(mut session: SecondaryDataSession) {
         client_id: std::mem::take(&mut session.client_id),
         packet_data_handle: std::mem::take(&mut session.packet_data_handle),
     };
+    if let Some(binding) = session.worker.take() {
+        // Only the generation that configured the interface can clean it up.
+        // A replacement worker owns a different namespace instance, so its
+        // control channel would either reject these ops or apply them to the
+        // wrong stack; the interface still needs moving back to the host.
+        if binding.is_current() {
+            let _ = binding
+                .worker()
+                .apply_net_config(vec![
+                    NetConfigOp::FlushRoutesForDevice {
+                        ifname: session.netdev.interface.clone(),
+                        ipv6: session.netdev_config.address.is_ipv6(),
+                    },
+                    NetConfigOp::AddrDel {
+                        ifname: session.netdev.interface.clone(),
+                        cidr: format!(
+                            "{}/{}",
+                            session.netdev_config.address, session.netdev_config.prefix
+                        ),
+                    },
+                ])
+                .await;
+        }
+        let _ = netns::move_iface_out(binding.namespace(), &session.netdev.interface).await;
+        let _ = binding.worker().refresh_net_status().await;
+        // The interface may have returned to the host automatically when a
+        // worker namespace disappeared. Always remove this session's host
+        // address/policy state before releasing its QMI CID.
+        qmi_netdev::teardown(&session.netdev.interface, &session.netdev_config).await;
+    } else {
+        qmi_netdev::teardown(&session.netdev.interface, &session.netdev_config).await;
+    }
     stop_retained_session(&session.endpoint, &retained).await;
-    qmi_netdev::teardown(&session.netdev.interface, &session.netdev_config).await;
     info!(interface = %session.netdev.interface, "Secondary DATA QMI bearer deactivated");
 }
 

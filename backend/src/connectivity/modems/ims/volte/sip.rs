@@ -35,6 +35,16 @@ pub const PANI_EUTRAN: &str = "3GPP-E-UTRAN-FDD";
 pub const USER_AGENT: &str = "SimAdmin VoLTE";
 pub const SMS_CONTENT_TYPE: &str = "application/vnd.3gpp.sms";
 pub const DTMF_RELAY_CONTENT_TYPE: &str = "application/dtmf-relay";
+pub const MMTEL_ALLOW_METHODS: &str =
+    "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS";
+
+/// RFC 5626 `reg-id` for this (cellular) access leg.
+///
+/// Sourced from the access policy rather than written literally, because the
+/// two legs now share one `+sip.instance` and a binding is keyed on
+/// (AOR, instance-id, reg-id): if both legs emitted the same reg-id, the
+/// second registration would silently replace the first.
+const CELLULAR_REG_ID: u32 = crate::connectivity::core::ims_access::ImsAccess::Cellular.reg_id();
 
 /// Format a host for a SIP URI: bare IPv4, bracketed IPv6 (RFC 3261 §19.1.2).
 /// Delegates to the shared IMS core.
@@ -250,6 +260,7 @@ pub fn build_register_with_policy(
         security_verify,
         sip_instance,
         policy,
+        None,
     )
 }
 
@@ -301,6 +312,45 @@ pub fn build_register_from_profile_with_target(
     sip_instance: &str,
     policy: RegisterRequestPolicy,
 ) -> Vec<u8> {
+    build_register_from_profile_with_target_and_visited(
+        profile,
+        target,
+        phase,
+        identity,
+        route,
+        ids,
+        expires,
+        authorization,
+        security_client,
+        security_verify,
+        sip_instance,
+        policy,
+        None,
+    )
+}
+
+/// Build REGISTER with a runtime visited-network override.
+///
+/// Carrier profiles normally provide a static `P-Visited-Network-ID`. During
+/// roaming the visited PLMN is learned from ModemManager, so the live path can
+/// replace that static value without changing the home profile used for IMS
+/// identities, APN, authentication, or registrar selection.
+#[allow(clippy::too_many_arguments)]
+pub fn build_register_from_profile_with_target_and_visited(
+    profile: &CarrierProfile,
+    target: RegisterTarget<'_>,
+    phase: RegisterPhase,
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    ids: &RequestIds,
+    expires: u32,
+    authorization: Option<&str>,
+    security_client: Option<&str>,
+    security_verify: Option<&str>,
+    sip_instance: &str,
+    policy: RegisterRequestPolicy,
+    visited_network_override: Option<&str>,
+) -> Vec<u8> {
     build_register_internal(
         Some(profile),
         Some(target),
@@ -314,6 +364,7 @@ pub fn build_register_from_profile_with_target(
         security_verify,
         sip_instance,
         policy,
+        visited_network_override,
     )
 }
 
@@ -361,16 +412,21 @@ fn build_register_internal(
     security_verify: Option<&str>,
     sip_instance: &str,
     policy: RegisterRequestPolicy,
+    visited_network_override: Option<&str>,
 ) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
-    let include_pani = profile.is_none_or(|profile| match phase {
-        RegisterPhase::Initial => profile.ims.register.include_pani_initial,
-        RegisterPhase::Authenticated | RegisterPhase::Refresh => {
-            profile.ims.register.include_pani_authenticated
-        }
-    });
+    // An MMTEL-capable cellular binding must identify its radio access. Some
+    // imported carrier bundles omit the PANI booleans even though they enable
+    // MMTEL, which can leave a 200-OK registration ineligible for MT routing.
+    let include_pani = policy.include_mmtel_features
+        || profile.is_none_or(|profile| match phase {
+            RegisterPhase::Initial => profile.ims.register.include_pani_initial,
+            RegisterPhase::Authenticated | RegisterPhase::Refresh => {
+                profile.ims.register.include_pani_authenticated
+            }
+        });
     let access_network_info = profile
         .map(|profile| profile.ims.register.access_network_info)
         .unwrap_or(PANI_EUTRAN);
@@ -409,10 +465,12 @@ fn build_register_internal(
         allow_header: profile
             .and_then(|profile| profile.ims.register.allow_methods)
             .unwrap_or_else(|| {
-                if profile.is_some() {
+                if policy.include_mmtel_features {
+                    MMTEL_ALLOW_METHODS
+                } else if profile.is_some() {
                     ""
                 } else {
-                    "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS"
+                    MMTEL_ALLOW_METHODS
                 }
             })
             .to_string(),
@@ -437,10 +495,23 @@ fn build_register_internal(
         route.transport.as_param(),
     );
     let mut advertises_sms_over_ip = false;
-    if let Some(profile) =
-        profile.filter(|profile| !profile.ims.register.contact_param_order.is_empty())
-    {
-        for parameter in profile.ims.register.contact_param_order {
+    let mut declared_sip_instance = false;
+    let always_add_sip_instance =
+        profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance);
+    // A profile dictates the Contact parameter list only when it actually
+    // carries one. Catalog bundles that omit `sip.common.contact_parameters`
+    // -- and every hardcoded profile, which sets `contact_param_order: &[]`
+    // -- are expressing no opinion, not "advertise nothing". Treating the
+    // empty list as a third, silent case skipped both arms below and emitted
+    // a bare `<sip:user@host:port;transport=udp>;+g.3gpp.smsip`: without
+    // `+g.3gpp.icsi-ref` the S-CSCF has no reason to consider the
+    // registration MMTEL voice capable, so terminating calls are never
+    // delivered even though REGISTER answers 200 OK.
+    let explicit_parameters = profile
+        .map(|profile| profile.ims.register.contact_param_order)
+        .unwrap_or(&[]);
+    if !explicit_parameters.is_empty() {
+        for parameter in explicit_parameters {
             let name = parameter
                 .split_once('=')
                 .map_or(*parameter, |(name, _)| name)
@@ -451,10 +522,13 @@ fn build_register_internal(
             if name.eq_ignore_ascii_case("+g.3gpp.smsip") {
                 advertises_sms_over_ip = true;
             }
+            if name.eq_ignore_ascii_case("+sip.instance") {
+                declared_sip_instance = true;
+            }
             contact.push(';');
             contact.push_str(parameter);
         }
-    } else if profile.is_none() {
+    } else {
         contact.push_str(&format!(";+g.3gpp.accesstype=\"{access_network_info}\""));
         if policy.include_mmtel_features {
             contact.push_str(";audio");
@@ -465,22 +539,37 @@ fn build_register_internal(
             contact.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", MMTEL_ICSI_REF));
         }
         contact.push_str(&format!(";+sip.instance=\"<{}>\"", sip_instance));
+        // RFC 5626: reg-id only has meaning next to the instance it pairs
+        // with, so emit it here rather than letting the tail append a second
+        // +sip.instance further down the parameter list.
+        if always_add_sip_instance {
+            contact.push_str(&format!(";reg-id={CELLULAR_REG_ID}"));
+        }
+        declared_sip_instance = true;
         contact.push_str(&format!(";expires={expires}"));
     }
     if !advertises_sms_over_ip {
         contact.push_str(";+g.3gpp.smsip");
     }
-    if profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance) {
-        contact.push_str(&format!(";+sip.instance=\"<{}>\";reg-id=1", sip_instance));
+    if always_add_sip_instance && !declared_sip_instance {
+        contact.push_str(&format!(
+            ";+sip.instance=\"<{}>\";reg-id={CELLULAR_REG_ID}",
+            sip_instance
+        ));
     }
-    let visited_network = profile
-        .and_then(|profile| profile.ims.register.visited_network_header)
-        .or_else(|| (profile.is_none() && policy.include_visited_network).then(|| ""))
+    let visited_network = visited_network_override
+        .map(str::to_string)
+        .or_else(|| {
+            profile
+                .and_then(|profile| profile.ims.register.visited_network_header)
+                .map(str::to_string)
+        })
+        .or_else(|| (profile.is_none() && policy.include_visited_network).then(String::new))
         .map(|value| {
             if value.is_empty() {
                 format!("\"{}\"", identity.home_domain)
             } else {
-                value.to_string()
+                value
             }
         });
     crate::connectivity::core::register_message::build_register(&RegisterRequest {
@@ -495,6 +584,10 @@ fn build_register_internal(
         headers: RegisterHeaderFields {
             authorization: authorization.map(str::to_string),
             contact,
+            // REGISTER publishes the UE's MMTEL capability through the
+            // Contact feature tags above. Accept-Contact is caller preference
+            // for a target request and P-Preferred-Service selects the service
+            // of that request; neither belongs on this registration binding.
             accept_contacts: Vec::new(),
             route: policy.include_route_header.then(|| {
                 format!(
@@ -508,6 +601,7 @@ fn build_register_internal(
             require_sec_agree: policy.require_sec_agree,
             proxy_require_sec_agree: policy.proxy_require_sec_agree,
             allow: Some(params.allow_header),
+            preferred_service: None,
             preferred_identity: profile
                 .is_none_or(|profile| profile.ims.register.include_p_preferred_identity)
                 .then(|| format!("<{}>", identity.public_uri)),
@@ -638,7 +732,7 @@ pub fn build_invite(
     sdp_offer: &[u8],
     security_verify: Option<&str>,
 ) -> Vec<u8> {
-    build_invite_for_access(
+    build_invite_for_access_with_supported(
         identity,
         route,
         service_route,
@@ -648,6 +742,7 @@ pub fn build_invite(
         security_verify,
         PANI_EUTRAN,
         USER_AGENT,
+        "100rel, precondition",
     )
 }
 
@@ -665,6 +760,33 @@ pub fn build_invite_for_access(
     security_verify: Option<&str>,
     pani: &str,
     user_agent: &str,
+) -> Vec<u8> {
+    build_invite_for_access_with_supported(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        sdp_offer,
+        security_verify,
+        pani,
+        user_agent,
+        "100rel, timer",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_invite_for_access_with_supported(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    sdp_offer: &[u8],
+    security_verify: Option<&str>,
+    pani: &str,
+    user_agent: &str,
+    supported: &str,
 ) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
@@ -694,7 +816,7 @@ pub fn build_invite_for_access(
             "Allow",
             "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS",
         ),
-        SipHeader::new("Supported", "100rel, precondition"),
+        SipHeader::new("Supported", supported),
     ];
     if let Some(sv) = security_verify {
         headers.push(SipHeader::new("Security-Verify", sv));
@@ -832,6 +954,24 @@ pub fn build_ack(
     dialog: &DialogIds,
     callee_uri: &str,
 ) -> Vec<u8> {
+    build_ack_for_access(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        USER_AGENT,
+    )
+}
+
+pub fn build_ack_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    user_agent: &str,
+) -> Vec<u8> {
     let branch = new_branch();
     let to = match &dialog.remote_tag {
         Some(tag) => format!("<{callee_uri}>;tag={tag}"),
@@ -839,7 +979,7 @@ pub fn build_ack(
     };
     let headers = [
         SipHeader::new("Route", route_header_value(route, service_route)),
-        SipHeader::new("User-Agent", USER_AGENT),
+        SipHeader::new("User-Agent", user_agent),
     ];
     crate::connectivity::core::sip_message::build_ack(&SipRequest {
         method: "ACK",
@@ -871,6 +1011,31 @@ pub fn build_prack(
     rseq: u32,
     invite_cseq: u32,
 ) -> Vec<u8> {
+    build_prack_for_access(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        cseq,
+        rseq,
+        invite_cseq,
+        USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_prack_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    rseq: u32,
+    invite_cseq: u32,
+    user_agent: &str,
+) -> Vec<u8> {
     let branch = new_branch();
     let to = match &dialog.remote_tag {
         Some(tag) => format!("<{callee_uri}>;tag={tag}"),
@@ -879,7 +1044,7 @@ pub fn build_prack(
     let headers = [
         SipHeader::new("Route", route_header_value(route, service_route)),
         SipHeader::new("RAck", format!("{rseq} {invite_cseq} INVITE")),
-        SipHeader::new("User-Agent", USER_AGENT),
+        SipHeader::new("User-Agent", user_agent),
     ];
     crate::connectivity::core::sip_message::build_request(&SipRequest {
         method: "PRACK",
@@ -905,6 +1070,27 @@ pub fn build_bye(
     dialog: &DialogIds,
     callee_uri: &str,
     cseq: u32,
+) -> Vec<u8> {
+    build_bye_for_access(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        cseq,
+        USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_bye_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    user_agent: &str,
 ) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
@@ -932,9 +1118,51 @@ pub fn build_bye(
     h.push_str(&format!("To: {to}\r\n"));
     h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
     h.push_str(&format!("CSeq: {cseq} BYE\r\n"));
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("User-Agent: {user_agent}\r\n"));
     h.push_str("Content-Length: 0\r\n\r\n");
     h.into_bytes()
+}
+
+/// Build an out-of-dialog OPTIONS request used to verify that the registered
+/// cellular binding is still reachable.  The request deliberately carries the
+/// current Service-Route/security binding, but no digest credentials: a
+/// registrar may answer 401/403 and that is still useful evidence that the
+/// SIP path is alive; only transport timeout is treated as a dead leg.
+pub fn build_options(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    cseq: u32,
+    security_verify: Option<&str>,
+) -> Vec<u8> {
+    use crate::connectivity::core::sip_message::build_request;
+
+    let ids = RequestIds::fresh(cseq);
+    let route_header = route_header_value(route, service_route);
+    let to = format!("<{}>", identity.public_uri);
+    let mut headers = vec![
+        SipHeader::new("Route", route_header),
+        SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
+        SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
+        SipHeader::new("Accept", "application/sdp"),
+    ];
+    if let Some(value) = security_verify {
+        headers.push(SipHeader::new("Security-Verify", value));
+    }
+    headers.push(SipHeader::new("User-Agent", USER_AGENT));
+    build_request(&SipRequest {
+        method: "OPTIONS",
+        request_uri: &identity.public_uri,
+        route: *route,
+        branch: &new_branch(),
+        from_uri: &identity.public_uri,
+        from_tag: &ids.from_tag,
+        to_value: &to,
+        call_id: &ids.call_id,
+        cseq: ids.cseq,
+        headers: &headers,
+        body: &[],
+    })
 }
 
 /// Build an in-dialog SIP INFO carrying one DTMF digit. This is the signaling
@@ -1030,6 +1258,27 @@ pub fn build_cancel(
     callee_uri: &str,
     invite_branch: &str,
 ) -> Vec<u8> {
+    build_cancel_for_access(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        invite_branch,
+        USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_cancel_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    invite_branch: &str,
+    user_agent: &str,
+) -> Vec<u8> {
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
 
@@ -1052,7 +1301,7 @@ pub fn build_cancel(
     h.push_str(&format!("To: <{callee_uri}>\r\n"));
     h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
     h.push_str(&format!("CSeq: {} CANCEL\r\n", dialog.cseq));
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("User-Agent: {user_agent}\r\n"));
     h.push_str("Content-Length: 0\r\n\r\n");
     h.into_bytes()
 }
@@ -1068,6 +1317,21 @@ pub fn build_response(
     local_tag: Option<&str>,
     contact: Option<&str>,
     sdp_answer: Option<&[u8]>,
+) -> Vec<u8> {
+    build_response_for_access(
+        request, status, reason, local_tag, contact, sdp_answer, USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_response_for_access(
+    request: &[u8],
+    status: u16,
+    reason: &str,
+    local_tag: Option<&str>,
+    contact: Option<&str>,
+    sdp_answer: Option<&[u8]>,
+    user_agent: &str,
 ) -> Vec<u8> {
     let mut h = String::new();
     h.push_str(&format!("SIP/2.0 {status} {reason}\r\n"));
@@ -1102,7 +1366,7 @@ pub fn build_response(
     if let Some(contact) = contact {
         h.push_str(&format!("Contact: <{contact}>\r\n"));
     }
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("User-Agent: {user_agent}\r\n"));
     match sdp_answer {
         Some(body) => {
             h.push_str("Content-Type: application/sdp\r\n");
@@ -1260,6 +1524,37 @@ mod tests {
     }
 
     #[test]
+    fn roaming_register_overrides_static_visited_network_only_for_this_request() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let frame = build_register_from_profile_with_target_and_visited(
+            &profile,
+            RegisterTarget::from_profile(&profile),
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy {
+                include_visited_network: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+            Some("\"ims.mnc000.mcc460.3gppnetwork.org\""),
+        );
+        assert_eq!(
+            header_value(&frame, "P-Visited-Network-ID").as_deref(),
+            Some("\"ims.mnc000.mcc460.3gppnetwork.org\"")
+        );
+        assert_eq!(
+            profile.ims.register.visited_network_header,
+            Some("\"legacy-test-profile\"")
+        );
+    }
+
+    #[test]
     fn carrier_policy_adds_imei_sip_instance_and_reg_id_to_contact() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         profile.ims.register.always_add_sip_instance = true;
@@ -1277,7 +1572,20 @@ mod tests {
             RegisterRequestPolicy::LEGACY,
         );
         let text = String::from_utf8(frame).unwrap();
-        assert!(text.contains(";+sip.instance=\"<urn:imei:490154203237518>\";reg-id=1"));
+        assert!(text.contains(&format!(
+            ";+sip.instance=\"<urn:imei:490154203237518>\";reg-id={CELLULAR_REG_ID}"
+        )));
+    }
+
+    #[test]
+    fn cellular_reg_id_never_equals_the_wlan_leg() {
+        // The two legs share one +sip.instance now, so RFC 5626 §6 keys their
+        // bindings on (AOR, instance-id, reg-id) alone. If this ever collides,
+        // whichever leg registers second replaces the other's binding while our
+        // runtime still reports both as registered.
+        use crate::connectivity::core::ims_access::ImsAccess;
+        assert_eq!(CELLULAR_REG_ID, ImsAccess::Cellular.reg_id());
+        assert_ne!(CELLULAR_REG_ID, ImsAccess::Wlan.reg_id());
     }
 
     #[test]
@@ -1314,6 +1622,204 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn catalog_profile_without_contact_parameters_still_advertises_mmtel() {
+        // Regression: a profile with an empty contact_param_order used to skip
+        // both Contact arms, emitting a bare
+        // `<sip:...;transport=udp>;+g.3gpp.smsip`. Without +g.3gpp.icsi-ref the
+        // S-CSCF does not treat the registration as MMTEL voice capable and MT
+        // calls are never delivered, even though REGISTER answers 200 OK.
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &[];
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy {
+                include_mmtel_features: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+        let contact = header_value(text.as_bytes(), "Contact").unwrap();
+        assert!(contact.contains(";audio"));
+        assert!(contact.contains(&format!(";+g.3gpp.icsi-ref=\"{MMTEL_ICSI_REF}\"")));
+        assert!(contact.contains(";+sip.instance=\"<urn:uuid:test>\""));
+        assert!(contact.contains(";expires="));
+        assert_eq!(
+            contact
+                .to_ascii_lowercase()
+                .matches("+g.3gpp.smsip")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mmtel_register_keeps_lte_pani_across_registration_phases() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.include_pani_initial = false;
+        profile.ims.register.include_pani_authenticated = false;
+        profile.ims.register.access_network_info = "3GPP-E-UTRAN-FDD";
+
+        for phase in [
+            RegisterPhase::Initial,
+            RegisterPhase::Authenticated,
+            RegisterPhase::Refresh,
+        ] {
+            let frame = build_register_from_profile(
+                &profile,
+                phase,
+                &ident(),
+                &route_udp(),
+                &RequestIds::fresh(1),
+                profile.ims.register.expires_seconds,
+                None,
+                None,
+                None,
+                "urn:uuid:test",
+                RegisterRequestPolicy {
+                    include_mmtel_features: true,
+                    ..RegisterRequestPolicy::LEGACY
+                },
+            );
+            assert_eq!(
+                header_value(&frame, "P-Access-Network-Info").as_deref(),
+                Some("3GPP-E-UTRAN-FDD"),
+                "missing PANI during {phase:?} REGISTER"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_reregistration_repeats_security_client_and_verify() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Refresh,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            Some("Digest username=\"impi\", realm=\"ims.example\", uri=\"sip:ims.example\""),
+            Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=6000;port-s=6001"),
+            Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=6000;port-s=6001"),
+            "urn:uuid:test",
+            RegisterRequestPolicy {
+                advertise_sec_agree: true,
+                require_sec_agree: true,
+                proxy_require_sec_agree: true,
+                include_mmtel_features: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.contains("Security-Client: ipsec-3gpp;"));
+        assert!(text.contains("Security-Verify: ipsec-3gpp;"));
+        assert!(text.contains("Require: sec-agree\r\n"));
+        assert!(text.contains("Proxy-Require: sec-agree\r\n"));
+    }
+
+    #[test]
+    fn non_mmtel_register_still_obeys_carrier_pani_policy() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.include_pani_initial = false;
+        profile.ims.register.include_pani_authenticated = false;
+
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy::LEGACY,
+        );
+        assert!(header_value(&frame, "P-Access-Network-Info").is_none());
+        assert!(header_value(&frame, "Allow").is_none());
+    }
+
+    #[test]
+    fn empty_contact_parameters_keep_sip_instance_single_with_reg_id() {
+        // always_add_sip_instance must not append a second +sip.instance when
+        // the fallback arm already emitted one.
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &[];
+        profile.ims.register.always_add_sip_instance = true;
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:imei:490154203237518",
+            RegisterRequestPolicy {
+                include_mmtel_features: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+        let contact = header_value(text.as_bytes(), "Contact").unwrap();
+        assert_eq!(
+            contact
+                .to_ascii_lowercase()
+                .matches("+sip.instance")
+                .count(),
+            1
+        );
+        assert_eq!(
+            contact
+                .matches(&format!(";reg-id={CELLULAR_REG_ID}"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_contact_parameters_are_not_widened_by_the_fallback() {
+        // A bundle that spells out its Contact list keeps expressing the whole
+        // opinion: no accesstype, no icsi-ref, no expires get bolted on.
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &["+g.3gpp.mid-call"];
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy {
+                include_mmtel_features: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+        let contact = header_value(text.as_bytes(), "Contact").unwrap();
+        assert!(contact.contains(";+g.3gpp.mid-call;+g.3gpp.smsip"));
+        assert!(!contact.contains("+g.3gpp.icsi-ref"));
+        assert!(!contact.contains("+g.3gpp.accesstype"));
+        assert!(!contact.contains(";expires="));
     }
 
     #[test]
@@ -1451,9 +1957,11 @@ mod tests {
         assert!(text.contains(";audio;+g.3gpp.smsip;+g.3gpp.icsi-ref=\""));
         assert!(text.contains(";+sip.instance=\"<urn:uuid:"));
         assert!(!text.contains("Accept-Contact:"));
+        assert!(!text.contains("P-Preferred-Service:"));
         assert!(text.contains("Route: <sip:10.0.0.1:5060;lr>\r\n"));
         assert!(text.contains("P-Visited-Network-ID: \"ims.mnc000.mcc460.3gppnetwork.org\"\r\n"));
         assert!(text.contains("Supported: path, gruu, sec-agree\r\n"));
+        assert!(text.contains(&format!("Allow: {MMTEL_ALLOW_METHODS}\r\n")));
         assert!(!text.contains("Require: sec-agree\r\n"));
         assert!(!text.contains("Proxy-Require: sec-agree\r\n"));
         assert!(!text.contains("Authorization:"));
@@ -1641,6 +2149,54 @@ mod tests {
         assert!(text.starts_with("BYE sip:+8613800138000@h SIP/2.0\r\n"));
         assert!(text.contains("CSeq: 2 BYE\r\n"));
         assert!(text.contains("To: <sip:+8613800138000@h>;tag=rt\r\n"));
+    }
+
+    #[test]
+    fn access_specific_dialog_messages_use_the_requested_user_agent() {
+        let identity = ident();
+        let route = route_udp();
+        let mut dialog = DialogIds::fresh();
+        dialog.set_remote_tag("remote-tag");
+        let callee = "sip:+8613800138000@h";
+        let user_agent = "SimAdmin VoWiFi Test";
+        let frames = [
+            build_ack_for_access(&identity, &route, None, &dialog, callee, user_agent),
+            build_prack_for_access(
+                &identity, &route, None, &dialog, callee, 2, 77, 1, user_agent,
+            ),
+            build_bye_for_access(
+                &identity, &route, None, &dialog, callee, 2, user_agent,
+            ),
+            build_cancel_for_access(
+                &identity,
+                &route,
+                None,
+                &dialog,
+                callee,
+                "z9hG4bKinvite",
+                user_agent,
+            ),
+            build_response_for_access(
+                b"OPTIONS sip:user@h SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKrequest\r\nFrom: <sip:user@h>;tag=from-tag\r\nTo: <sip:me@h>\r\nCall-ID: request-call-id\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+                200,
+                "OK",
+                Some("local-tag"),
+                None,
+                None,
+                user_agent,
+            ),
+        ];
+
+        for frame in frames {
+            assert_eq!(
+                header_value(&frame, "User-Agent").as_deref(),
+                Some(user_agent)
+            );
+            assert_ne!(
+                header_value(&frame, "User-Agent").as_deref(),
+                Some(USER_AGENT)
+            );
+        }
     }
 
     #[test]

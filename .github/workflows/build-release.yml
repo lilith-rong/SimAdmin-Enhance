@@ -16,6 +16,7 @@ on:
     branches:
       - main
       - master
+      - feat/catalog-free-iphone-fallback
   workflow_dispatch:
     inputs:
       version:
@@ -64,14 +65,16 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
           EVENT_NAME: ${{ github.event_name }}
-          RUN_NUMBER: ${{ github.run_number }}
         run: |
           CURRENT_VERSION=$(cat VERSION | tr -d '[:space:]')
           VERSION=$(echo "$INPUT_VERSION" | tr -d '[:space:]')
 
           if [ "$EVENT_NAME" = "push" ]; then
-            VERSION="${CURRENT_VERSION}-build.${RUN_NUMBER}"
-            SOURCE="push build"
+            # A push is a release of the version explicitly recorded in VERSION.
+            # Do not append the Actions run number: it makes the package version
+            # differ from the source version and creates build-N release tags.
+            VERSION="$CURRENT_VERSION"
+            SOURCE="VERSION file (push)"
           elif [ -z "$VERSION" ] || [ "$VERSION" = "auto" ]; then
             VERSION="$CURRENT_VERSION"
             SOURCE="VERSION file"
@@ -142,6 +145,43 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # ==================== 1.5 测试代码类型检查（不阻塞发布） ====================
+  #
+  # 发布流水线只跑 `cargo build --release`，而 release 构建根本不编译
+  # `#[cfg(test)]` 代码。后果是真实存在过的：VoWiFi 的 Contact 兜底分支被
+  # `#[cfg(test)]` 包着，release 里那个 else 是空的 —— 发出的 REGISTER 一个
+  # feature tag 都没有，而覆盖它的测试照样"通过"，因为测试里那段代码存在。
+  #
+  # `cargo test --no-run` 只编译不执行：既能抓住这类只存在于测试构建中的
+  # 代码，也不会碰到 WSL/CI 里跑真实网络测试的那些坑。
+  # continue-on-error 保证它永远不挡发布 —— 这是信号，不是闸门。
+  check-tests:
+    name: Type-check test code (non-blocking)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            backend/target/
+          key: ${{ runner.os }}-checktests-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-checktests-cargo-
+
+      - name: Compile tests without running them
+        working-directory: backend
+        run: cargo test --no-run --locked
+
   # ==================== 2. 后端构建 + 分架构打包 ====================
   build:
     name: Build ${{ matrix.arch }} (${{ matrix.target }})
@@ -179,6 +219,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install musl toolchain
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
@@ -286,7 +327,6 @@ jobs:
 
           # ---- DATA6 / secondary-QMI boot resources ----
           mkdir -p "$TMP/system"
-          cp deploy/system/99-simadmin-secondary-qmi.rules "$TMP/system/"
           cp deploy/system/simadmin-secondary-qmi.service "$TMP/system/"
           cp scripts/simadmin-modem-recovery.sh "$TMP/system/"
           cp scripts/simadmin-modem-recovery.service "$TMP/system/"
@@ -308,8 +348,8 @@ jobs:
           mkdir -p release
           OUT="release/simadmin-linux-${ARCH}.tar.gz"
 
-          # system/ carries the unit and fallback udev rule needed to reserve
-          # the DATA6 endpoint before ModemManager starts.
+          # system/ carries the unit that reserves the DATA6 endpoint before
+          # ModemManager starts. The udev rule it needs is generated at runtime.
           ( cd "$TMP" && tar -czf - meta.json simadmin www system ) > "$OUT"
 
           echo ""
@@ -334,6 +374,22 @@ jobs:
           path: release/simadmin-linux-${{ matrix.arch }}.tar.gz
           retention-days: 3
           if-no-files-found: error
+
+      # Do not make device deployments wait for an unrelated architecture.
+      # The final release job below still publishes both packages and checksums
+      # after the full matrix succeeds.
+      - name: Publish ARM64 package when ready
+        if: matrix.arch == 'arm64'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          files: release/simadmin-linux-arm64.tar.gz
+          overwrite_files: true
+          draft: false
+          prerelease: false
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ==================== 3. 汇总所有架构并发布 Release ====================
   release:

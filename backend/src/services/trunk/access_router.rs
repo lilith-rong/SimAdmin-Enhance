@@ -227,6 +227,15 @@ impl VoiceAccessRouter {
             .find(|kind| kind.is_ims())
     }
 
+    /// Whether the media gateway backing one access can carry a call right now.
+    ///
+    /// Reported by the IMS status API so the UI can tell "this access is not
+    /// registered" apart from "this access is registered, but has no media path"
+    /// — two very different faults that a single readiness flag would merge.
+    pub fn media_gateway_ready(&self, kind: AccessPathKind) -> bool {
+        backend(&self.backends, kind).is_some_and(|backend| backend.link.is_available())
+    }
+
     /// Route a locally-originated call through the same policy and route table
     /// used by the Asterisk trunk. The selected access is returned only after
     /// its `StartCall` command has been accepted by the registered live leg.
@@ -341,7 +350,7 @@ async fn run_router(
                     if response.is_closed() {
                         continue;
                     }
-                    let result = route_call_plan(plan, &policy, &backends, &mut routes);
+                    let result = route_call_plan(plan, &trunk, &policy, &backends, &mut routes);
                     let _ = response.send(result);
                 }
                 Some(RouterRequest::CallAccess { call_id, response }) => {
@@ -364,6 +373,7 @@ async fn run_router(
 
 fn route_call_plan(
     plan: VoiceCallPlan,
+    trunk: &OperatorLink,
     policy: &RwLock<VoicePathPolicy>,
     backends: &[AccessBackend],
     routes: &mut HashMap<String, CallRoute>,
@@ -379,6 +389,14 @@ fn route_call_plan(
             continue;
         };
         if selected.link.send_command(command.clone()).is_ok() {
+            // There is no await between accepting the backend command and
+            // publishing this event, so live provisional/final events cannot
+            // overtake creation of the API/history call record.
+            trunk.send_event(OperatorEvent::Started {
+                call_id: plan.call_id.clone(),
+                caller: plan.caller.clone(),
+                callee: plan.callee.clone(),
+            });
             routes.insert(
                 plan.call_id.clone(),
                 CallRoute {
@@ -489,6 +507,13 @@ fn route_command(
 ) {
     let call_id = command_call_id(&command).to_string();
     if matches!(&command, OperatorCommand::StartCall { .. }) {
+        if let OperatorCommand::StartCall { caller, callee, .. } = &command {
+            trunk.send_event(OperatorEvent::Started {
+                call_id: call_id.clone(),
+                caller: caller.clone(),
+                callee: callee.clone(),
+            });
+        }
         let video_required = matches!(
             &command,
             OperatorCommand::StartCall { offer, .. } if offer.video.is_some()
@@ -650,7 +675,9 @@ fn command_call_id(command: &OperatorCommand) -> &str {
 
 fn event_call_id(event: &OperatorEvent) -> &str {
     match event {
-        OperatorEvent::Incoming { call_id, .. }
+        OperatorEvent::Started { call_id, .. }
+        | OperatorEvent::Connected { call_id }
+        | OperatorEvent::Incoming { call_id, .. }
         | OperatorEvent::Provisional { call_id, .. }
         | OperatorEvent::Answered { call_id, .. }
         | OperatorEvent::Renegotiate { call_id, .. }
@@ -774,6 +801,15 @@ mod tests {
             .expect("operator command channel closed")
     }
 
+    async fn recv_event(
+        receiver: &mut tokio::sync::broadcast::Receiver<OperatorEvent>,
+    ) -> OperatorEvent {
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("operator event timed out")
+            .expect("operator event channel closed")
+    }
+
     #[tokio::test]
     async fn pins_all_commands_to_the_selected_access_leg() {
         let vowifi = OperatorLink::default();
@@ -790,9 +826,15 @@ mod tests {
             ],
         );
         let trunk = router.operator_link();
+        let mut trunk_events = trunk.subscribe_events();
         wait_available(&trunk).await;
 
         trunk.send_command(start("call-a")).unwrap();
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Started { call_id, caller, callee }
+                if call_id == "call-a" && caller == "6108" && callee == "+601112023012"
+        ));
         assert!(matches!(
             recv_command(&mut vowifi_commands).await,
             OperatorCommand::StartCall { .. }
@@ -833,6 +875,7 @@ mod tests {
                 (AccessPathKind::Volte, volte),
             ],
         );
+        let mut lifecycle_events = router.operator_link().subscribe_events();
 
         let queued = router
             .start_call(call_plan("local-voicemail-a"))
@@ -840,6 +883,13 @@ mod tests {
             .unwrap();
         assert_eq!(queued.call_id, "local-voicemail-a");
         assert_eq!(queued.access, AccessPathKind::Volte);
+        assert!(matches!(
+            recv_event(&mut lifecycle_events).await,
+            OperatorEvent::Started { call_id, caller, callee }
+                if call_id == "local-voicemail-a"
+                    && caller == "6108"
+                    && callee == "+601112023012"
+        ));
         assert!(matches!(
             recv_command(&mut volte_commands).await,
             OperatorCommand::StartCall { call_id, .. } if call_id == "local-voicemail-a"
@@ -966,6 +1016,14 @@ mod tests {
             recv_command(&mut volte_commands).await,
             OperatorCommand::StartCall { call_id, .. } if call_id == "call-b"
         ));
+        // Dispatching the StartCall publishes `Started` upstream before any
+        // backend replies, so drain it here. What must not surface is the
+        // `Unavailable` from the first leg -- the failover has to stay
+        // invisible to the trunk.
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Started { call_id, .. } if call_id == "call-b"
+        ));
         assert!(matches!(
             trunk_events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -1040,10 +1098,17 @@ mod tests {
             call_id: "dtmf-call".into(),
             body: Vec::new(),
         });
-        let _ = tokio::time::timeout(Duration::from_secs(1), trunk_events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        // Two events precede the DTMF: `Started` from dispatching the
+        // StartCall, then the answered leg. Asserting both by name keeps a
+        // future extra emission from being absorbed by a bare discard.
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Started { call_id, .. } if call_id == "dtmf-call"
+        ));
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Answered { call_id, .. } if call_id == "dtmf-call"
+        ));
 
         let outbound = DtmfSignal {
             digit: '5',
@@ -1104,10 +1169,12 @@ mod tests {
             call_id: "transfer-call".into(),
             body: Vec::new(),
         });
-        let _ = tokio::time::timeout(Duration::from_secs(1), trunk_events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        // Dispatching the StartCall publishes `Started` upstream; name it so a
+        // future extra emission cannot be absorbed by a bare discard.
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Started { call_id, .. } if call_id == "transfer-call"
+        ));
         drop(vowifi_commands);
 
         trunk
@@ -1116,14 +1183,32 @@ mod tests {
                 refer_to: "sip:+601199999999@ims.example".into(),
             })
             .unwrap();
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), trunk_events.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            OperatorEvent::TransferResponse { call_id, status: 503 }
-                if call_id == "transfer-call"
-        ));
+
+        // The backend `Answered` and the `TransferResponse` published by the
+        // failed dispatch reach the trunk through two different arms of the
+        // router's select loop, so their relative order is not deterministic --
+        // asserting the 503 comes next fails roughly half the time. Scan for it
+        // instead, and let any terminal event fail the test: the point of this
+        // case is that only the REFER transaction ends, not the call.
+        let mut transfer_status = None;
+        for _ in 0..4 {
+            match recv_event(&mut trunk_events).await {
+                OperatorEvent::TransferResponse { call_id, status } => {
+                    assert_eq!(call_id, "transfer-call");
+                    transfer_status = Some(status);
+                    break;
+                }
+                OperatorEvent::Answered { call_id, .. } => {
+                    assert_eq!(call_id, "transfer-call");
+                }
+                other => panic!("unexpected event before the transfer response: {other:?}"),
+            }
+        }
+        assert_eq!(
+            transfer_status,
+            Some(503),
+            "the failed REFER dispatch must report 503"
+        );
     }
 
     #[tokio::test]

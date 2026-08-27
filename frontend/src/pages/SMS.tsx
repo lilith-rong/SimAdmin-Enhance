@@ -218,6 +218,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
 
   // 聊天区域滚动引用
   const chatEndRef = useRef<HTMLDivElement>(null)
+  const messagesRef = useRef<SmsMessage[]>([])
 
   const scrollToBottom = useCallback(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -244,6 +245,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
         channel_id: selectedChannelId || undefined,
       })
       if (response.status === 'ok' && response.data) {
+        messagesRef.current = response.data.messages
         setMessages(response.data.messages)
         setConversations(buildConversations(response.data.messages))
       } else {
@@ -289,7 +291,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
         }
       }
     } catch {
-      const localMsgs = messages.filter((m) => (
+      const localMsgs = messagesRef.current.filter((m) => (
         m.phone_number === phone && (!channelId || smsChannelId(m) === channelId)
       ))
       const sorted = [...localMsgs].sort(compareSmsChronological)
@@ -308,7 +310,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
         setConversationLoading(false)
       }
     }
-  }, [messages, scrollToBottom, scrollToMessage, selectedChannelId])
+  }, [scrollToBottom, scrollToMessage, selectedChannelId])
 
   const fetchStats = useCallback(async () => {
     try {
@@ -359,18 +361,63 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
   }, [embeddedLineId])
 
   useEffect(() => {
-    void fetchMessages(false)
-    void fetchStats()
-    void fetchLines()
-    const interval = setInterval(() => {
-      void fetchMessages(true)
-      void fetchStats()
-      void fetchLines()
+    const eventSource = api.openAppEventStream({ lineId: embeddedLineId || undefined })
+    let fallbackTimer: number | undefined
+    let refreshDebounce: number | undefined
+
+    const refreshFromEvent = () => {
+      if (refreshDebounce !== undefined) window.clearTimeout(refreshDebounce)
+      refreshDebounce = window.setTimeout(() => {
+        void fetchMessages(true)
+        void fetchStats()
+        if (selectedConversation) void fetchConversation(phoneNumber, selectedConversationChannelId, undefined, true)
+      }, 250)
+    }
+
+    const refresh = async (isBackground: boolean) => {
+      await Promise.all([
+        fetchMessages(isBackground),
+        fetchStats(),
+        fetchLines(),
+      ])
       if (selectedConversation) {
-        void fetchConversation(phoneNumber, selectedConversationChannelId, undefined, true)
+        await fetchConversation(phoneNumber, selectedConversationChannelId, undefined, true)
       }
-    }, 10000)
-    return () => clearInterval(interval)
+    }
+
+    void refresh(false)
+    const calibrationTimer = window.setInterval(() => void refresh(true), 60_000)
+    eventSource.onopen = () => {
+      if (fallbackTimer !== undefined) {
+        window.clearInterval(fallbackTimer)
+        fallbackTimer = undefined
+      }
+    }
+    const onAppEvent = (rawEvent: Event) => {
+      const message = rawEvent as MessageEvent<string>
+      try {
+        const event = JSON.parse(message.data) as { event_type?: string; line_id?: string | null }
+        if (event.event_type?.startsWith('sms.') && (!event.line_id || !selectedChannelId || event.line_id === selectedChannelId)) {
+          refreshFromEvent()
+        }
+      } catch {
+        // Keep the existing polling fallback when an event payload is invalid.
+      }
+    }
+    eventSource.addEventListener('app_event', onAppEvent)
+    eventSource.onerror = () => {
+      if (fallbackTimer === undefined) {
+        void refresh(true)
+        fallbackTimer = window.setInterval(() => void refresh(true), 10_000)
+      }
+    }
+    return () => {
+      window.clearInterval(calibrationTimer)
+      if (fallbackTimer !== undefined) window.clearInterval(fallbackTimer)
+      if (refreshDebounce !== undefined) window.clearTimeout(refreshDebounce)
+      eventSource?.removeEventListener('app_event', onAppEvent)
+      eventSource?.close()
+    }
   }, [
     fetchConversation,
     fetchLines,
@@ -379,6 +426,8 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
     phoneNumber,
     selectedConversation,
     selectedConversationChannelId,
+    selectedChannelId,
+    embeddedLineId,
   ])
 
   const channelById = useMemo(() => new Map(

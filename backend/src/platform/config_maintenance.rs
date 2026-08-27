@@ -513,6 +513,7 @@ mod tests {
                 .unwrap(),
             1
         );
+        drop(connection);
         fs::remove_dir_all(dir).unwrap();
     }
 

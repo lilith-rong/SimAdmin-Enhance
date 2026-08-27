@@ -16,6 +16,11 @@ use std::{collections::VecDeque, future::Future, net::IpAddr, process::Output};
 
 use tokio::process::Command;
 
+use crate::platform::network_routing::{
+    host_selector, network_address, route_table, rule_priority, source_selector, RouteDomain,
+};
+use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
+
 use super::{
     errors::{code, VolteError},
     pcscf::ImsIpSettings,
@@ -487,12 +492,7 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
 /// Configure the address and DNS host routes for the dedicated bearer. No
 /// default route is added, preserving the management/Wi-Fi path.
 pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), VolteError> {
-    // A raw-IP bearer still has to be administratively UP before Linux accepts
-    // host routes or transmits bound SIP/RTP sockets.  In particular, a
-    // bam-dmux runtime-PM/firmware failure may surface here as EINVAL or
-    // ETIMEDOUT.  Propagate that first failure instead of obscuring it with the
-    // inevitable later "Device for nexthop is not up" route error.
-    run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await?;
+    ensure_bearer_interface_ready(&bearer.interface).await?;
     if let Some(mtu) = bearer.mtu {
         let mtu = mtu.to_string();
         run_ip(&["link", "set", "dev", &bearer.interface, "mtu", &mtu]).await?;
@@ -536,67 +536,449 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
     Err(last_error.unwrap_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING)))
 }
 
+/// Configure a dedicated native IMS netdev after it has been moved into its
+/// per-line worker namespace. No policy-rule/table indirection is needed there:
+/// the namespace itself is the route domain, so identical addresses on other
+/// UEs cannot collide.
+pub async fn configure_bearer_network_in_worker(
+    bearer: &BearerConnection,
+    worker: &UeWorkerHandle,
+) -> Result<(), VolteError> {
+    let mut ops = Vec::new();
+    if let Some(mtu) = bearer.mtu {
+        ops.push(NetConfigOp::LinkSetMtu {
+            ifname: bearer.interface.clone(),
+            mtu,
+        });
+    }
+    for (address, prefix, dns) in [
+        (
+            bearer.settings.ipv6_address,
+            bearer.ipv6_prefix.unwrap_or(64),
+            bearer.settings.ipv6_dns.as_slice(),
+        ),
+        (
+            bearer.settings.ipv4_address,
+            bearer.ipv4_prefix.unwrap_or(32),
+            bearer.settings.ipv4_dns.as_slice(),
+        ),
+    ] {
+        let Some(address) = address else { continue };
+        ops.push(NetConfigOp::AddrReplace {
+            ifname: bearer.interface.clone(),
+            cidr: format!("{address}/{prefix}"),
+        });
+        for server in dns {
+            ops.push(worker_host_route_op(bearer, *server)?);
+        }
+    }
+    if !ops
+        .iter()
+        .any(|op| matches!(op, NetConfigOp::AddrReplace { .. }))
+    {
+        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+    }
+    ops.push(NetConfigOp::LinkSetUp {
+        ifname: bearer.interface.clone(),
+    });
+    apply_worker_ops(worker, ops).await
+}
+
+pub async fn route_pcscf_in_worker(
+    bearer: &BearerConnection,
+    pcscf: IpAddr,
+    worker: &UeWorkerHandle,
+) -> Result<(), VolteError> {
+    apply_worker_ops(worker, vec![worker_host_route_op(bearer, pcscf)?]).await
+}
+
+pub async fn route_media_host_in_worker(
+    bearer: &BearerConnection,
+    host: IpAddr,
+    worker: &UeWorkerHandle,
+) -> Result<(), VolteError> {
+    apply_worker_ops(worker, vec![worker_host_route_op(bearer, host)?]).await
+}
+
+fn worker_host_route_op(
+    bearer: &BearerConnection,
+    host: IpAddr,
+) -> Result<NetConfigOp, VolteError> {
+    let source = bearer
+        .settings
+        .local_addr_for_family(host)
+        .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+    Ok(NetConfigOp::RouteReplace {
+        target: host_selector(host),
+        via: None,
+        dev: Some(bearer.interface.clone()),
+        src: Some(source.to_string()),
+        table: None,
+    })
+}
+
+async fn apply_worker_ops(
+    worker: &UeWorkerHandle,
+    ops: Vec<NetConfigOp>,
+) -> Result<(), VolteError> {
+    let outcome = worker.apply_net_config(ops).await.map_err(|error| {
+        VolteError::with_detail(code::COMMAND_FAILED, format!("worker net-config: {error}"))
+    })?;
+    if outcome.ok {
+        Ok(())
+    } else {
+        Err(VolteError::with_detail(
+            code::COMMAND_FAILED,
+            outcome
+                .error
+                .unwrap_or_else(|| "worker net-config failed".to_string()),
+        ))
+    }
+}
+
+/// Ensure that the kernel data path is usable before installing policy routes.
+///
+/// ModemManager reports a connected QMI bearer before the netdev has necessarily
+/// completed its remote OPEN handshake, so one administrative UP plus polling is
+/// the portable part of this function.
+///
+/// The non-portable part -- whether this baseband has latched a permanent error
+/// state that makes OPEN impossible -- is asked of the platform's
+/// [`BasebandFaultPolicy`] rather than tested inline. The 410's bam-dmux latch
+/// used to be hard-coded here, which made a generic IMS path assert something
+/// true of exactly one SoC and left other hardware nowhere to describe its own
+/// firmware defects. See `hardware/devices/baseband_faults.rs`.
+pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(), VolteError> {
+    if interface_is_up(interface).await {
+        return Ok(());
+    }
+    let faults = crate::hardware::devices::baseband_faults::detected_fault_policy();
+    let latched_error = |interface: &str, when: &str| {
+        let fault = faults.inspect_data_interface(interface);
+        let detail = match faults.fault_note(fault) {
+            Some(note) => format!("interface={interface}: {when} ({note})"),
+            None => format!("interface={interface}: {when}"),
+        };
+        VolteError::with_detail(code::BEARER_NETDEV_RUNTIME_ERROR, detail)
+    };
+    if !faults
+        .inspect_data_interface(interface)
+        .permits_bring_up()
+    {
+        return Err(latched_error(interface, "runtime_status=error before OPEN"));
+    }
+
+    // One administrative UP is one remote OPEN request. Never issue several
+    // OPENs in a readiness loop: duplicate requests can race the modem
+    // firmware. Polling below only observes the result of this single request.
+    if let Err(error) = run_ip(&["link", "set", "dev", interface, "up"]).await {
+        if interface_is_up(interface).await {
+            return Ok(());
+        }
+        return Err(
+            if !faults
+                .inspect_data_interface(interface)
+                .permits_bring_up()
+            {
+                latched_error(interface, &error.to_string())
+            } else {
+                VolteError::with_detail(
+                    code::BEARER_NETDEV_NOT_UP,
+                    format!("interface={interface}: {error}"),
+                )
+            },
+        );
+    }
+
+    for attempt in 0..4 {
+        if interface_is_up(interface).await {
+            return Ok(());
+        }
+        if !faults
+            .inspect_data_interface(interface)
+            .permits_bring_up()
+        {
+            return Err(latched_error(interface, "runtime_status=error after OPEN"));
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    Err(VolteError::with_detail(
+        code::BEARER_NETDEV_NOT_READY,
+        format!("interface={interface} remained down after one OPEN request"),
+    ))
+}
+
+async fn interface_is_up(interface: &str) -> bool {
+    let Ok(output) = run_command("ip", &["-json", "link", "show", "dev", interface]).await else {
+        return false;
+    };
+    link_output_is_up(&output)
+}
+
+fn link_output_is_up(output: &str) -> bool {
+    let Ok(links) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return false;
+    };
+    links.first().is_some_and(|link| {
+        link.get("operstate")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|state| state.eq_ignore_ascii_case("up"))
+            || link
+                .get("flags")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|flags| {
+                    flags.iter().any(|flag| {
+                        flag.as_str().is_some_and(|flag| {
+                            flag.eq_ignore_ascii_case("up") || flag.eq_ignore_ascii_case("lower_up")
+                        })
+                    })
+                })
+    })
+}
+
+/// Confirm the address the policy routing was built around is still the one on
+/// the interface.
+///
+/// The IMS bearer is torn down and re-established between attempts and the
+/// network hands out a different address every time, so a `BearerConnection`
+/// captured moments earlier can name an address the interface no longer owns.
+/// The `ip rule` is keyed on that source address, so once it goes stale the
+/// REGISTER misses the bearer's table entirely and follows the host default
+/// route out of the wrong interface, where a private P-CSCF address is
+/// unroutable and the transaction simply times out.
+pub(crate) async fn interface_still_holds_address(interface: &str, address: IpAddr) -> bool {
+    let Ok(output) = run_command("ip", &["-json", "address", "show", "dev", interface]).await
+    else {
+        return false;
+    };
+    addr_output_contains(&output, address)
+}
+
+fn addr_output_contains(output: &str, address: IpAddr) -> bool {
+    let Ok(links) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return false;
+    };
+    let wanted = address.to_string();
+    links.iter().any(|link| {
+        link.get("addr_info")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry
+                        .get("local")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|local| local.eq_ignore_ascii_case(&wanted))
+                })
+            })
+    })
+}
+
 async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
-    let Some(IpAddr::V6(address)) = bearer.settings.ipv6_address else {
+    let Some(address @ IpAddr::V6(_)) = bearer.settings.ipv6_address else {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
     };
     let prefix = bearer.ipv6_prefix.unwrap_or(64);
-    let address = format!("{address}/{prefix}");
+    let address_with_prefix = format!("{address}/{prefix}");
     run_ip(&[
         "-6",
         "address",
         "replace",
-        &address,
+        &address_with_prefix,
         "dev",
         &bearer.interface,
     ])
     .await?;
+    configure_source_policy(&bearer.interface, address, prefix).await?;
     for dns in &bearer.settings.ipv6_dns {
-        route_host(&bearer.interface, *dns).await?;
+        route_host_on_bearer(bearer, *dns).await?;
     }
     Ok(())
 }
 
 async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), VolteError> {
-    let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address else {
+    let Some(address @ IpAddr::V4(_)) = bearer.settings.ipv4_address else {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
     };
     let prefix = bearer.ipv4_prefix.unwrap_or(32);
-    let address = format!("{address}/{prefix}");
-    run_ip(&["address", "replace", &address, "dev", &bearer.interface]).await?;
+    let address_with_prefix = format!("{address}/{prefix}");
+    run_ip(&[
+        "address",
+        "replace",
+        &address_with_prefix,
+        "dev",
+        &bearer.interface,
+    ])
+    .await?;
+    configure_source_policy(&bearer.interface, address, prefix).await?;
     for dns in &bearer.settings.ipv4_dns {
-        route_host(&bearer.interface, *dns).await?;
+        route_host_on_bearer(bearer, *dns).await?;
     }
     Ok(())
 }
 
 pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(), VolteError> {
-    route_host(&bearer.interface, pcscf).await
+    route_host_on_bearer(bearer, pcscf).await
 }
 
-async fn route_host(interface: &str, host: IpAddr) -> Result<(), VolteError> {
-    let (family, suffix) = if host.is_ipv6() {
-        (Some("-6"), 128)
-    } else {
-        (None, 32)
-    };
-    let destination = format!("{host}/{suffix}");
+/// Install a host route for an operator media address on the dedicated IMS
+/// bearer. RTP/RTCP and video endpoints are supplied dynamically in SDP and
+/// are not necessarily the P-CSCF address; without this route Linux may send
+/// media through the management/Wi-Fi default route.
+pub async fn route_media_host(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
+    route_host_on_bearer(bearer, host).await
+}
+
+/// IMS traffic must be selected by the bearer source address, not by the
+/// process-wide main route table. Multiple modems can receive the same remote
+/// RTP address, and a main-table `/32` would let the last line win.
+async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
+    // A dual-stack ModemManager bearer has two independent local addresses.
+    // `BearerConnection::local_addr()` intentionally returns the preferred
+    // address (currently IPv6-first), which is not necessarily the family
+    // selected by the current REGISTER attempt.  Comparing every destination
+    // with that preferred address made a valid IPv4 attempt fail with
+    // `volte_route_family_mismatch` whenever the same bearer also had IPv6.
+    // Select the local address belonging to the destination family instead.
+    let local = bearer
+        .settings
+        .local_addr_for_family(host)
+        .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+    if local.is_ipv4() != host.is_ipv4() {
+        return Err(VolteError::new("volte_route_family_mismatch"));
+    }
+    let table = route_table(RouteDomain::VolteIms, &bearer.interface, host);
+    let destination = host_selector(host);
+    let family = if host.is_ipv6() { Some("-6") } else { None };
+    let table = table.to_string();
     let mut args = Vec::new();
     if let Some(family) = family {
         args.push(family);
     }
-    args.extend_from_slice(&["route", "replace", &destination, "dev", interface]);
+    args.extend_from_slice(&[
+        "route",
+        "replace",
+        &destination,
+        "dev",
+        &bearer.interface,
+        "table",
+        &table,
+    ]);
     run_ip(&args).await.map(|_| ())
+}
+
+async fn configure_source_policy(
+    interface: &str,
+    address: IpAddr,
+    prefix: u8,
+) -> Result<(), VolteError> {
+    let family = if address.is_ipv6() { Some("-6") } else { None };
+    let table = route_table(RouteDomain::VolteIms, interface, address).to_string();
+    let priority = rule_priority(RouteDomain::VolteIms, interface, address).to_string();
+    let source = source_selector(address);
+    let connected = format!("{}/{prefix}", network_address(address, prefix));
+    let mut flush = Vec::new();
+    if let Some(family) = family {
+        flush.push(family);
+    }
+    flush.extend_from_slice(&["route", "flush", "table", &table]);
+    let _ = run_ip(&flush).await;
+
+    let mut delete = Vec::new();
+    if let Some(family) = family {
+        delete.push(family);
+    }
+    delete.extend_from_slice(&["rule", "del", "priority", &priority]);
+    let _ = run_ip(&delete).await;
+
+    let mut add = Vec::new();
+    if let Some(family) = family {
+        add.push(family);
+    }
+    add.extend_from_slice(&[
+        "rule", "add", "priority", &priority, "from", &source, "table", &table,
+    ]);
+    run_ip(&add).await?;
+
+    let mut connected_route = Vec::new();
+    if let Some(family) = family {
+        connected_route.push(family);
+    }
+    connected_route.extend_from_slice(&[
+        "route", "replace", &connected, "dev", interface, "table", &table,
+    ]);
+    run_ip(&connected_route).await.map(|_| ())
 }
 
 /// Remove network state only from the dedicated bearer interface. This is
 /// used on failed registration and normal teardown so stale IPv6 addresses or
 /// host routes cannot accumulate across long-running retries.
 pub async fn teardown_bearer_network(bearer: &BearerConnection) {
+    for (address, _prefix) in [
+        (bearer.settings.ipv4_address, bearer.ipv4_prefix),
+        (bearer.settings.ipv6_address, bearer.ipv6_prefix),
+    ] {
+        if let Some(address) = address {
+            let table = route_table(RouteDomain::VolteIms, &bearer.interface, address).to_string();
+            let priority =
+                rule_priority(RouteDomain::VolteIms, &bearer.interface, address).to_string();
+            let family = if address.is_ipv6() { Some("-6") } else { None };
+            let mut flush = Vec::new();
+            if let Some(family) = family {
+                flush.push(family);
+            }
+            flush.extend_from_slice(&["route", "flush", "table", &table]);
+            let _ = run_ip(&flush).await;
+            let mut delete = Vec::new();
+            if let Some(family) = family {
+                delete.push(family);
+            }
+            delete.extend_from_slice(&["rule", "del", "priority", &priority]);
+            let _ = run_ip(&delete).await;
+        }
+    }
     let _ = run_ip(&["-6", "route", "flush", "dev", &bearer.interface]).await;
     let _ = run_ip(&["route", "flush", "dev", &bearer.interface]).await;
     let _ = run_ip(&["address", "flush", "dev", &bearer.interface]).await;
-    let _ = run_ip(&["link", "set", "dev", &bearer.interface, "down"]).await;
+    // Let ModemManager/QMI own the bam-dmux CLOSE handshake when the bearer is
+    // disconnected. Sending `ip link down` here duplicates that operation and
+    // can race the firmware on Qualcomm SoCs, especially after a failed route
+    // setup. Ordinary interface state is cleaned up by the bearer disconnect.
+}
+
+/// Remove only network state owned by a native IMS interface in a UE worker.
+/// The worker namespace may also contain VoWiFi/veth state, so cleanup is
+/// deliberately device-scoped and never flushes the whole main table.
+pub async fn teardown_bearer_network_in_worker(bearer: &BearerConnection, worker: &UeWorkerHandle) {
+    let mut ops = vec![
+        NetConfigOp::FlushRoutesForDevice {
+            ifname: bearer.interface.clone(),
+            ipv6: true,
+        },
+        NetConfigOp::FlushRoutesForDevice {
+            ifname: bearer.interface.clone(),
+            ipv6: false,
+        },
+    ];
+    for (address, prefix) in [
+        (
+            bearer.settings.ipv6_address,
+            bearer.ipv6_prefix.unwrap_or(64),
+        ),
+        (
+            bearer.settings.ipv4_address,
+            bearer.ipv4_prefix.unwrap_or(32),
+        ),
+    ] {
+        if let Some(address) = address {
+            ops.push(NetConfigOp::AddrDel {
+                ifname: bearer.interface.clone(),
+                cidr: format!("{address}/{prefix}"),
+            });
+        }
+    }
+    let _ = worker.apply_net_config(ops).await;
 }
 
 /// Disconnect a ModemManager bearer.
@@ -701,6 +1083,40 @@ fn list_ip_values(output: &str, key_prefix: &str) -> Vec<IpAddr> {
 mod tests {
     use super::*;
 
+    /// Maxis re-addresses the IMS PDN on every activation, so the source-based
+    /// policy rule goes stale and SIP silently leaves via the host default
+    /// route. The liveness check has to notice the address is gone.
+    #[test]
+    fn address_liveness_follows_the_interface_not_the_snapshot() {
+        let configured = r#"[{"ifname":"wwan1","addr_info":[
+            {"family":"inet","local":"2.188.57.65","prefixlen":30},
+            {"family":"inet6","local":"2001:d08:1504:2c26::1","prefixlen":64}]}]"#;
+
+        assert!(addr_output_contains(
+            configured,
+            IpAddr::V4(std::net::Ipv4Addr::new(2, 188, 57, 65))
+        ));
+        // The address the bearer carried a moment ago is no longer present.
+        assert!(!addr_output_contains(
+            configured,
+            IpAddr::V4(std::net::Ipv4Addr::new(2, 181, 21, 248))
+        ));
+        assert!(addr_output_contains(
+            configured,
+            "2001:d08:1504:2c26::1".parse::<IpAddr>().unwrap()
+        ));
+
+        // An interface with no addresses, and unparsable output, are both "gone".
+        assert!(!addr_output_contains(
+            r#"[{"ifname":"wwan1","addr_info":[]}]"#,
+            IpAddr::V4(std::net::Ipv4Addr::new(2, 188, 57, 65))
+        ));
+        assert!(!addr_output_contains(
+            "not json",
+            IpAddr::V4(std::net::Ipv4Addr::new(2, 188, 57, 65))
+        ));
+    }
+
     #[test]
     fn wds_arg_with_and_without_profile() {
         let r = BearerRequest::default();
@@ -743,6 +1159,24 @@ mod tests {
             code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN
         );
     }
+
+    #[test]
+    fn parses_ip_json_link_state_without_substring_false_positives() {
+        assert!(link_output_is_up(
+            r#"[{"ifname":"wwan0","flags":["POINTOPOINT","UP","LOWER_UP"],"operstate":"UNKNOWN"}]"#
+        ));
+        assert!(link_output_is_up(
+            r#"[{"ifname":"wwan0","flags":["POINTOPOINT"],"operstate":"UP"}]"#
+        ));
+        assert!(!link_output_is_up(
+            r#"[{"ifname":"backup0","flags":["POINTOPOINT"],"operstate":"DOWN"}]"#
+        ));
+        assert!(!link_output_is_up("not-json"));
+    }
+
+    // Runtime-PM latch detection moved to
+    // hardware/devices/qcm410/baseband_faults.rs, which owns both the sysfs
+    // parsing and its tests. This module is platform-agnostic again.
 
     #[test]
     fn default_request_uses_ims_apn() {

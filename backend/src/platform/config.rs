@@ -8,6 +8,8 @@
 use rusqlite::{params, Connection as SqliteConnection, OptionalExtension, TransactionBehavior};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+use crate::connectivity::core::ims_access::ImsAccessPreference;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -558,6 +560,106 @@ pub struct DeviceNetworkConfig {
     pub ddns: DdnsConfig,
 }
 
+/// Per-UE isolation configuration (Linux network namespaces).
+///
+/// This is the master switch for the multi-UE architecture documented in
+/// `multi_ue_ims_volte_vowifi_architecture.md`. When enabled, every line gets
+/// its own UE Context and Linux network namespace so identical IPs, P-CSCF
+/// addresses and route state can never leak between SIMs. The data planes
+/// (VoLTE bearer netdev, VoWiFi TUN, per-UE proxy) are migrated into the
+/// namespace incrementally behind this switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UeIsolationConfig {
+    /// Master switch. Defaults to false: behaviour is exactly the current
+    /// host-namespace routing until the migration is complete.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Prefix for per-UE network namespace names.
+    #[serde(default = "default_ue_namespace_prefix")]
+    pub namespace_prefix: String,
+    /// Prefix for the host side of each UE egress veth pair.
+    #[serde(default = "default_ue_host_veth_prefix")]
+    pub host_veth_prefix: String,
+    /// Prefix for the UE side of each UE egress veth pair.
+    #[serde(default = "default_ue_veth_prefix")]
+    pub ue_veth_prefix: String,
+    /// MTU used for the egress veth pairs.
+    #[serde(default = "default_ue_veth_mtu")]
+    pub veth_mtu: u32,
+    /// Stage 2b gate: move the VoWiFi TUN device into the UE namespace after
+    /// creation. Defaults to false because the host-side SIP/RTP sockets still
+    /// bind by device name and cannot follow the TUN into another namespace
+    /// yet; enable only after the VoWiFi sockets are migrated into the worker.
+    #[serde(default)]
+    pub vowifi_tun_in_namespace: bool,
+    /// Stage 3 gate: place 3GPP IMS (LTE today, NR later) bearer networking,
+    /// SIP/XFRM and RTP sockets in the per-line worker namespace. The hardware
+    /// bearer stays device-owned and the host path remains the safe fallback.
+    #[serde(default)]
+    pub three_gpp_ims_sockets_in_worker: bool,
+    /// Stage 4 gate: run per-line proxy outbound sockets through its worker.
+    #[serde(default)]
+    pub data_proxy_in_worker: bool,
+    /// Stage 4 gate for trunk media sockets. Signalling and dialog ownership
+    /// are already line-scoped; this controls only operator RTP socket creation.
+    /// Depends on `three_gpp_ims_sockets_in_worker`; read it through
+    /// [`UeIsolationConfig::effective_trunk_sockets_in_worker`].
+    #[serde(default)]
+    pub trunk_sockets_in_worker: bool,
+}
+
+impl UeIsolationConfig {
+    /// Whether operator RTP sockets may actually be created inside the worker.
+    ///
+    /// Trunk media can only follow a bearer that already lives in the UE
+    /// namespace. Enabling this gate alone would advertise a worker that cannot
+    /// see the bearer interface, so the RTP socket would either fail to bind or
+    /// silently egress through an ambiguous host route — a half-migrated state
+    /// that reads as "enabled" while traffic still leaves via the host.
+    pub fn effective_trunk_sockets_in_worker(&self) -> bool {
+        self.trunk_sockets_in_worker && self.three_gpp_ims_sockets_in_worker
+    }
+
+    /// True when the trunk gate is set but suppressed by its missing
+    /// dependency. Callers use this to explain the ignored setting.
+    pub fn trunk_sockets_gate_suppressed(&self) -> bool {
+        self.trunk_sockets_in_worker && !self.three_gpp_ims_sockets_in_worker
+    }
+}
+
+impl Default for UeIsolationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace_prefix: default_ue_namespace_prefix(),
+            host_veth_prefix: default_ue_host_veth_prefix(),
+            ue_veth_prefix: default_ue_veth_prefix(),
+            veth_mtu: default_ue_veth_mtu(),
+            vowifi_tun_in_namespace: false,
+            three_gpp_ims_sockets_in_worker: false,
+            data_proxy_in_worker: false,
+            trunk_sockets_in_worker: false,
+        }
+    }
+}
+
+fn default_ue_namespace_prefix() -> String {
+    crate::platform::netns::DEFAULT_NAMESPACE_PREFIX.to_string()
+}
+
+fn default_ue_host_veth_prefix() -> String {
+    crate::platform::netns::DEFAULT_HOST_VETH_PREFIX.to_string()
+}
+
+fn default_ue_veth_prefix() -> String {
+    crate::platform::netns::DEFAULT_UE_VETH_PREFIX.to_string()
+}
+
+fn default_ue_veth_mtu() -> u32 {
+    crate::platform::netns::DEFAULT_VETH_MTU
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct VersionUpdateNotificationConfig {
@@ -588,6 +690,102 @@ impl Default for GithubDownloadProxyConfig {
             enabled: true,
             proxy_prefix: default_github_download_proxy_prefix(),
         }
+    }
+}
+
+/// On-disk diagnostic log settings.
+///
+/// The web UI keeps only the newest handful of activity entries; anything older
+/// exists solely in this file, which is the sole record when a field failure has
+/// to be reconstructed after the fact. Retention is enforced by whichever bound
+/// trips first — age or total bytes — so a burst of registration retries cannot
+/// fill the device flash and an idle device still ages its history out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DiagnosticLogConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Files older than this are deleted by the cleanup pass.
+    #[serde(default = "default_diagnostic_log_retention_days")]
+    pub retention_days: u32,
+    /// Combined ceiling across all rotated files, in mebibytes.
+    #[serde(default = "default_diagnostic_log_max_total_mb")]
+    pub max_total_mb: u32,
+    /// Lowest severity written to disk.
+    #[serde(default)]
+    pub min_severity: DiagnosticLogSeverity,
+    /// Mask subscriber identifiers (IMSI/IMPI/IMPU), phone numbers, SMS bodies
+    /// and P-CSCF addresses. On by default: the download endpoint hands the file
+    /// to anyone who can log in, and the recovery path for the common failures
+    /// (SIP status codes, error chains, stage transitions) does not need PII.
+    #[serde(default = "default_true")]
+    pub redact_sensitive: bool,
+    /// Directory override. Empty means the platform default.
+    #[serde(default)]
+    pub directory: Option<String>,
+}
+
+/// Severity ladder for on-disk diagnostic lines.
+///
+/// Deliberately ordered so `PartialOrd` expresses "at least as severe as", which
+/// is how the writer applies `min_severity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticLogSeverity {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl DiagnosticLogSeverity {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+fn default_diagnostic_log_retention_days() -> u32 {
+    7
+}
+
+fn default_diagnostic_log_max_total_mb() -> u32 {
+    50
+}
+
+impl Default for DiagnosticLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: default_diagnostic_log_retention_days(),
+            max_total_mb: default_diagnostic_log_max_total_mb(),
+            min_severity: DiagnosticLogSeverity::default(),
+            redact_sensitive: true,
+            directory: None,
+        }
+    }
+}
+
+impl DiagnosticLogConfig {
+    /// Reject values that would disable retention entirely or overflow the byte
+    /// math, so a bad API payload cannot turn the log into an unbounded writer.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.retention_days == 0 || self.retention_days > 365 {
+            return Err("日志保留天数需在 1-365 之间".to_string());
+        }
+        if self.max_total_mb == 0 || self.max_total_mb > 4096 {
+            return Err("日志体积上限需在 1-4096 MB 之间".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn max_total_bytes(&self) -> u64 {
+        u64::from(self.max_total_mb) * 1024 * 1024
     }
 }
 
@@ -1371,6 +1569,26 @@ pub enum AutomationAction {
 mod tests {
     use super::*;
 
+    /// Trunk media cannot enter a worker the bearer has not moved into, so the
+    /// trunk gate alone must never advertise a worker-backed RTP path.
+    #[test]
+    fn trunk_socket_gate_requires_the_three_gpp_bearer_gate() {
+        let mut isolation = UeIsolationConfig {
+            trunk_sockets_in_worker: true,
+            ..UeIsolationConfig::default()
+        };
+        assert!(!isolation.effective_trunk_sockets_in_worker());
+        assert!(isolation.trunk_sockets_gate_suppressed());
+
+        isolation.three_gpp_ims_sockets_in_worker = true;
+        assert!(isolation.effective_trunk_sockets_in_worker());
+        assert!(!isolation.trunk_sockets_gate_suppressed());
+
+        isolation.trunk_sockets_in_worker = false;
+        assert!(!isolation.effective_trunk_sockets_in_worker());
+        assert!(!isolation.trunk_sockets_gate_suppressed());
+    }
+
     #[test]
     fn notification_channel_accepts_frontend_pushplus_key() {
         assert!(matches!(
@@ -1701,7 +1919,6 @@ mod tests {
         let line_id = "line-0123456789abcdef0123456789abcdef";
         let mut config = AppConfig::default();
         let mut profile = LineProfileConfig::for_line(line_id);
-        profile.volte_voice_enabled = false;
         profile.ims_video.video_payload_type = 111;
         config.line_profiles.push(profile);
         std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
@@ -1711,15 +1928,10 @@ mod tests {
             .reconcile_line_profiles(&[line_id.to_string()])
             .unwrap());
         let profile = manager.get_line_profile(line_id);
-        assert!(!profile.volte_voice_enabled);
         assert_eq!(profile.ims_video.video_payload_type, 111);
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            persisted["line_profiles"][0]["volte_voice_enabled"],
-            serde_json::Value::Bool(false)
-        );
         assert_eq!(
             persisted["line_profiles"][0]["ims_video"]["video_payload_type"],
             serde_json::Value::from(111)
@@ -1800,6 +2012,140 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    /// VoLTE and VoWiFi are two access paths to the same IMS core, not two
+    /// mutually exclusive modes.
+    ///
+    /// Enabling one must never silently disable the other. Doing so removes the
+    /// fallback leg that makes a Wi-Fi drop survivable, and turns every access
+    /// change into a full re-registration. "Priority switching" patches have
+    /// introduced exactly that coupling here before; this test pins it shut.
+    #[test]
+    fn enabling_one_ims_access_never_disables_the_other() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-ims-coexistence-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line = "line-0123456789abcdef0123456789abcdef";
+
+        manager
+            .set_line_volte_connection_enabled(line, true)
+            .unwrap();
+        manager
+            .set_line_vowifi_connection_enabled(line, true)
+            .unwrap();
+
+        let profile = manager.get_line_profile(line);
+        assert!(
+            profile.volte_connection_enabled,
+            "enabling the non-3GPP access must not disable the 3GPP access"
+        );
+        assert!(profile.vowifi.enabled);
+
+        // Re-asserting VoLTE must likewise leave VoWiFi alone.
+        manager
+            .set_line_volte_connection_enabled(line, true)
+            .unwrap();
+        let profile = manager.get_line_profile(line);
+        assert!(
+            profile.vowifi.enabled,
+            "enabling the 3GPP access must not disable the non-3GPP access"
+        );
+        assert!(profile.volte_connection_enabled);
+
+        // Turning one leg off is a change to that leg only.
+        manager
+            .set_line_vowifi_connection_enabled(line, false)
+            .unwrap();
+        let profile = manager.get_line_profile(line);
+        assert!(!profile.vowifi.enabled);
+        assert!(
+            profile.volte_connection_enabled,
+            "disabling one access must not cascade into the other"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The registration preference must never edit the enable intent.
+    ///
+    /// Companion to `enabling_one_ims_access_never_disables_the_other`: that test
+    /// pins the two enable switches apart from each other, this one pins them
+    /// apart from the preference. If setting `CellularPreferred` also cleared
+    /// `vowifi.enabled`, flipping the preference back would silently fail to
+    /// restore the WLAN leg.
+    #[test]
+    fn ims_access_preference_never_edits_the_enable_intent() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-ims-access-pref-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line = "line-0123456789abcdef0123456789abcdef";
+
+        // Default keeps both legs registered, matching the coexistence invariant
+        // in services::orchestrator::ims_access.
+        assert_eq!(
+            manager.get_line_ims_access_preference(line),
+            ImsAccessPreference::Concurrent
+        );
+
+        manager
+            .set_line_volte_connection_enabled(line, true)
+            .unwrap();
+        manager
+            .set_line_vowifi_connection_enabled(line, true)
+            .unwrap();
+
+        for preference in [
+            ImsAccessPreference::WlanPreferred,
+            ImsAccessPreference::CellularPreferred,
+            ImsAccessPreference::Concurrent,
+        ] {
+            manager
+                .set_line_ims_access_preference(line, preference)
+                .unwrap();
+            let profile = manager.get_line_profile(line);
+            assert_eq!(profile.ims_access_preference, preference);
+            assert!(
+                profile.volte_connection_enabled,
+                "{preference:?} must not clear the VoLTE enable intent"
+            );
+            assert!(
+                profile.vowifi.enabled,
+                "{preference:?} must not clear the VoWiFi enable intent"
+            );
+        }
+
+        // And it survives a reload.
+        manager
+            .set_line_ims_access_preference(line, ImsAccessPreference::WlanPreferred)
+            .unwrap();
+        let reloaded = ConfigManager::new(path.clone());
+        assert_eq!(
+            reloaded.get_line_ims_access_preference(line),
+            ImsAccessPreference::WlanPreferred
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A line that never set a preference must deserialize to the coexisting
+    /// default rather than failing or silently parking a leg.
+    #[test]
+    fn line_profile_without_ims_access_preference_defaults_to_concurrent() {
+        let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
+            "line_id": "line-0123456789abcdef0123456789abcdef"
+        }))
+        .unwrap();
+        assert_eq!(
+            profile.ims_access_preference,
+            ImsAccessPreference::Concurrent
+        );
     }
 
     #[test]
@@ -2353,10 +2699,23 @@ mod tests {
     fn line_volte_ip_families_round_trip() {
         let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
         assert_eq!(profile.volte_ip_families, default_line_volte_ip_families());
+        assert!(profile.volte_ip_families_auto);
         profile.volte_ip_families = vec![VolteIpFamily::Ipv6];
+        profile.volte_ip_families_auto = false;
         let round_trip: LineProfileConfig =
             serde_json::from_value(serde_json::to_value(profile).unwrap()).unwrap();
         assert_eq!(round_trip.volte_ip_families, vec![VolteIpFamily::Ipv6]);
+        assert!(!round_trip.volte_ip_families_auto);
+    }
+
+    #[test]
+    fn legacy_line_profile_defaults_ip_family_selection_to_automatic() {
+        let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
+            "line_id": "line-0123456789abcdef0123456789abcdef",
+            "volte_ip_families": ["ipv4v6", "ipv4", "ipv6"]
+        }))
+        .unwrap();
+        assert!(profile.volte_ip_families_auto);
     }
 
     #[test]
@@ -2450,38 +2809,20 @@ mod tests {
         let line_a = "line-0123456789abcdef0123456789abcdef";
         let line_b = "line-fedcba9876543210fedcba9876543210";
 
-        manager.set_line_volte_voice_enabled(line_a, false).unwrap();
-        assert_eq!(
-            manager
-                .set_line_ims_video_volte_enabled(line_a, true)
-                .unwrap_err(),
-            "volte_voice_disabled"
-        );
-
-        manager.set_line_volte_voice_enabled(line_b, true).unwrap();
-        let ims_video = manager
-            .set_line_ims_video_volte_enabled(line_b, true)
+        // IMS video follows the access leg's connection: there is no separate
+        // voice or video switch to set. Connecting VoLTE on line_b is therefore
+        // the whole action, and line_a stays off because it is not connected.
+        manager
+            .set_line_volte_connection_enabled(line_b, true)
             .unwrap();
-        assert!(ims_video.volte_enabled);
-        assert_eq!(ims_video.codec, "h264");
-        assert!(!manager.get_line_volte_voice_enabled(line_a));
-        assert!(manager.get_line_volte_voice_enabled(line_b));
         assert!(!manager.get_line_ims_video_config(line_a).volte_enabled);
         assert!(manager.get_line_ims_video_config(line_b).volte_enabled);
 
-        // VoWiFi gate is independent of the VoLTE voice gate.
-        assert_eq!(
-            manager
-                .set_line_ims_video_vowifi_enabled(line_b, true)
-                .unwrap_err(),
-            "vowifi_voice_disabled"
-        );
+        // VoWiFi video follows the VoWiFi connection independently.
         manager
             .set_line_vowifi_connection_enabled(line_b, true)
             .unwrap();
-        let vowifi_video = manager
-            .set_line_ims_video_vowifi_enabled(line_b, true)
-            .unwrap();
+        let vowifi_video = manager.get_line_ims_video_config(line_b);
         assert!(vowifi_video.vowifi_enabled);
         assert!(vowifi_video.volte_enabled);
 
@@ -2510,34 +2851,80 @@ mod tests {
             "vilte_payload_type_invalid"
         );
 
-        manager.set_line_volte_voice_enabled(line_b, false).unwrap();
-        assert!(!manager.get_line_ims_video_config(line_b).volte_enabled);
-        let forced = manager
+        // Incoming booleans are status mirrors and cannot override the access
+        // switches. Only the media parameters are accepted from this API.
+        let derived = manager
             .set_line_ims_video_config(
                 line_b,
                 ImsVideoConfig {
-                    volte_enabled: true,
+                    volte_enabled: false,
+                    vowifi_enabled: false,
                     video_payload_type: 112,
                     ..ImsVideoConfig::default()
                 },
             )
             .unwrap();
-        assert!(
-            !forced.volte_enabled,
-            "VoLTE video must be forced off when VoLTE voice is disabled"
-        );
-        assert_eq!(forced.video_payload_type, 112);
+        assert!(derived.volte_enabled);
+        assert!(derived.vowifi_enabled);
+        assert_eq!(derived.video_payload_type, 112);
 
         let reloaded = ConfigManager::new(path.clone());
         assert!(!reloaded.get_line_volte_voice_enabled(line_a));
-        assert!(!reloaded.get_line_volte_voice_enabled(line_b));
+        assert!(reloaded.get_line_volte_voice_enabled(line_b));
         assert_eq!(
             reloaded
                 .get_line_ims_video_config(line_b)
                 .video_payload_type,
             112
         );
+        assert!(reloaded.get_line_ims_video_config(line_b).volte_enabled);
+        assert!(reloaded.get_line_ims_video_config(line_b).vowifi_enabled);
         assert!(!reloaded.get_line_ims_video_config(line_a).volte_enabled);
+
+        reloaded
+            .set_line_volte_connection_enabled(line_b, false)
+            .unwrap();
+        assert!(!reloaded.get_line_ims_video_config(line_b).volte_enabled);
+        assert!(reloaded.get_line_ims_video_config(line_b).vowifi_enabled);
+
+        let _ = std::fs::remove_file(path.with_extension("bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_ims_video_gates_are_normalized_when_config_loads() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin_vilte_normalize_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let mut config = AppConfig::default();
+        let mut profile = LineProfileConfig::for_line(line_id);
+        profile.volte_connection_enabled = true;
+        profile.vowifi.enabled = true;
+        assert!(!profile.ims_video.volte_enabled);
+        assert!(!profile.ims_video.vowifi_enabled);
+        config.line_profiles.push(profile);
+        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let manager = ConfigManager::new(path.clone());
+        let normalized = manager.get_line_ims_video_config(line_id);
+        assert!(normalized.volte_enabled);
+        assert!(normalized.vowifi_enabled);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["line_profiles"][0]["ims_video"]["volte_enabled"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            persisted["line_profiles"][0]["ims_video"]["vowifi_enabled"],
+            serde_json::Value::Bool(true)
+        );
 
         let _ = std::fs::remove_file(path.with_extension("bak"));
         let _ = std::fs::remove_file(path);
@@ -3327,10 +3714,6 @@ impl Default for EsimReaderConfig {
     }
 }
 
-fn default_volte_voice_enabled() -> bool {
-    false
-}
-
 fn default_volte_auto_restore_initial_delay_secs() -> u64 {
     60
 }
@@ -3429,6 +3812,10 @@ impl VolteIpFamily {
 
 fn default_line_volte_ip_families() -> Vec<VolteIpFamily> {
     VolteIpFamilyPreference::default().to_families()
+}
+
+fn default_line_volte_ip_families_auto() -> bool {
+    true
 }
 
 /// How this line's logical SIP trunk associates with the remote Asterisk/FreePBX.
@@ -3677,8 +4064,6 @@ pub struct LineProfileConfig {
     pub volte_connection_enabled: bool,
     #[serde(default)]
     pub volte_auto_restore: AutoRestoreConfig,
-    #[serde(default = "default_volte_voice_enabled")]
-    pub volte_voice_enabled: bool,
     #[serde(default, alias = "vilte")]
     pub ims_video: ImsVideoConfig,
     #[serde(default)]
@@ -3704,11 +4089,28 @@ pub struct LineProfileConfig {
     /// Per-line voice path priority.
     #[serde(default)]
     pub voice_path: VoicePathPolicy,
+    /// Which IMS access leg may hold the *registration* when both VoLTE and
+    /// VoWiFi are switched on.
+    ///
+    /// Distinct from `voice_path`, which orders **originating** calls across
+    /// legs that are already registered. The default keeps both legs registered
+    /// (each with its own RFC 5626 `reg-id`), preserving the live fallback that
+    /// `services::orchestrator::ims_access` treats as an invariant. The
+    /// single-registration modes follow GSMA IR.51 instead (§2.2.1
+    /// re-registration on handover, §4.8 keep the same P-CSCF) and are opt-in.
+    /// See `connectivity::core::ims_access` for the full reasoning.
+    #[serde(default)]
+    pub ims_access_preference: ImsAccessPreference,
     /// Per-line ordered IMS IP-family attempt order. The list elements are the families to
     /// enable, in fallback order. `[Ipv4v6, Ipv4, Ipv6]` tries dual-stack, then
     /// IPv4, then IPv6; `[Ipv6]` is IPv6-only. An empty list is invalid.
     #[serde(default = "default_line_volte_ip_families")]
     pub volte_ip_families: Vec<VolteIpFamily>,
+    /// Whether the family order is still automatic. Automatic lines may use
+    /// the carrier catalog's LTE `ip_family` as a hint; saving the order from
+    /// the UI turns this off so the user's choice always wins.
+    #[serde(default = "default_line_volte_ip_families_auto")]
+    pub volte_ip_families_auto: bool,
     /// Per-line APN.
     #[serde(default)]
     pub apn: ApnConfig,
@@ -3808,15 +4210,28 @@ fn default_line_enabled() -> bool {
 }
 
 impl LineProfileConfig {
+    /// Mirror each access leg's presence onto its IMS video state.
+    ///
+    /// These are status mirrors, not feature switches. IMS voice and video are
+    /// the reason this project implements user-space IMS registration, so there
+    /// is no separate "voice enabled" or "video enabled" opinion to consult: a
+    /// leg that is connected offers MMTEL voice and video, and a carrier that
+    /// does not permit them answers with a SIP error (488 on the media, 403/420
+    /// or 380 on the registration) which the runtime surfaces as-is.
+    fn sync_ims_video_access_gates(&mut self) {
+        self.ims_video.volte_enabled = self.volte_connection_enabled;
+        self.ims_video.vowifi_enabled = self.vowifi.enabled;
+    }
+
     pub fn for_line(line_id: impl Into<String>) -> Self {
         Self {
             line_id: line_id.into(),
             enabled: true,
             volte_connection_enabled: false,
             volte_auto_restore: AutoRestoreConfig::default(),
-            volte_voice_enabled: default_volte_voice_enabled(),
             ims_video: ImsVideoConfig::default(),
             volte_ip_families: default_line_volte_ip_families(),
+            volte_ip_families_auto: default_line_volte_ip_families_auto(),
             vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
             data_connection_enabled: false,
@@ -3825,6 +4240,7 @@ impl LineProfileConfig {
             airplane_mode_enabled: false,
             sms_path: SmsPathPolicy::default().normalized(),
             voice_path: VoicePathPolicy::default().normalized(),
+            ims_access_preference: ImsAccessPreference::default(),
             apn: ApnConfig::default(),
             esim_control: None,
             esim_reader: EsimReaderConfig::default(),
@@ -3845,6 +4261,23 @@ impl Default for LineProfileConfig {
     fn default() -> Self {
         Self::for_line(String::new())
     }
+}
+
+fn sync_line_ims_video_access_gates(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+    for profile in &mut config.line_profiles {
+        let before = (
+            profile.ims_video.volte_enabled,
+            profile.ims_video.vowifi_enabled,
+        );
+        profile.sync_ims_video_access_gates();
+        changed |= before
+            != (
+                profile.ims_video.volte_enabled,
+                profile.ims_video.vowifi_enabled,
+            );
+    }
+    changed
 }
 
 fn valid_line_id(line_id: &str) -> bool {
@@ -3956,12 +4389,14 @@ fn default_vilte_h264_fmtp() -> String {
     "profile-level-id=42e01f;packetization-mode=1".to_string()
 }
 
-/// Shared IMS video (ViLTE / VoWiFi video) configuration, gated per access leg.
+/// Shared IMS video (ViLTE / VoWiFi video) media configuration.
 ///
 /// Video rides the *same* IMS voice session as the access's voice call (one
 /// INVITE, an audio `m=` line plus a video `m=` line). VoLTE and VoWiFi each
-/// carry their own gate: `volte_enabled` is gated on the VoLTE voice feature at
-/// the `ConfigManager` layer, and `vowifi_enabled` on the VoWiFi voice feature.
+/// expose their effective state through `volte_enabled` and `vowifi_enabled`.
+/// Those fields are maintained by `ConfigManager`: VoLTE video follows the
+/// line's VoLTE connection plus voice gateway, while VoWiFi video follows the
+/// line's VoWiFi connection. They are status mirrors, not independent switches.
 /// On the target hardware class (no audio/video capture) the device is a pure
 /// media relay: it forwards RTP between the operator IMS leg and an internal
 /// SIP UA and never encodes/decodes video. Therefore only pass-through codecs
@@ -3972,10 +4407,10 @@ fn default_vilte_h264_fmtp() -> String {
 /// so existing persisted configs migrate in place.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImsVideoConfig {
-    /// Whether IMS video is enabled for the VoLTE (LTE) access leg.
+    /// Effective configured state for the VoLTE (LTE) access leg.
     #[serde(default, alias = "feature_enabled")]
     pub volte_enabled: bool,
-    /// Whether IMS video is enabled for the VoWiFi (WiFi/ePDG) access leg.
+    /// Effective configured state for the VoWiFi (WiFi/ePDG) access leg.
     #[serde(default)]
     pub vowifi_enabled: bool,
     /// Advertised video codec name (relay is pass-through; H.264 is the IMS
@@ -4260,9 +4695,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub device_network: DeviceNetworkConfig,
     #[serde(default)]
+    pub ue_isolation: UeIsolationConfig,
+    #[serde(default)]
     pub version_update_notifications: VersionUpdateNotificationConfig,
     #[serde(default)]
     pub github_download_proxy: GithubDownloadProxyConfig,
+    #[serde(default)]
+    pub diagnostic_log: DiagnosticLogConfig,
     #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
@@ -4283,8 +4722,10 @@ impl Default for AppConfig {
             line_config_version: CURRENT_LINE_CONFIG_VERSION,
             notifications: NotificationConfig::default(),
             device_network: DeviceNetworkConfig::default(),
+            ue_isolation: UeIsolationConfig::default(),
             version_update_notifications: VersionUpdateNotificationConfig::default(),
             github_download_proxy: GithubDownloadProxyConfig::default(),
+            diagnostic_log: DiagnosticLogConfig::default(),
             security: SecurityConfig::default(),
             esim: EsimConfig::default(),
             automation: AutomationConfig::default(),
@@ -4716,7 +5157,9 @@ impl ConfigManager {
             AppConfig::default()
         };
 
-        let changed = migrate_templates_to_remove_md5(&mut config) || canonical_rewrite_required;
+        let templates_changed = migrate_templates_to_remove_md5(&mut config);
+        let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
+        let changed = templates_changed || video_gates_changed || canonical_rewrite_required;
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
@@ -4748,7 +5191,9 @@ impl ConfigManager {
             }
         };
 
-        let changed = migrate_templates_to_remove_md5(&mut config) || canonical_rewrite_required;
+        let templates_changed = migrate_templates_to_remove_md5(&mut config);
+        let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
+        let changed = templates_changed || video_gates_changed || canonical_rewrite_required;
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
             storage: ConfigStorage::Sqlite(config_path.clone()),
@@ -5227,12 +5672,14 @@ impl ConfigManager {
 
     pub fn get_line_profile(&self, line_id: &str) -> LineProfileConfig {
         let config = self.config.read().unwrap();
-        config
+        let mut profile = config
             .line_profiles
             .iter()
             .find(|profile| profile.line_id == line_id)
             .cloned()
-            .unwrap_or_else(|| LineProfileConfig::for_line(line_id))
+            .unwrap_or_else(|| LineProfileConfig::for_line(line_id));
+        profile.sync_ims_video_access_gates();
+        profile
     }
 
     pub fn set_line_volte_connection_enabled(
@@ -5261,6 +5708,7 @@ impl ConfigManager {
                 return Err("line_disabled".to_string());
             }
             profile.volte_connection_enabled = enabled;
+            profile.sync_ims_video_access_gates();
             let next = profile.clone();
             config
                 .line_profiles
@@ -5359,6 +5807,7 @@ impl ConfigManager {
                 config.line_profiles.last_mut().expect("profile inserted")
             };
             profile.volte_ip_families = families;
+            profile.volte_ip_families_auto = false;
             let next = profile.clone();
             config
                 .line_profiles
@@ -5371,6 +5820,10 @@ impl ConfigManager {
 
     pub fn get_line_volte_ip_families(&self, line_id: &str) -> Vec<VolteIpFamily> {
         self.get_line_profile(line_id).volte_ip_families
+    }
+
+    pub fn get_line_volte_ip_families_auto(&self, line_id: &str) -> bool {
+        self.get_line_profile(line_id).volte_ip_families_auto
     }
 
     pub fn set_line_vowifi_config(
@@ -5400,6 +5853,7 @@ impl ConfigManager {
                 return Err("line_disabled".to_string());
             }
             profile.vowifi = vowifi;
+            profile.sync_ims_video_access_gates();
             let next = profile.clone();
             config
                 .line_profiles
@@ -5587,6 +6041,7 @@ impl ConfigManager {
                 profile.data_connection_enabled = false;
                 profile.volte_connection_enabled = false;
             }
+            profile.sync_ims_video_access_gates();
             let next = profile.clone();
             config
                 .line_profiles
@@ -5763,28 +6218,14 @@ impl ConfigManager {
         )
     }
 
+    /// Whether the VoLTE voice leg is available for one line.
+    ///
+    /// MMTEL voice is the purpose of registering IMS at all, so this follows the
+    /// line's VoLTE connection rather than a separate switch. A carrier that
+    /// does not permit voice answers the REGISTER or the INVITE with a SIP
+    /// error, which the runtime reports instead of pre-emptively refusing.
     pub fn get_line_volte_voice_enabled(&self, line_id: &str) -> bool {
-        self.get_line_profile(line_id).volte_voice_enabled
-    }
-
-    /// Toggle VoLTE voice handling for exactly one registered IMS line.
-    /// Disabling voice also disables VoLTE video on that line, matching the media
-    /// dependency without changing any other profile.
-    pub fn set_line_volte_voice_enabled(
-        &self,
-        line_id: &str,
-        enabled: bool,
-    ) -> Result<LineProfileConfig, String> {
-        let mut ims_video = self.get_line_ims_video_config(line_id);
-        if !enabled {
-            ims_video.volte_enabled = false;
-        }
-        self.update_line_profile(line_id, |profile| {
-            profile.volte_voice_enabled = enabled;
-            if !enabled {
-                profile.ims_video = ims_video;
-            }
-        })
+        self.get_line_profile(line_id).volte_connection_enabled
     }
 
     /// SMS path policy for one line.
@@ -5823,6 +6264,30 @@ impl ConfigManager {
         self.get_line_profile(line_id).voice_path.normalized()
     }
 
+    /// Which IMS access legs may hold a registration for this line.
+    pub fn get_line_ims_access_preference(&self, line_id: &str) -> ImsAccessPreference {
+        self.get_line_profile(line_id).ims_access_preference
+    }
+
+    /// Set one line's IMS access (registration) preference.
+    ///
+    /// Deliberately independent of `volte_connection_enabled` and
+    /// `vowifi.enabled`: this says which *enabled* legs may register, and must
+    /// never edit the enable intent itself. Coupling the two is the bug
+    /// `enabling_one_ims_access_never_disables_the_other` pins shut — the user's
+    /// switch has to survive a preference change so flipping it back is enough
+    /// to restore the leg.
+    pub fn set_line_ims_access_preference(
+        &self,
+        line_id: &str,
+        preference: ImsAccessPreference,
+    ) -> Result<ImsAccessPreference, String> {
+        self.update_line_profile(line_id, |profile| {
+            profile.ims_access_preference = preference;
+        })?;
+        Ok(self.get_line_ims_access_preference(line_id))
+    }
+
     /// Set one line's explicit voice path policy.
     pub fn set_line_voice_path_policy(
         &self,
@@ -5856,42 +6321,9 @@ impl ConfigManager {
         self.get_line_profile(line_id).vowifi.enabled
     }
 
-    /// Toggle IMS video for one line's VoLTE leg. Video rides that line's VoLTE
-    /// voice session, so another line's voice switch cannot satisfy this
-    /// dependency.
-    pub fn set_line_ims_video_volte_enabled(
-        &self,
-        line_id: &str,
-        enabled: bool,
-    ) -> Result<ImsVideoConfig, String> {
-        if enabled && !self.get_line_volte_voice_enabled(line_id) {
-            return Err("volte_voice_disabled".to_string());
-        }
-        let mut next = self.get_line_ims_video_config(line_id);
-        next.volte_enabled = enabled;
-        self.set_line_ims_video_config(line_id, next)
-    }
-
-    /// Toggle IMS video for one line's VoWiFi leg. Video rides that line's
-    /// VoWiFi voice session, so another line's voice switch cannot satisfy this
-    /// dependency.
-    pub fn set_line_ims_video_vowifi_enabled(
-        &self,
-        line_id: &str,
-        enabled: bool,
-    ) -> Result<ImsVideoConfig, String> {
-        if enabled && !self.get_line_vowifi_voice_enabled(line_id) {
-            return Err("vowifi_voice_disabled".to_string());
-        }
-        let mut next = self.get_line_ims_video_config(line_id);
-        next.vowifi_enabled = enabled;
-        self.set_line_ims_video_config(line_id, next)
-    }
-
-    /// Replace one line's IMS video config (codec / payload type / fmtp).
-    /// `volte_enabled` is forced off when VoLTE voice is disabled on that same
-    /// line, and `vowifi_enabled` when VoWiFi voice is disabled, leaving every
-    /// other line untouched.
+    /// Replace one line's IMS video media parameters. Access enablement is
+    /// derived from the corresponding VoLTE/VoWiFi voice configuration, so API
+    /// clients cannot leave a hidden video gate out of sync.
     pub fn set_line_ims_video_config(
         &self,
         line_id: &str,
@@ -5903,18 +6335,12 @@ impl ConfigManager {
         if !(96..=127).contains(&ims_video.video_payload_type) {
             return Err("vilte_payload_type_invalid".to_string());
         }
-        let mut next = ims_video;
-        if next.volte_enabled && !self.get_line_volte_voice_enabled(line_id) {
-            next.volte_enabled = false;
-        }
-        if next.vowifi_enabled && !self.get_line_vowifi_voice_enabled(line_id) {
-            next.vowifi_enabled = false;
-        }
-        let persisted = next.clone();
-        self.update_line_profile(line_id, |profile| {
+        let profile = self.update_line_profile(line_id, |profile| {
+            let persisted = ims_video;
             profile.ims_video = persisted;
+            profile.sync_ims_video_access_gates();
         })?;
-        Ok(next)
+        Ok(profile.ims_video)
     }
 
     pub fn set_esim_config(&self, mut esim: EsimConfig) -> Result<(), String> {
@@ -5968,6 +6394,19 @@ impl ConfigManager {
         self.save()
     }
 
+    pub fn get_diagnostic_log(&self) -> DiagnosticLogConfig {
+        self.config.read().unwrap().diagnostic_log.clone()
+    }
+
+    pub fn set_diagnostic_log(&self, diagnostic_log: DiagnosticLogConfig) -> Result<(), String> {
+        diagnostic_log.validate()?;
+        {
+            let mut c = self.config.write().unwrap();
+            c.diagnostic_log = diagnostic_log;
+        }
+        self.save()
+    }
+
     pub fn get_security(&self) -> SecurityConfig {
         self.config.read().unwrap().security.clone()
     }
@@ -5976,6 +6415,20 @@ impl ConfigManager {
         {
             let mut c = self.config.write().unwrap();
             c.security = security;
+        }
+        self.save()
+    }
+
+    /// Return the current per-UE isolation configuration.
+    pub fn get_ue_isolation(&self) -> UeIsolationConfig {
+        self.config.read().unwrap().ue_isolation.clone()
+    }
+
+    /// Replace the per-UE isolation configuration and persist it.
+    pub fn set_ue_isolation(&self, ue_isolation: UeIsolationConfig) -> Result<(), String> {
+        {
+            let mut c = self.config.write().unwrap();
+            c.ue_isolation = ue_isolation;
         }
         self.save()
     }

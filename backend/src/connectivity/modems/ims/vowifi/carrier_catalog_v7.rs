@@ -394,6 +394,35 @@ pub(super) fn ambiguous_plmn_prefixes(conn: &Connection) -> Result<Vec<String>, 
     Ok(prefixes)
 }
 
+pub(super) fn infer_home_plmn(conn: &Connection, imsi: &str) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT mr.plmn
+             FROM profile_match_rules AS mr
+             WHERE mr.is_exclusion = 0
+               AND mr.plmn IS NOT NULL
+               AND ?1 LIKE mr.plmn || '%'
+               AND (mr.imsi_prefix IS NULL OR ?1 LIKE mr.imsi_prefix || '%')
+               AND mr.iccid_prefix IS NULL
+               AND mr.gid1 IS NULL AND mr.gid2 IS NULL AND mr.spn IS NULL
+             ORDER BY length(mr.plmn) DESC, mr.plmn",
+        )
+        .map_err(db_error)?;
+    let matches = stmt
+        .query_map([imsi], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    let lengths = matches.iter().map(String::len).collect::<HashSet<_>>();
+    if lengths.len() != 1 {
+        return Ok(None);
+    }
+    Ok(matches.first().cloned())
+}
+
 pub(super) fn resolve_for_imsi(
     conn: &Connection,
     imsi: &str,
@@ -408,7 +437,7 @@ pub(super) fn resolve_for_imsi(
         "SELECT cp.profile_id, mr.plmn
          FROM carrier_profiles AS cp
          JOIN profile_match_rules AS mr ON mr.profile_id = cp.profile_id
-         WHERE cp.{} = 'ready' AND mr.is_exclusion = 0
+         WHERE mr.is_exclusion = 0
            AND (mr.plmn IS NULL OR ?1 LIKE mr.plmn || '%')
            AND (mr.imsi_prefix IS NULL OR ?1 LIKE mr.imsi_prefix || '%')
            AND (?2 IS NULL OR mr.plmn IS NULL OR mr.plmn = ?2)
@@ -423,11 +452,12 @@ pub(super) fn resolve_for_imsi(
                  AND (ex.imsi_prefix IS NULL OR ?1 LIKE ex.imsi_prefix || '%')
                  AND (?2 IS NULL OR ex.plmn IS NULL OR ex.plmn = ?2)
            )
-         ORDER BY mr.priority,
+         ORDER BY CASE WHEN cp.{} = 'ready' THEN 0 ELSE 1 END,
+                  mr.priority,
                   length(COALESCE(mr.imsi_prefix, mr.plmn, '')) DESC,
                   cp.priority, cp.confidence DESC, cp.profile_id
          LIMIT 1",
-        access.v7_status_column()
+        access.v7_status_column(),
     );
     let matched = conn
         .query_row(&sql, params![imsi, home_plmn], |row| {
@@ -1174,17 +1204,26 @@ fn project_register(
             ))
         }
     };
+    let mut security_client = security_client_values(config, access)?;
+    if sec_agree_mode != "disabled" && security_client.is_empty() {
+        security_client.push(BASELINE_SECURITY_CLIENT.to_string());
+    }
+    // Offering ipsec-3gpp through Security-Client commits the UE to the
+    // security agreement, so the same REGISTER has to advertise and demand it:
+    // RFC 3329 §2.3 requires Supported/Require/Proxy-Require to travel with the
+    // offer, and TS 24.229 §5.1.1.2.2 requires the empty AKA Authorization.
+    // Bundles extracted from real handsets frequently omit
+    // `security_agreement`, which lands here as "auto"; sending the offer
+    // without the declaration makes the request self-contradictory and IMS
+    // cores answer 421 Extension Required.
+    let offers_sec_agree = !security_client.is_empty();
     let mut supported = string_array_or_csv(register, "/supported").unwrap_or_default();
-    if sec_agree_mode == "required"
+    if offers_sec_agree
         && !supported
             .iter()
             .any(|value| value.eq_ignore_ascii_case("sec-agree"))
     {
         supported.push("sec-agree".to_string());
-    }
-    let mut security_client = security_client_values(config, access)?;
-    if sec_agree_mode != "disabled" && security_client.is_empty() {
-        security_client.push(BASELINE_SECURITY_CLIENT.to_string());
     }
     // iOS bundles express PANI policy through `country_of_origination_format`
     // (`PANI`/`BOTH` = the REGISTER carries P-Access-Network-Info; `NONE` =
@@ -1206,7 +1245,9 @@ fn project_register(
         .map(|value| expand_ims_static_template(value, meta, domain, "sip_visited_network_id"))
         .transpose()?;
     let contact_param_order = contact_parameters(config, meta, domain)?;
-    let include_mmtel_features = contact_param_order.iter().any(|parameter| {
+    // An explicit Contact parameter list is the strongest signal: if the bundle
+    // spells out `audio` or `+g.3gpp.icsi-ref`, honour exactly that.
+    let contact_declares_mmtel = contact_param_order.iter().any(|parameter| {
         matches!(
             parameter
                 .split_once('=')
@@ -1216,6 +1257,23 @@ fn project_register(
             "audio" | "+g.3gpp.icsi-ref"
         )
     });
+    // Most bundles (Maxis among them, and all 1444 rows currently shipped)
+    // carry no `sip.common.contact_parameters` at all. Deriving MMTEL purely
+    // from that absent list made every such profile register as non-voice: no
+    // `+g.3gpp.icsi-ref` reaches the S-CSCF, so it never selects the MMTEL AS
+    // for terminating requests and MT calls are simply never delivered --
+    // while REGISTER still answers 200 OK, which makes the fault look like a
+    // network problem rather than ours. A real UE advertises the voice feature
+    // tags on any voice-capable registration, and a core that does not offer
+    // MMTEL just ignores them, so the safe default when the bundle expresses
+    // no Contact opinion is to advertise -- only an explicit `services` flag
+    // turning the access off suppresses it.
+    let declares_voice_service = match access {
+        CatalogAccessKind::LteEpc => bool_at(config, "/services/volte").unwrap_or(true),
+        CatalogAccessKind::WifiEpdg => bool_at(config, "/services/vowifi").unwrap_or(true),
+    };
+    let include_mmtel_features =
+        contact_declares_mmtel || (contact_param_order.is_empty() && declares_voice_service);
     Ok(RegisterPolicyRecord {
         supported_header: supported.join(","),
         request_uri_policy: string_at(register, "/request_uri_policy")
@@ -1223,15 +1281,17 @@ fn project_register(
             .to_string(),
         include_pani_initial,
         include_pani_authenticated,
-        // TS 24.229 §5.1.1.1: an AKA UE's initial REGISTER SHALL carry an
+        // TS 24.229 §5.1.1.2.2: an AKA UE's initial REGISTER SHALL carry an
         // empty Authorization (username/realm/uri populated, nonce/response
-        // empty) so the network can challenge it. Default to that shape when
-        // the carrier requires sec-agree (the normal IMS AKA path); the
-        // explicit JSON value still wins.
+        // empty) so the network knows which private identity to challenge.
+        // Offering ipsec-3gpp means we are doing IMS AKA, so default to that
+        // shape; a core that demands sec-agree has no way to start the
+        // challenge without it and answers 400. The explicit JSON value still
+        // wins, and hardcoded profiles in profiles.rs are unaffected.
         initial_authorization: string_at(register, "/initial_authorization")
             .map(str::to_string)
             .unwrap_or_else(|| {
-                if sec_agree_mode == "required" {
+                if offers_sec_agree {
                     "aka_empty".to_string()
                 } else {
                     "none".to_string()
@@ -1249,12 +1309,14 @@ fn project_register(
         enable_initial_reject_fallback: false,
         use_plain_digest_placeholder: false,
         require_sec_agree_headers: bool_at(register, "/require_sec_agree_headers").unwrap_or(false),
-        // RFC 3329 §2.3: the client MUST add both Require and Proxy-Require
-        // with "sec-agree" when it offers sec-agree. When the carrier marks
-        // security_agreement=required, default Proxy-Require to on so the
-        // REGISTER is complete even if the bundle omitted the flag.
+        // RFC 3329 §2.3: Require and Proxy-Require travel together. The
+        // builder already gates this on require_sec_agree, so defaulting it on
+        // only takes effect once we actually send Require -- either because
+        // the bundle marks security_agreement=required or because the core
+        // answered 421 and we escalated. Maxis answers 400 Bad Request to a
+        // Require without the matching Proxy-Require.
         proxy_require_sec_agree_headers: bool_at(register, "/proxy_require_sec_agree_headers")
-            .unwrap_or(sec_agree_mode == "required"),
+            .unwrap_or(true),
         sec_agree_mode,
         security_client_mechanisms: security_client,
         live_header_variant_set: "catalog_v7".to_string(),
@@ -1785,6 +1847,34 @@ mod tests {
         assert_eq!(lte.record.ims.domain, "ims.mnc033.mcc234.example");
         assert_eq!(lte.record.meta.aliases, ["Test", "Test Telecom"]);
 
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn voice_service_declaration_drives_mmtel_features_without_contact_parameters() {
+        let (catalog, path) = fixture();
+        // The fixture bundle declares services.volte/vowifi but carries no
+        // sip.common.contact_parameters -- the shape of essentially every real
+        // bundle. Deriving MMTEL from the absent parameter list alone left the
+        // REGISTER Contact without +g.3gpp.icsi-ref, so the S-CSCF never
+        // treated the registration as voice capable and MT calls were dropped
+        // while REGISTER still answered 200 OK.
+        for access in [CatalogAccessKind::LteEpc, CatalogAccessKind::WifiEpdg] {
+            let resolved = catalog
+                .resolve_for_imsi("234330123456789", None, access)
+                .expect("query")
+                .expect("profile");
+            assert!(
+                resolved.record.ims.register.contact_param_order.is_empty(),
+                "fixture should carry no explicit Contact parameters for {}",
+                access.as_str()
+            );
+            assert!(
+                resolved.record.ims.register.include_mmtel_features,
+                "{} should advertise MMTEL from the service declaration",
+                access.as_str()
+            );
+        }
         std::fs::remove_file(path).expect("remove fixture");
     }
 

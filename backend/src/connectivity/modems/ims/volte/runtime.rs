@@ -19,12 +19,15 @@ use std::sync::{
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::connectivity::core::ims_failure::ImsServiceState;
+
 /// Connection sub-stage. String values MUST match `volteStatus.js` `b()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolteStage {
     Disabled,
     Starting,
     Identity,
+    CarrierProfile,
     IdentityAka,
     Radio,
     ImsContext,
@@ -52,6 +55,7 @@ impl VolteStage {
             VolteStage::Disabled => "disabled",
             VolteStage::Starting => "starting",
             VolteStage::Identity => "identity",
+            VolteStage::CarrierProfile => "carrier_profile",
             VolteStage::IdentityAka => "identity_aka",
             VolteStage::Radio => "radio",
             VolteStage::ImsContext => "ims_context",
@@ -75,7 +79,10 @@ impl VolteStage {
     }
 }
 
-const MAX_CONNECTION_ATTEMPTS: usize = 32;
+/// Keep enough history to diagnose a complete IMS connection lifecycle
+/// (Bearer family fallback and REGISTER) without allowing a busy line to grow
+/// the in-memory status response indefinitely.
+const MAX_CONNECTION_ATTEMPTS: usize = 100;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VolteConnectionAttempt {
@@ -208,6 +215,36 @@ pub struct VolteSnapshot {
     pub at_cid: Option<u8>,
     pub current_ip_family: Option<String>,
     pub identity_source: Option<String>,
+    /// The public user identity actually in force after REGISTER.
+    ///
+    /// This starts out IMSI-derived, but the network's default P-Associated-URI
+    /// replaces it once registration succeeds, so it is the identity later
+    /// requests are sent under -- not the one the profile was built from.
+    pub public_uri: Option<String>,
+    /// Every P-Associated-URI the registrar returned, in header order.
+    ///
+    /// Operators return both the IMSI-derived IMPU and the MSISDN-associated
+    /// one, so this is the only place the line's own number is observable: the
+    /// SIM reports nothing (`AT+CNUM` empty, ModemManager's `own-numbers` unset)
+    /// and USSD needs a network that a data-only bearer does not provide.
+    pub associated_uris: Vec<String>,
+    /// What the network said about our right to use MMTEL voice on this
+    /// registration.
+    ///
+    /// There is no local voice switch to consult: the UE always advertises the
+    /// MMTEL feature tags and the network decides. This is where that decision
+    /// is recorded, so a carrier refusal is reported as an observed fact rather
+    /// than inferred. `voice_service` starts `unknown` and only an actual
+    /// refusal makes it `denied`.
+    pub voice_service: &'static str,
+    pub voice_service_code: &'static str,
+    pub voice_service_reason: Option<String>,
+    /// Set when the network answered 380 Alternative Service, naming the access
+    /// it wants used instead.
+    pub voice_alternative_service: Option<String>,
+    pub profile_id: Option<String>,
+    pub profile_source: Option<String>,
+    pub profile_fallback_reason: Option<String>,
     pub usim_aid: Option<String>,
     pub isim_aid: Option<String>,
     pub connection_attempts: Vec<VolteConnectionAttempt>,
@@ -250,6 +287,15 @@ impl Default for VolteSnapshot {
             bearer_ip_type: None,
             current_ip_family: None,
             identity_source: None,
+            public_uri: None,
+            associated_uris: Vec::new(),
+            voice_service: ImsServiceState::Unknown.as_str(),
+            voice_service_code: "ims_voice_service_unknown",
+            voice_service_reason: None,
+            voice_alternative_service: None,
+            profile_id: None,
+            profile_source: None,
+            profile_fallback_reason: None,
             usim_aid: None,
             isim_aid: None,
             connection_attempts: Vec::new(),
@@ -267,6 +313,34 @@ impl Default for VolteSnapshot {
 impl VolteSnapshot {
     pub fn registered(&self) -> bool {
         self.phase == VoltePhase::Registered
+    }
+
+    /// Whether the IMS APN bearer carrying this access is established.
+    ///
+    /// Everything from `Bearer` onward implies an IP-capable IMS PDN; the
+    /// earlier stages are identity, carrier-profile and radio preparation.
+    pub fn bearer_up(&self) -> bool {
+        matches!(
+            self.stage,
+            VolteStage::Bearer
+                | VolteStage::BearerDual
+                | VolteStage::BearerIpv4
+                | VolteStage::BearerIpv6
+                | VolteStage::IpConfig
+                | VolteStage::RegisterInitial
+                | VolteStage::Ipsec
+                | VolteStage::RegisterAuthenticated
+                | VolteStage::RegisterRefresh
+                | VolteStage::RegisterIpsec
+                | VolteStage::RegisterUdp
+                | VolteStage::Registered
+        )
+    }
+
+    /// Whether a SIP transport toward the P-CSCF has been selected for this
+    /// access — an IPsec SA, or plain UDP where the carrier permits it.
+    pub fn signaling_ready(&self) -> bool {
+        self.registration_mode != RegistrationMode::None
     }
 }
 
@@ -316,6 +390,29 @@ pub struct VolteRuntimeStatus {
     pub current_ip_family: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_source: Option<String>,
+    /// The public user identity in force after REGISTER, network-assigned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_uri: Option<String>,
+    /// Every P-Associated-URI the registrar returned. The MSISDN-associated
+    /// entry here is the only observable source of the line's own number.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub associated_uris: Vec<String>,
+    /// MMTEL voice entitlement as reported by the network: `available`,
+    /// `without_telephone_identity`, `denied` or `unknown`. Replaces the removed
+    /// local voice switches — a client that wants to know whether calls will
+    /// work reads this, not a configuration flag.
+    pub voice_service: String,
+    pub voice_service_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_service_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_alternative_service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_fallback_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usim_aid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,6 +457,15 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             bearer_ip_type: s.bearer_ip_type.clone(),
             current_ip_family: s.current_ip_family.clone(),
             identity_source: s.identity_source.clone(),
+            public_uri: s.public_uri.clone(),
+            associated_uris: s.associated_uris.clone(),
+            voice_service: s.voice_service.to_string(),
+            voice_service_code: s.voice_service_code.to_string(),
+            voice_service_reason: s.voice_service_reason.clone(),
+            voice_alternative_service: s.voice_alternative_service.clone(),
+            profile_id: s.profile_id.clone(),
+            profile_source: s.profile_source.clone(),
+            profile_fallback_reason: s.profile_fallback_reason.clone(),
             usim_aid: s.usim_aid.clone(),
             isim_aid: s.isim_aid.clone(),
             connection_attempts: s.connection_attempts.clone(),
@@ -508,6 +614,7 @@ mod tests {
         assert_eq!(VolteStage::Disabled.as_str(), "disabled");
         assert_eq!(VolteStage::Starting.as_str(), "starting");
         assert_eq!(VolteStage::Identity.as_str(), "identity");
+        assert_eq!(VolteStage::CarrierProfile.as_str(), "carrier_profile");
         assert_eq!(VolteStage::IdentityAka.as_str(), "identity_aka");
         assert_eq!(VolteStage::Radio.as_str(), "radio");
         assert_eq!(VolteStage::Pcscf.as_str(), "pcscf");

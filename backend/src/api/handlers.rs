@@ -28,7 +28,7 @@ use crate::{
     connectivity::modems::ims::vowifi::restore::RestorePhase,
     connectivity::modems::ims::vowifi::{
         live::{
-            clear_live_runtime_for_line, live_xcap_access_for_line, place_live_voice_call_for_line,
+            clear_live_runtime_for_line, live_xcap_access_for_line,
             send_live_sms_over_ims_for_line, verify_live_sim_auth_access_for_line,
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
@@ -51,9 +51,10 @@ use crate::{
     },
     hardware::sim::esim::EsimApiError,
     platform::config::{
-        AccessPathKind, AutoRestoreConfig, EsimReaderConfig, GithubDownloadProxyConfig,
-        ImsVideoConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig, SmsPathPolicy,
-        StandaloneSimSlotConfig, TrunkProfileConfig, VoicePathPolicy,
+        AccessPathKind, AutoRestoreConfig, DiagnosticLogConfig, EsimReaderConfig,
+        GithubDownloadProxyConfig, ImsVideoConfig, LineDataProxyConfig, LineProfileConfig,
+        LineVowifiConfig, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
+        VoicePathPolicy,
     },
     platform::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -64,17 +65,19 @@ use crate::{
         read_cpu_load_sync, read_disk_info, read_interface_stats, read_memory_info,
         read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,
     },
+    services::system::diagnostic_log,
     services::system::system_event::{
         codes as system_event_codes, mask_identifier, severity as system_event_severity,
         status as system_event_status,
     },
     services::trunk::bridge::{DtmfSignal, DtmfSource, OperatorCommand},
+    services::ue_worker::{worker_for_line_feature, UeWorkerBinding, UeWorkerFeatures},
     state::AppState,
 };
 
 const ESIM_SIM_IDENTITY_TIMEOUT_SECS: u64 = 3;
 const ESIM_SIM_ENRICH_TIMEOUT_SECS: u64 = 12;
-const VOWIFI_SIM_IDENTITY_TIMEOUT_SECS: u64 = 3;
+const VOWIFI_SIM_IDENTITY_TIMEOUT_SECS: u64 = 5;
 const VOWIFI_STATUS_STAGE_TIMEOUT_SECS: u64 = 12;
 const VOWIFI_LIVE_STAGE_TIMEOUT_SECS: u64 = 90;
 const VOWIFI_MANUAL_CONNECT_ATTEMPTS: u8 = 3;
@@ -505,6 +508,144 @@ pub async fn set_github_download_proxy_handler(
             Json(ApiResponse::<GithubDownloadProxyConfig>::error(error)),
         ),
     }
+}
+
+/// Settings plus on-disk state, so one request populates the whole settings card.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DiagnosticLogSettingsResponse {
+    pub config: DiagnosticLogConfig,
+    pub status: diagnostic_log::DiagnosticLogStatus,
+}
+
+fn diagnostic_log_settings(app: &AppState) -> DiagnosticLogSettingsResponse {
+    let config = app.config_manager.get_diagnostic_log();
+    let status = diagnostic_log::read_status(&config, app.diagnostic_log_sink.dropped_count());
+    DiagnosticLogSettingsResponse { config, status }
+}
+
+/// GET /api/settings/diagnostic-log
+///
+/// Returns the settings plus on-disk state (size, file count, oldest record) so
+/// the UI can show whether the log is actually accumulating anything before a
+/// user tries to download it.
+pub async fn get_diagnostic_log_handler(State(app): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            diagnostic_log_settings(&app),
+        )),
+    )
+}
+
+/// POST /api/settings/diagnostic-log
+pub async fn set_diagnostic_log_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<DiagnosticLogConfig>,
+) -> impl IntoResponse {
+    if let Err(error) = payload.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<DiagnosticLogSettingsResponse>::error(error)),
+        );
+    }
+    match app.config_manager.set_diagnostic_log(payload) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Diagnostic log settings updated",
+                diagnostic_log_settings(&app),
+            )),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<DiagnosticLogSettingsResponse>::error(error)),
+        ),
+    }
+}
+
+/// Ceiling on one download response.
+///
+/// Retention allows far more than this on disk, and the whole body is buffered to
+/// set Content-Length, so newest-first truncation keeps a large archive from
+/// pinning that many megabytes of device RAM per concurrent request. Recent
+/// records are the ones being diagnosed, so the oldest files are what gets cut.
+const DIAGNOSTIC_LOG_DOWNLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// GET /api/settings/diagnostic-log/download
+///
+/// Returns the rotated files concatenated newest-first as one plain-text
+/// attachment. Redaction already happened at write time, so what lands on disk
+/// is what the operator gets — there is no second, unredacted copy to leak.
+pub async fn download_diagnostic_log_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let config = app.config_manager.get_diagnostic_log();
+    let directory = diagnostic_log::resolve_log_directory(&config);
+    let files = diagnostic_log::list_log_files(&directory);
+    if files.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            "诊断日志文件尚未生成".to_string().into_bytes(),
+        )
+            .into_response();
+    }
+
+    let mut body = Vec::new();
+    let mut budget = DIAGNOSTIC_LOG_DOWNLOAD_MAX_BYTES;
+    let mut omitted = 0usize;
+    // Newest first: `list_log_files` returns oldest-first.
+    for file in files.iter().rev() {
+        if budget == 0 {
+            omitted += 1;
+            continue;
+        }
+        match fs::read(&file.path) {
+            Ok(bytes) => {
+                body.extend_from_slice(format!("===== {} =====\n", file.name).as_bytes());
+                let take = bytes.len().min(budget as usize);
+                body.extend_from_slice(&bytes[..take]);
+                if take < bytes.len() {
+                    body.extend_from_slice(
+                        format!("\n===== {} 已按下载上限截断 =====\n", file.name).as_bytes(),
+                    );
+                } else if !bytes.ends_with(b"\n") {
+                    body.push(b'\n');
+                }
+                budget = budget.saturating_sub(take as u64);
+            }
+            Err(error) => {
+                warn!(file = %file.name, %error, "failed to read diagnostic log file for download");
+            }
+        }
+    }
+    if omitted > 0 {
+        body.extend_from_slice(
+            format!("===== 另有 {omitted} 个较早的日志文件因下载上限未包含 =====\n").as_bytes(),
+        );
+    }
+
+    let filename = format!(
+        "simadmin-diagnostics-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// GET /api/esim/config
@@ -1292,6 +1433,53 @@ pub async fn get_device_info(
 
 // ============ SIM 卡 ============
 
+/// Fill in this line's own number from an IMS registration when no other source
+/// knew it, and persist it so every other reader sees it too.
+///
+/// On a data-only line the SIM does not carry the number: `EF-MSISDN` is
+/// commonly unprogrammed, so ModemManager reports nothing and the own-number
+/// cache stays empty -- which is why the UI showed `N/A` even while the line was
+/// registered. The registrar's `P-Associated-URI` is the only observable source
+/// (TS 24.229 §5.1.1.2), and both access legs publish what they learned into
+/// `connectivity::core::own_numbers`.
+///
+/// Two things this deliberately does not do: it never overrides a manual entry
+/// (the user's own statement outranks an observed one), and it never overwrites
+/// numbers another source already supplied.
+async fn apply_ims_observed_own_numbers(
+    app: &AppState,
+    line_id: &str,
+    info: &mut crate::api::models::SimInfoResponse,
+) {
+    if info.phone_number_is_manual || !info.phone_numbers.is_empty() {
+        return;
+    }
+    let observed = crate::connectivity::core::own_numbers::for_line(line_id);
+    if observed.is_empty() {
+        return;
+    }
+    // Persisting needs the ICCID: it is the cache's identity key, and without it
+    // the value would be re-derived from the registrar on every read.
+    if !info.iccid.is_empty() {
+        crate::hardware::cellular::modem_manager::cache_own_numbers_for_identity(
+            &app.database,
+            &crate::hardware::cellular::modem_manager::SimIdentity {
+                iccid: info.iccid.clone(),
+                imsi: info.imsi.clone(),
+                operator_id: format!("{}{}", info.mcc, info.mnc),
+            },
+            &observed,
+            crate::connectivity::core::own_numbers::IMS_NUMBER_SOURCE,
+        );
+    }
+    tracing::debug!(
+        line_id,
+        number_count = observed.len(),
+        "Reported this line's own number from the IMS registrar's P-Associated-URI"
+    );
+    info.phone_numbers = observed;
+}
+
 /// GET /api/modem/lines/{line_id}/sim
 pub async fn get_sim_info(
     State(app): State<AppState>,
@@ -1351,32 +1539,33 @@ pub async fn get_sim_info(
                     &app.database,
                     &cache_identity,
                 );
+            let mut info = SimInfoResponse {
+                present: binding.present,
+                iccid,
+                imsi,
+                phone_numbers,
+                sms_center,
+                mcc,
+                mnc,
+                phone_number_is_manual,
+                sms_center_is_manual,
+                sim_path: binding.model,
+                modem_path: String::new(),
+                sim_type: binding.sim_type,
+                esim_status: binding.esim_status,
+                active: binding.present,
+                operator_name: operator_id.clone(),
+                registered_operator_name: "VoWiFi".to_string(),
+                registered_operator_code: operator_id,
+                lock_status: "none".to_string(),
+                ..Default::default()
+            };
+            // A reader line has no baseband to ask, so the registrar's answer is
+            // the only source of its number.
+            apply_ims_observed_own_numbers(&app, line_id.trim(), &mut info).await;
             return (
                 StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Success",
-                    SimInfoResponse {
-                        present: binding.present,
-                        iccid,
-                        imsi,
-                        phone_numbers,
-                        sms_center,
-                        mcc,
-                        mnc,
-                        phone_number_is_manual,
-                        sms_center_is_manual,
-                        sim_path: binding.model,
-                        modem_path: String::new(),
-                        sim_type: binding.sim_type,
-                        esim_status: binding.esim_status,
-                        active: binding.present,
-                        operator_name: operator_id.clone(),
-                        registered_operator_name: "VoWiFi".to_string(),
-                        registered_operator_code: operator_id,
-                        lock_status: "none".to_string(),
-                        ..Default::default()
-                    },
-                )),
+                Json(ApiResponse::success_with_message("Success", info)),
             );
         }
     }
@@ -1391,10 +1580,15 @@ pub async fn get_sim_info(
     };
     match get_sim_info_for_modem_with_cache(&app.dbus_conn, &modem_path, Some(&app.database)).await
     {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", data)),
-        ),
+        Ok(mut data) => {
+            // The modem had nothing to say about the number on a data-only line;
+            // the IMS registrar did.
+            apply_ims_observed_own_numbers(&app, line_id.trim(), &mut data).await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", data)),
+            )
+        }
         Err(e) => (
             StatusCode::OK,
             Json(ApiResponse::<SimInfoResponse>::error(format!(
@@ -2883,21 +3077,23 @@ async fn start_line_data_runtime_locked(
     // proxy on the data path and avoids allocating a duplicate WDS session.
     if let Some(interface) = line.secondary_data.interface().await {
         line.data_proxy
-            .start(&interface, &profile.data_proxy)
+            .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
             .await?;
         return Ok(());
     }
 
-    // Preserve an ordinary-data bearer that is already active on qmi0. Beta8
-    // moves IMS to DATA6 in this case; replacing the data bearer would discard
-    // the observed slot state before the VoLTE allocator can act on it.
+    // Last resort: adopt an ordinary-data bearer still sitting on qmi0. The
+    // caller normally releases it first so IMS can own that port -- reaching
+    // here means that release failed, and some data is better than none. IMS
+    // will fail on this firmware while it stays, which the VoLTE activation
+    // reports on its own.
     if let Some(interface) =
         modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
             .await
             .map_err(|error| error.to_string())?
     {
         line.data_proxy
-            .start(&interface, &profile.data_proxy)
+            .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
             .await?;
         return Ok(());
     }
@@ -2913,12 +3109,12 @@ async fn start_line_data_runtime_locked(
     if let Some(qmi_device) = binding.qmi_device.as_deref() {
         match line
             .secondary_data
-            .start(&binding.modem_id, qmi_device, &apn)
+            .start(&binding.line_id, qmi_device, &apn)
             .await
         {
             Ok(interface) => {
                 line.data_proxy
-                    .start(&interface, &profile.data_proxy)
+                    .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
                     .await?;
                 return Ok(());
             }
@@ -2956,7 +3152,7 @@ async fn start_line_data_runtime_locked(
     }
     let interface = interface.ok_or_else(|| "cellular_data_interface_unavailable".to_string())?;
     line.data_proxy
-        .start(&interface, &profile.data_proxy)
+        .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
         .await?;
     Ok(())
 }
@@ -3034,6 +3230,35 @@ fn cooldown_elapsed(last_attempt: Option<Instant>, cooldown_secs: u64) -> bool {
     last_attempt
         .map(|attempt| attempt.elapsed() >= Duration::from_secs(cooldown_secs))
         .unwrap_or(true)
+}
+
+fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
+    features.data_proxy
+}
+
+/// Resolve the worker generation that can currently see a data interface.
+///
+/// A worker handle in the line registry is not sufficient by itself: the
+/// process may still be handshaking, or the bearer may have moved back to the
+/// host namespace after a worker restart.  Refreshing the namespace snapshot
+/// here keeps the watchdog's expected binding in lock-step with
+/// `DataProxyRuntime::start_for_line`.
+async fn current_data_proxy_worker(
+    line_id: &str,
+    interface: Option<&str>,
+) -> Option<UeWorkerBinding> {
+    let interface = interface?;
+    let worker = worker_for_line_feature(line_id, data_proxy_worker_enabled)?;
+    if !worker.status().await.ready {
+        return None;
+    }
+    let binding = worker.bind();
+    worker
+        .refresh_net_status()
+        .await
+        .ok()
+        .filter(|snapshot| snapshot.interfaces.iter().any(|name| name == interface))
+        .map(|_| binding)
 }
 
 /// Reconcile registration, bearer and proxy health for one selected line. The
@@ -3115,8 +3340,15 @@ async fn reconcile_line_data_health(
             .unwrap_or(None)
     };
     let proxy = line.data_proxy.status().await;
+    let current_worker = current_data_proxy_worker(&binding.line_id, interface.as_deref()).await;
+    let worker_binding_matches = line
+        .data_proxy
+        .worker_binding_matches(current_worker.as_ref())
+        .await;
     let healthy = interface.as_deref().is_some_and(|interface| {
-        proxy.running && proxy.interface_name.as_deref() == Some(interface)
+        proxy.running
+            && proxy.interface_name.as_deref() == Some(interface)
+            && worker_binding_matches
     });
     if healthy {
         watchdog.missing_data_polls = 0;
@@ -3156,7 +3388,14 @@ pub fn spawn_line_data_supervisor(app: AppState) {
             for line in app.line_registry.all().await {
                 let reconcile_app = app.clone();
                 tokio::spawn(async move {
-                    reconcile_line_data_health(&reconcile_app, &line).await;
+                    // Marks every diagnostic record this reconcile publishes as
+                    // per-line UE work, so the log separates it from the
+                    // device-wide schedulers sharing the same runtime.
+                    diagnostic_log::with_ue_worker_context(reconcile_line_data_health(
+                        &reconcile_app,
+                        &line,
+                    ))
+                    .await;
                 });
             }
         }
@@ -3232,45 +3471,69 @@ async fn prepare_line_data_slot_for_volte(
     let primary_data_active = primary_data_interface.is_some();
     let mut secondary_data_active = line.secondary_data.interface().await.is_some();
 
-    if !primary_data_active {
-        let data_start_error = start_line_data_runtime_locked(app, line, profile)
-            .await
-            .err();
-        secondary_data_active = line.secondary_data.interface().await.is_some();
-        if let Some(error) = data_start_error {
-            line.data_proxy.record_error(error.clone()).await;
-            if secondary_data_active {
-                // The DATA6 bearer can be healthy even when the local proxy
-                // listener fails. Keep the real allocation in that case.
-                warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
-            } else {
-                warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; VoLTE allocation will use the observed slot state");
-            }
-        }
-    } else if let Some(interface) = primary_data_interface.as_deref() {
-        if let Err(error) = line.data_proxy.start(interface, &profile.data_proxy).await {
-            line.data_proxy.record_error(error.clone()).await;
-            warn!(line_id = %binding.line_id, error = %error, "Primary data is active but its local proxy is unavailable");
-        }
-    }
-
     let inputs = DataSlotInputs {
         data_requested: true,
         primary_data_active,
         secondary_data_active,
-        secondary_endpoint_available: secondary_data_active || binding.qmi_device.is_some(),
+        secondary_endpoint_available: secondary_data_active
+            || binding.qmi_device.as_deref().is_some_and(
+                crate::hardware::devices::qcm410::secondary_qmi::runtime_endpoint_available,
+            ),
     };
-    match select_data_slot_mode(inputs) {
-        Ok(mode) => {
-            info!(line_id = %binding.line_id, mode = mode.as_str(), allocation = mode.allocation_message(), "VoLTE/data slot allocation selected");
-            Ok(mode)
-        }
+    let mode = match select_data_slot_mode(inputs) {
+        Ok(mode) => mode,
         Err(error) => {
             line.data_proxy.record_error(error.to_string()).await;
             warn!(line_id = %binding.line_id, error = %error, "VoLTE/data slot allocation failed");
-            Err(error)
+            return Err(error);
+        }
+    };
+
+    // IMS needs qmi0 to itself: an ordinary ModemManager bearer on that port
+    // deactivates the IMS bearer on this firmware. Move the user data to DATA6
+    // rather than moving IMS -- IMS cannot run on DATA6 while secondary-qmi-init
+    // holds that character device open, and trying strands a WDS client per
+    // attempt until the baseband faults.
+    if mode.requires_primary_data_release(primary_data_active) {
+        info!(
+            line_id = %binding.line_id,
+            interface = primary_data_interface.as_deref().unwrap_or("unknown"),
+            "Releasing the qmi0 data bearer so IMS can own the primary port"
+        );
+        line.data_proxy.stop().await;
+        if let Err(error) =
+            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+        {
+            // Not fatal on its own: DATA6 may still come up below, and the IMS
+            // activation that follows reports the real consequence.
+            warn!(line_id = %binding.line_id, error = %error, "Could not release the qmi0 data bearer");
         }
     }
+
+    // Establish user data on DATA6, or adopt the session already there.
+    let data_start_error = start_line_data_runtime_locked(app, line, profile)
+        .await
+        .err();
+    secondary_data_active = line.secondary_data.interface().await.is_some();
+    if let Some(error) = data_start_error {
+        line.data_proxy.record_error(error.clone()).await;
+        if secondary_data_active {
+            // The DATA6 bearer can be healthy even when the local proxy
+            // listener fails. Keep the real allocation in that case.
+            warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
+        } else {
+            warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; the line has no data exit");
+        }
+    }
+
+    info!(
+        line_id = %binding.line_id,
+        mode = mode.as_str(),
+        allocation = mode.allocation_message(),
+        "VoLTE/data slot allocation selected"
+    );
+    Ok(mode)
 }
 
 pub async fn set_line_data_connection_handler(
@@ -3528,17 +3791,12 @@ pub async fn set_line_airplane_mode_handler(
         );
     }
     if payload.enabled && app.config_manager.get_line_profile(&line_id).vowifi.enabled {
-        // Rebuild the WiFi Calling registration after cellular deregistration
-        // so the operator recalculates MT SMS and call routing without CS.
+        // Airplane mode only removes the 3GPP access. The connect path is
+        // idempotent: it preserves a healthy non-3GPP registration and repairs
+        // it only when the tunnel, operator link, or REGISTER lease is stale.
         let refresh_app = app.clone();
         let scope = VowifiScope::for_line(Arc::clone(&line));
         tokio::spawn(async move {
-            let _ = reset_vowifi_runtime_for_scope(
-                &refresh_app,
-                &scope,
-                "line_airplane_mode_vowifi_refresh",
-            )
-            .await;
             let _ = connect_vowifi_on_line(
                 &refresh_app,
                 &scope,
@@ -4169,8 +4427,8 @@ async fn send_sms_over_volte_path(
                 &line.volte_live,
                 &device,
                 &line.volte,
-                app.config_manager.get_line_volte_voice_enabled(line_id),
                 &ip_families,
+                app.config_manager.get_line_volte_ip_families_auto(line_id),
                 profile.roaming_allowed,
                 data_slot_mode,
                 app.config_manager
@@ -4259,11 +4517,7 @@ async fn send_sms_over_cs_path(
     Ok(json!({ "path": path, "transport": "modem", "line_id": line_id }))
 }
 
-async fn start_vowifi_voice_call(
-    app: &AppState,
-    line_id: &str,
-    phone_number: &str,
-) -> Result<crate::connectivity::modems::ims::vowifi::live::LiveCallResult, String> {
+async fn ensure_vowifi_voice_ready(app: &AppState, line_id: &str) -> Result<(), String> {
     let scope = VowifiScope::resolve(app, line_id).await?;
     if !scope.is_present() {
         return Err("line_not_present".to_string());
@@ -4294,48 +4548,76 @@ async fn start_vowifi_voice_call(
     if !voice_ready {
         return Err("vowifi_voice_ready_not_reached".to_string());
     }
-    place_live_voice_call_for_line(scope.line_id(), phone_number)
-        .await
-        .map_err(|error| error.reason)
+    Ok(())
 }
 
-/// Drain the voice call follow-up channel and keep the unified call list and
-/// history in sync for reader-backed VoWiFi calls.
-fn spawn_vowifi_call_followup(
-    app: AppState,
-    path: String,
-    mut followup: tokio::sync::mpsc::UnboundedReceiver<
-        crate::connectivity::modems::ims::vowifi::live::LiveCallFollowupFrame,
-    >,
-) {
-    tokio::spawn(async move {
-        while let Some(frame) = followup.recv().await {
-            let state = frame.outcome.call_state.as_str();
-            {
-                let mut active = app.active_calls.lock().await;
-                if let Some(record) = active.get_mut(&path) {
-                    record.state = state.to_string();
-                }
-            }
-            if state == "active" {
-                mark_tracked_call_answered(&app, &path).await;
-            } else if matches!(state, "ended" | "failed") {
-                let _ = finish_tracked_call(&app, &path, false).await;
-            }
-            info!(
-                trace_id = frame.outcome.trace_id.as_str(),
-                call_id = frame.outcome.call_id.as_str(),
-                call_state = frame.outcome.call_state.as_str(),
-                invite_state = frame.outcome.invite_state.as_str(),
-                negotiated_codec = frame
-                    .outcome
-                    .negotiated_codec
-                    .map(|codec| codec.as_str())
-                    .unwrap_or("none"),
-                "VoWiFi voice call follow-up progress"
+/// Start an outgoing call through the per-line IMS router. `force_vowifi` is
+/// used only by the explicit VoWiFi endpoint; automation and the normal line
+/// endpoint let the configured router choose VoWiFi before VoLTE.
+async fn start_routed_ims_voice_call(
+    app: &AppState,
+    requested_line_id: &str,
+    phone_number: &str,
+    force_vowifi: bool,
+) -> Result<(String, String, &'static str), String> {
+    let (line_id, _) = resolve_call_line(app, requested_line_id).await?;
+    let line = app
+        .line_registry
+        .get(&line_id)
+        .await
+        .ok_or_else(|| "line_not_found".to_string())?;
+    ensure_ims_voice_listener(app, &line);
+    let profile = app.config_manager.get_line_profile(&line_id);
+    if force_vowifi && !profile.vowifi.enabled {
+        return Err("vowifi_voice_disabled".to_string());
+    }
+
+    let volte = line.volte_live.live_xcap_access().await;
+    let mut vowifi = live_xcap_access_for_line(&line_id).await;
+    if profile.vowifi.enabled && vowifi.is_none() && (force_vowifi || volte.is_none()) {
+        match ensure_vowifi_voice_ready(app, &line_id).await {
+            Ok(()) => vowifi = live_xcap_access_for_line(&line_id).await,
+            Err(error) if force_vowifi => return Err(error),
+            Err(error) => tracing::debug!(
+                line_id,
+                %error,
+                "VoWiFi was not ready for normal call routing"
+            ),
+        }
+    }
+    let has_vowifi = vowifi.is_some();
+    let local_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let call_id = format!("{}@simadmin", crate::services::trunk::sip::token(16));
+    let mut plan = crate::services::trunk::access_router::VoiceCallPlan::new(
+        call_id,
+        "simadmin",
+        phone_number,
+        local_ip,
+    );
+    if let Some(context) = vowifi {
+        plan = plan.with_offer(
+            AccessPathKind::Vowifi,
+            local_voice_media_offer(context.profile, local_ip),
+        );
+    }
+    if !force_vowifi {
+        if let Some(context) = volte {
+            plan = plan.with_offer(
+                AccessPathKind::Volte,
+                local_voice_media_offer(context.profile, local_ip),
             );
         }
-    });
+    }
+    if force_vowifi && !has_vowifi {
+        return Err("vowifi_voice_ready_not_reached".to_string());
+    }
+    let queued = line
+        .voice_access
+        .start_call(plan)
+        .await
+        .map_err(|error| error.to_string())?;
+    let path = ims_call_path(&line_id, &queued.call_id);
+    Ok((line_id, path, queued.access.transport_tag()))
 }
 
 /// POST /api/vowifi/lines/{line_id}/voice/call
@@ -4350,45 +4632,23 @@ pub async fn place_call_handler(
     Json(payload): Json<PlaceCallRequest>,
 ) -> impl IntoResponse {
     let resolved_line_id = line_id.trim().to_string();
-    match start_vowifi_voice_call(&app, &resolved_line_id, &payload.phone_number).await {
-        Ok(call_result) => {
-            let outcome = call_result.outcome;
-            let path = format!("vowifi:{}", outcome.call_id);
-            track_call_start(
-                &app,
-                &resolved_line_id,
-                &path,
-                "outgoing",
-                &payload.phone_number,
-                false,
-            )
-            .await;
-            spawn_vowifi_call_followup(app.clone(), path.clone(), call_result.followup);
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Call placed",
-                    json!({
-                        "transport": "vowifi_ims",
-                        "line_id": resolved_line_id,
-                        "path": path,
-                        "call_id": outcome.call_id,
-                        "trace_id": outcome.trace_id,
-                        "call_state": outcome.call_state.as_str(),
-                        "invite_state": outcome.invite_state.as_str(),
-                        "negotiated_codec": outcome
-                            .negotiated_codec
-                            .map(|codec| codec.as_str()),
-                        "sip_status": outcome.sip_status,
-                        "media_followup": "background",
-                    }),
-                )),
-            )
-        }
+    match start_routed_ims_voice_call(&app, &resolved_line_id, &payload.phone_number, true).await {
+        Ok((line_id, path, transport)) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Call placed",
+                json!({
+                    "transport": transport,
+                    "line_id": line_id,
+                    "path": path,
+                    "media_followup": "operator_link",
+                }),
+            )),
+        ),
         Err(err) => (
             StatusCode::OK,
             Json(ApiResponse::<serde_json::Value>::error(format!(
-                "Failed to place call over VoWiFi: {}",
+                "Failed to place call over IMS: {}",
                 err
             ))),
         ),
@@ -4696,6 +4956,7 @@ async fn track_call_start(
                 answered_at: answered.then(std::time::Instant::now),
                 answered,
                 missing_polls: 0,
+                media_offer: None,
             },
         );
     }
@@ -4768,39 +5029,196 @@ async fn finish_tracked_call(
     None
 }
 
+async fn record_tracked_call_failure(
+    app: &AppState,
+    path: &str,
+    diagnostic: &crate::connectivity::core::ims_failure::ImsFailureDiagnostic,
+) {
+    let id = {
+        let active = app.active_calls.lock().await;
+        active.get(path).map(|record| record.id)
+    };
+    if let Some(id) = id {
+        if let Err(error) = app.database.update_call_failure(id, diagnostic) {
+            warn!(call_id = id, %error, "Failed to persist IMS call failure diagnostic");
+        }
+    }
+}
+
+fn is_ims_call_path(path: &str) -> bool {
+    path.starts_with("ims:")
+}
+
+fn ims_call_path(line_id: &str, call_id: &str) -> String {
+    format!("ims:{line_id}:{call_id}")
+}
+
+fn ims_call_id_for_line<'a>(path: &'a str, line_id: &str) -> Option<&'a str> {
+    let scoped = path.strip_prefix("ims:")?;
+    let (owner_line_id, call_id) = scoped.split_once(':')?;
+    (owner_line_id == line_id && !call_id.trim().is_empty()).then_some(call_id)
+}
+
+/// Keep IMS MT calls visible to the HTTP API even when there is no Asterisk
+/// trunk. The live VoLTE/VoWiFi adapters publish one event stream per line;
+/// this listener is deliberately attached to the line's aggregate router link
+/// so the selected access leg is never confused with another SIM.
+fn ensure_ims_voice_listener(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+) {
+    if !line.begin_ims_voice_listener() {
+        return;
+    }
+    let app = app.clone();
+    let line = Arc::clone(line);
+    let line_id = line.binding().line_id;
+    let mut receiver = line.voice_access.operator_link().subscribe_events();
+    tokio::spawn(async move {
+        loop {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(line_id, skipped, "IMS voice event listener lagged");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match event {
+                crate::services::trunk::bridge::OperatorEvent::Started {
+                    call_id, callee, ..
+                } => {
+                    track_call_start(
+                        &app,
+                        &line_id,
+                        &ims_call_path(&line_id, &call_id),
+                        "outgoing",
+                        &callee,
+                        false,
+                    )
+                    .await;
+                }
+                crate::services::trunk::bridge::OperatorEvent::Incoming {
+                    call_id,
+                    caller,
+                    body,
+                } => {
+                    let path = ims_call_path(&line_id, &call_id);
+                    track_call_start(&app, &line_id, &path, "incoming", &caller, false).await;
+                    {
+                        let mut active = app.active_calls.lock().await;
+                        if let Some(record) = active.get_mut(&path) {
+                            record.media_offer = Some(body);
+                        }
+                    }
+                    // Without an Asterisk driver there is nobody else to send
+                    // a provisional response. A 180 keeps the carrier dialog
+                    // alive while the UI decides whether to answer or reject.
+                    if !line.trunk.status().await.enabled {
+                        let _ = line.voice_access.operator_link().send_command(
+                            crate::services::trunk::bridge::OperatorCommand::ReportProvisional {
+                                call_id,
+                                status: 180,
+                                body: None,
+                            },
+                        );
+                    }
+                }
+                crate::services::trunk::bridge::OperatorEvent::Provisional {
+                    call_id,
+                    status,
+                    ..
+                } => {
+                    let path = ims_call_path(&line_id, &call_id);
+                    let mut active = app.active_calls.lock().await;
+                    if let Some(record) = active.get_mut(&path) {
+                        record.state = if status >= 180 {
+                            "ringing".into()
+                        } else {
+                            "dialing".into()
+                        };
+                        record.missing_polls = 0;
+                    }
+                }
+                crate::services::trunk::bridge::OperatorEvent::Answered { call_id, .. } => {
+                    mark_tracked_call_answered(&app, &ims_call_path(&line_id, &call_id)).await;
+                }
+                crate::services::trunk::bridge::OperatorEvent::Connected { call_id } => {
+                    mark_tracked_call_answered(&app, &ims_call_path(&line_id, &call_id)).await;
+                }
+                crate::services::trunk::bridge::OperatorEvent::Rejected {
+                    call_id,
+                    diagnostic,
+                    ..
+                } => {
+                    let path = ims_call_path(&line_id, &call_id);
+                    record_tracked_call_failure(&app, &path, &diagnostic).await;
+                    let _ = finish_tracked_call(&app, &path, false).await;
+                }
+                crate::services::trunk::bridge::OperatorEvent::Unavailable { call_id }
+                | crate::services::trunk::bridge::OperatorEvent::Ended { call_id }
+                | crate::services::trunk::bridge::OperatorEvent::Cancelled { call_id } => {
+                    let path = ims_call_path(&line_id, &call_id);
+                    let _ = finish_tracked_call(&app, &path, false).await;
+                }
+                crate::services::trunk::bridge::OperatorEvent::Renegotiate { .. }
+                | crate::services::trunk::bridge::OperatorEvent::Dtmf { .. }
+                | crate::services::trunk::bridge::OperatorEvent::TransferResponse { .. }
+                | crate::services::trunk::bridge::OperatorEvent::TransferNotify { .. } => {}
+            }
+        }
+        line.finish_ims_voice_listener();
+    });
+}
+
 async fn list_calls_for_line(
     app: &AppState,
     line_id: &str,
     modem_path: &str,
 ) -> Result<CallListResponse, String> {
-    if modem_path.trim().is_empty() {
+    let ims_calls = {
         let active = app.active_calls.lock().await;
-        return Ok(CallListResponse {
-            calls: active
-                .iter()
-                .filter(|(_, record)| record.line_id == line_id)
-                .map(|(path, record)| CallInfo {
-                    path: path.clone(),
-                    line_id: record.line_id.clone(),
-                    phone_number: record.phone_number.clone(),
-                    state: record.state.clone(),
-                    direction: record.direction.clone(),
-                    start_time: None,
-                })
-                .collect(),
-        });
-    }
-    let mut data = list_current_calls_for_modem(&app.dbus_conn, modem_path)
-        .await
-        .map_err(|error| error.to_string())?;
-    for call in &mut data.calls {
+        active
+            .iter()
+            .filter(|(path, record)| record.line_id == line_id && is_ims_call_path(path))
+            .map(|(path, record)| CallInfo {
+                path: path.clone(),
+                line_id: record.line_id.clone(),
+                phone_number: record.phone_number.clone(),
+                state: record.state.clone(),
+                direction: record.direction.clone(),
+                start_time: None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut calls = if modem_path.trim().is_empty() {
+        Vec::new()
+    } else {
+        match list_current_calls_for_modem(&app.dbus_conn, modem_path).await {
+            Ok(data) => data.calls,
+            Err(error) if !ims_calls.is_empty() => {
+                tracing::debug!(line_id, %error, "ModemManager call poll unavailable; returning IMS calls");
+                Vec::new()
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    for call in &mut calls {
         call.line_id = line_id.to_string();
     }
-    Ok(data)
+    calls.extend(ims_calls);
+    Ok(CallListResponse { calls })
 }
 
 async fn track_observed_calls(app: &AppState, data: &CallListResponse) {
     for call in &data.calls {
+        // IMS calls are already tracked by the per-line operator event stream.
+        // Re-inserting a polled IMS snapshot can resurrect a call after its
+        // terminal event has removed it from `active_calls`.
+        if is_ims_call_path(&call.path) {
+            continue;
+        }
         let answered = matches!(call.state.as_str(), "active" | "held");
         track_call_start(
             app,
@@ -4824,7 +5242,7 @@ async fn reconcile_finished_calls(
         active
             .iter_mut()
             .filter_map(|(path, record)| {
-                if !reconciled_lines.contains(&record.line_id) {
+                if is_ims_call_path(path) || !reconciled_lines.contains(&record.line_id) {
                     return None;
                 }
                 call_poll_marks_finished(record, observed_paths.contains(path))
@@ -4848,6 +5266,7 @@ pub fn spawn_call_monitor(app: AppState) {
             let mut observed_paths = HashSet::new();
             for line in app.line_registry.all().await {
                 let binding = line.binding();
+                ensure_ims_voice_listener(&app, &line);
                 if binding.line_kind == "reader" {
                     continue;
                 }
@@ -4858,7 +5277,12 @@ pub fn spawn_call_monitor(app: AppState) {
                 match list_calls_for_line(&app, &binding.line_id, &binding.modem_path).await {
                     Ok(data) => {
                         reconciled_lines.insert(binding.line_id);
-                        observed_paths.extend(data.calls.iter().map(|call| call.path.clone()));
+                        observed_paths.extend(
+                            data.calls
+                                .iter()
+                                .filter(|call| !is_ims_call_path(&call.path))
+                                .map(|call| call.path.clone()),
+                        );
                         track_observed_calls(&app, &data).await;
                     }
                     Err(error) => tracing::debug!(
@@ -4886,6 +5310,9 @@ pub async fn get_line_calls_handler(
             )
         }
     };
+    if let Some(line) = app.line_registry.get(&line_id).await {
+        ensure_ims_voice_listener(&app, &line);
+    }
     match list_calls_for_line(&app, &line_id, &modem_path).await {
         Ok(data) => {
             track_observed_calls(&app, &data).await;
@@ -4939,19 +5366,27 @@ pub(crate) async fn start_call_for_automation(
     requested_line_id: &str,
     phone_number: &str,
 ) -> Result<(String, String, &'static str), String> {
-    let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
-    if modem_path.trim().is_empty() {
-        let call_result = start_vowifi_voice_call(app, &line_id, phone_number).await?;
-        let path = format!("vowifi:{}", call_result.outcome.call_id);
-        track_call_start(app, &line_id, &path, "outgoing", phone_number, false).await;
-        spawn_vowifi_call_followup(app.clone(), path.clone(), call_result.followup);
-        return Ok((line_id, path, "vowifi_ims"));
+    match start_routed_ims_voice_call(app, requested_line_id, phone_number, false).await {
+        Ok(result) => return Ok(result),
+        Err(ims_error) => {
+            let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
+            if modem_path.trim().is_empty() {
+                return Err(ims_error);
+            }
+            let airplane =
+                modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path)
+                    .await
+                    .map_err(|_| "airplane_mode_state_unavailable".to_string())?;
+            if airplane.enabled {
+                return Err(format!("{ims_error};cs_blocked_by_airplane_mode"));
+            }
+            let path = make_call_on_modem(&app.dbus_conn, &modem_path, phone_number)
+                .await
+                .map_err(|error| error.to_string())?;
+            track_call_start(app, &line_id, &path, "outgoing", phone_number, false).await;
+            return Ok((line_id, path, "modem"));
+        }
     }
-    let path = make_call_on_modem(&app.dbus_conn, &modem_path, phone_number)
-        .await
-        .map_err(|error| error.to_string())?;
-    track_call_start(app, &line_id, &path, "outgoing", phone_number, false).await;
-    Ok((line_id, path, "modem"))
 }
 
 pub(crate) async fn hangup_call_for_automation(
@@ -4960,19 +5395,33 @@ pub(crate) async fn hangup_call_for_automation(
     path: &str,
 ) -> Result<(), String> {
     let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
-    if modem_path.trim().is_empty() {
-        let existed = app.active_calls.lock().await.contains_key(path);
+    if is_ims_call_path(path) {
+        let existed = app
+            .active_calls
+            .lock()
+            .await
+            .get(path)
+            .is_some_and(|record| record.line_id == line_id);
         if !existed {
             return Ok(());
         }
-        let call_id = path.strip_prefix("vowifi:").unwrap_or(path);
-        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
-            .send_command(OperatorCommand::HangupCall {
-                call_id: call_id.to_string(),
-            })
-            .map_err(|_| "vowifi_operator_channel_unavailable".to_string())?;
+        let call_id = ims_call_id_for_line(path, &line_id)
+            .ok_or_else(|| "call_not_found_on_selected_line".to_string())?;
+        let line = app
+            .line_registry
+            .get(&line_id)
+            .await
+            .ok_or_else(|| "line_not_found".to_string())?;
+        let link = line.voice_access.operator_link();
+        link.send_command(OperatorCommand::HangupCall {
+            call_id: call_id.to_string(),
+        })
+        .map_err(|_| "vowifi_operator_channel_unavailable".to_string())?;
         let _ = finish_tracked_call(app, path, false).await;
         return Ok(());
+    }
+    if modem_path.trim().is_empty() {
+        return Err("call_transport_unavailable".to_string());
     }
     match hangup_call_on_modem(&app.dbus_conn, &modem_path, path).await {
         Ok(()) => {
@@ -5000,7 +5449,7 @@ async fn resolve_call_owner(
     call_path: &str,
 ) -> Result<(String, String, CallInfo), String> {
     let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
-    if modem_path.trim().is_empty() {
+    if is_ims_call_path(call_path) {
         let active = app.active_calls.lock().await;
         let record = active
             .get(call_path)
@@ -5008,7 +5457,7 @@ async fn resolve_call_owner(
             .ok_or_else(|| "call_not_found_on_selected_line".to_string())?;
         return Ok((
             line_id.clone(),
-            modem_path,
+            String::new(),
             CallInfo {
                 path: call_path.to_string(),
                 line_id,
@@ -5051,13 +5500,33 @@ async fn hangup_call_on_line(
         answered,
     )
     .await;
-    let hangup_result = if modem_path.trim().is_empty() {
-        let call_id = path.strip_prefix("vowifi:").unwrap_or(path.as_str());
-        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
-            .send_command(OperatorCommand::HangupCall {
-                call_id: call_id.to_string(),
-            })
-            .map_err(|_| "vowifi_operator_channel_unavailable".to_string())
+    let hangup_result = if is_ims_call_path(&path) {
+        let Some(call_id) = ims_call_id_for_line(&path, &line_id) else {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(
+                    "call_not_found_on_selected_line",
+                )),
+            );
+        };
+        let line = app
+            .line_registry
+            .get(&line_id)
+            .await
+            .ok_or_else(|| "line_not_found".to_string());
+        let link = match line {
+            Ok(line) => line.voice_access.operator_link(),
+            Err(error) => {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::<serde_json::Value>::error(error)),
+                )
+            }
+        };
+        link.send_command(OperatorCommand::HangupCall {
+            call_id: call_id.to_string(),
+        })
+        .map_err(|_| "vowifi_operator_channel_unavailable".to_string())
     } else {
         hangup_call_on_modem(&app.dbus_conn, &modem_path, &path)
             .await
@@ -5113,35 +5582,43 @@ async fn hangup_all_calls_on_lines(
         if before.calls.is_empty() {
             continue;
         }
+        let mut result: Result<(), String> = Ok(());
+        let mut has_cs_call = false;
         for call in &before.calls {
-            track_call_start(
-                app,
-                &line_id,
-                &call.path,
-                &call.direction,
-                &call.phone_number,
-                matches!(call.state.as_str(), "active" | "held"),
-            )
-            .await;
-        }
-        let result = if modem_path.trim().is_empty() {
-            let calls = before.calls.clone();
-            let link = crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(
-                &line_id,
-            );
-            for call in &calls {
-                let call_id = call
-                    .path
-                    .strip_prefix("vowifi:")
-                    .unwrap_or(call.path.as_str());
-                let _ = link.send_command(OperatorCommand::HangupCall {
-                    call_id: call_id.to_string(),
-                });
+            if is_ims_call_path(&call.path) {
+                let Some(line) = app.line_registry.get(&line_id).await else {
+                    result = Err("line_not_found".to_string());
+                    break;
+                };
+                let link = line.voice_access.operator_link();
+                if link
+                    .send_command(OperatorCommand::HangupCall {
+                        call_id: match ims_call_id_for_line(&call.path, &line_id) {
+                            Some(call_id) => call_id.to_string(),
+                            None => {
+                                result = Err("call_not_found_on_selected_line".to_string());
+                                break;
+                            }
+                        },
+                    })
+                    .is_err()
+                {
+                    result = Err("ims_operator_channel_unavailable".to_string());
+                    break;
+                }
+            } else {
+                has_cs_call = true;
             }
-            Ok(())
-        } else {
-            hangup_all_calls_for_modem(&app.dbus_conn, &modem_path).await
-        };
+        }
+        if result.is_ok() && has_cs_call {
+            result = if modem_path.trim().is_empty() {
+                Err("cs_call_modem_unavailable".to_string())
+            } else {
+                hangup_all_calls_for_modem(&app.dbus_conn, &modem_path)
+                    .await
+                    .map_err(|error| error.to_string())
+            };
+        }
         if let Err(error) = result {
             failures.push(format!("{line_id}: {error}"));
             continue;
@@ -5201,15 +5678,42 @@ async fn answer_call_on_line(
         matches!(before.state.as_str(), "active" | "held"),
     )
     .await;
-    if modem_path.trim().is_empty() {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::<serde_json::Value>::error(
-                "VoWiFi incoming call answering is not exposed by this API",
-            )),
-        );
-    }
-    match answer_call_on_modem(&app.dbus_conn, &modem_path, &path).await {
+    let answer_result = if is_ims_call_path(&path) {
+        let body = match build_ims_answer_body(app, &line_id, &path).await {
+            Ok(body) => body,
+            Err(error) => {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::<serde_json::Value>::error(error)),
+                )
+            }
+        };
+        let Some(line) = app.line_registry.get(&line_id).await else {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error("line_not_found")),
+            );
+        };
+        let link = line.voice_access.operator_link();
+        let Some(call_id) = ims_call_id_for_line(&path, &line_id) else {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(
+                    "call_not_found_on_selected_line",
+                )),
+            );
+        };
+        link.send_command(OperatorCommand::AcceptCall {
+            call_id: call_id.to_string(),
+            body,
+        })
+        .map_err(|_| "ims_operator_channel_unavailable".to_string())
+    } else {
+        answer_call_on_modem(&app.dbus_conn, &modem_path, &path)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    match answer_result {
         Ok(()) => {
             mark_tracked_call_answered(app, &path).await;
             (
@@ -5227,6 +5731,52 @@ async fn answer_call_on_line(
             ))),
         ),
     }
+}
+
+async fn build_ims_answer_body(
+    app: &AppState,
+    line_id: &str,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let offer_body = {
+        let active = app.active_calls.lock().await;
+        active
+            .get(path)
+            .and_then(|record| record.media_offer.clone())
+            .ok_or_else(|| "ims_incoming_offer_unavailable".to_string())?
+    };
+    let offer = crate::connectivity::core::voice::parse_audio_sdp(&offer_body)
+        .map_err(|error| format!("ims_incoming_offer_invalid:{error}"))?;
+    let call_id = ims_call_id_for_line(path, line_id)
+        .ok_or_else(|| "ims_call_id_invalid_for_line".to_string())?;
+    let line = app
+        .line_registry
+        .get(line_id)
+        .await
+        .ok_or_else(|| "line_not_found".to_string())?;
+    let access = line
+        .voice_access
+        .call_access(call_id)
+        .await
+        .ok_or_else(|| "ims_call_access_unavailable".to_string())?;
+    let local_ip = std::net::Ipv4Addr::LOCALHOST;
+    let addr_type = crate::connectivity::core::voice::SdpAddrType::Ip4;
+    let context = match access {
+        AccessPathKind::Vowifi => live_xcap_access_for_line(line_id).await,
+        AccessPathKind::Volte => line.volte_live.live_xcap_access().await,
+        _ => None,
+    }
+    .ok_or_else(|| format!("ims_{}_registration_unavailable", access.as_str()))?;
+    let params = crate::connectivity::modems::ims::vowifi::voice::voice_params(context.profile);
+    crate::connectivity::core::voice::build_sdp_answer_with_params(
+        &params,
+        &offer,
+        &local_ip.to_string(),
+        addr_type,
+        LOCAL_VOICE_API_MEDIA_PORT,
+    )
+    .map(|answer| answer.to_sdp().into_bytes())
+    .map_err(|error| format!("ims_answer_sdp_failed:{error}"))
 }
 
 pub async fn answer_line_call_handler(
@@ -5260,7 +5810,7 @@ pub async fn send_line_call_dtmf_handler(
             )),
         );
     }
-    let result = if modem_path.trim().is_empty() {
+    let result = if is_ims_call_path(&payload.path) {
         let digit = payload
             .digit
             .chars()
@@ -5268,20 +5818,38 @@ pub async fn send_line_call_dtmf_handler(
             .ok_or_else(|| "dtmf_digit_required".to_string());
         match digit {
             Ok(digit) => {
-                crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
-                    .send_command(OperatorCommand::SendDtmf {
-                        call_id: payload
-                            .path
-                            .strip_prefix("vowifi:")
-                            .unwrap_or(payload.path.as_str())
-                            .to_string(),
-                        signal: DtmfSignal {
-                            digit,
-                            duration_ms: 160,
-                            source: DtmfSource::SipInfo,
-                        },
-                    })
-                    .map_err(|_| "vowifi_operator_channel_unavailable".to_string())
+                let link = app
+                    .line_registry
+                    .get(&line_id)
+                    .await
+                    .map(|line| line.voice_access.operator_link())
+                    .ok_or_else(|| "line_not_found".to_string());
+                let link = match link {
+                    Ok(link) => link,
+                    Err(error) => {
+                        return (
+                            StatusCode::OK,
+                            Json(ApiResponse::<serde_json::Value>::error(error)),
+                        )
+                    }
+                };
+                let Some(call_id) = ims_call_id_for_line(&payload.path, &line_id) else {
+                    return (
+                        StatusCode::OK,
+                        Json(ApiResponse::<serde_json::Value>::error(
+                            "call_not_found_on_selected_line",
+                        )),
+                    );
+                };
+                link.send_command(OperatorCommand::SendDtmf {
+                    call_id: call_id.to_string(),
+                    signal: DtmfSignal {
+                        digit,
+                        duration_ms: 160,
+                        source: DtmfSource::SipInfo,
+                    },
+                })
+                .map_err(|_| "vowifi_operator_channel_unavailable".to_string())
             }
             Err(error) => Err(error),
         }
@@ -5548,20 +6116,93 @@ pub async fn set_line_call_forwarding_handler(
     )
 }
 
+use crate::services::orchestrator::ims_access::{
+    ImsSubsystemState, NonThreeGppObservation, ThreeGppObservation,
+};
+
+/// Unified IMS view for one line.
+///
+/// Reports IMS registration, the 3GPP access path, the non-3GPP (Wi-Fi/ePDG)
+/// access path and the current voice access selection as four separate things.
+/// Both access paths can be registered at the same time; which one carries voice
+/// is a policy decision over them, not a property of either.
 pub async fn get_line_ims_status_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(reason) = resolve_call_line(&app, &line_id).await {
+    // Deliberately not `resolve_call_line`: that helper requires a present
+    // baseband, but a line whose radio is off can still be registered over the
+    // non-3GPP access. Refusing to report IMS state in exactly that case would
+    // hide the coexistence this endpoint exists to show.
+    let Some(line) = app.line_registry.get(line_id.trim()).await else {
         return (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<ImsStatusResponse>::error(reason)),
+            Json(ApiResponse::<ImsSubsystemState>::error("line_not_found")),
         );
-    }
+    };
+
+    let binding = line.binding();
+    let line_id = binding.line_id.clone();
+    let profile = app.config_manager.get_line_profile(&line_id);
+    let policy = app.config_manager.get_line_voice_path_policy(&line_id);
+
+    let volte = line.volte.snapshot().await;
+    let three_gpp = ThreeGppObservation {
+        configured: profile.volte_connection_enabled,
+        // Airplane mode powers down *this line's* baseband, so it disables the
+        // 3GPP access only. The non-3GPP path keeps working over Wi-Fi.
+        radio_available: binding.present && !profile.airplane_mode_enabled,
+        bearer_up: volte.bearer_up(),
+        signaling_ready: volte.signaling_ready(),
+        pcscf: volte.pcscf.clone(),
+        registered: volte.registered(),
+        registration_mode: match volte.registration_mode.as_str() {
+            "" => None,
+            mode => Some(mode.to_string()),
+        },
+        // Only a genuinely degraded phase is a degradation. A stale `last_error`
+        // from an earlier attempt must not mark a healthy registration down.
+        degraded_reason: (volte.phase
+            == crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded)
+            .then(|| {
+                volte
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "volte_degraded".to_string())
+            }),
+        media_gateway_ready: line.voice_access.media_gateway_ready(AccessPathKind::Volte),
+        // Current live runtimes do not yet expose authoritative EPS/5GS, PDU
+        // session, QoS-flow or VoNR capability metadata. Preserve that as
+        // unknown until a device-specific bearer provider reports it.
+        ..Default::default()
+    };
+
+    let vowifi = VowifiScope::for_line(Arc::clone(&line)).status().await;
+    let non_three_gpp = NonThreeGppObservation {
+        configured: profile.vowifi.enabled,
+        epdg_host: vowifi.profile.epdg.as_ref().map(|epdg| epdg.host.clone()),
+        epdg_ready: vowifi.readiness.epdg_ready,
+        ike_ready: vowifi.readiness.ike_ready,
+        child_sa_ready: vowifi.readiness.child_sa_ready,
+        esp_ready: vowifi.readiness.esp_ready,
+        pcscf: vowifi
+            .profile
+            .ims
+            .as_ref()
+            .and_then(|ims| ims.pcscf)
+            .map(str::to_string),
+        registered: vowifi.readiness.ims_registered,
+        degraded_reason: vowifi.degraded_reason.clone(),
+        media_gateway_ready: line
+            .voice_access
+            .media_gateway_ready(AccessPathKind::Vowifi),
+    };
+
     (
         StatusCode::OK,
-        Json(ApiResponse::<ImsStatusResponse>::error(
-            "IMS status is not exposed by ModemManager on this backend",
+        Json(ApiResponse::success_with_message(
+            "ok",
+            ImsSubsystemState::build(line_id.as_str(), &policy, &three_gpp, &non_three_gpp),
         )),
     )
 }
@@ -5628,6 +6269,10 @@ impl VowifiScope {
         self.line.binding().present
     }
 
+    fn line(&self) -> &Arc<crate::services::line_registry::LineRuntime> {
+        &self.line
+    }
+
     /// The modem this line owns, when the line is actually present. `None` means
     /// there is nothing to act on, which callers treat as a no-op rather than
     /// falling back to some other baseband.
@@ -5678,10 +6323,8 @@ impl Drop for VowifiRestoreClaim {
 }
 
 fn vowifi_restore_intent_enabled(app: &AppState, workflow: &VowifiRestoreWorkflow) -> bool {
-    app.config_manager
-        .get_line_profile(&workflow.line_id)
-        .vowifi
-        .enabled
+    let profile = app.config_manager.get_line_profile(&workflow.line_id);
+    profile.enabled && profile.vowifi.enabled
 }
 
 async fn reset_vowifi_runtime_for_scope(
@@ -5904,6 +6547,26 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
             0,
         );
         let _ = stop_vowifi_and_restore_cellular(&app, &scope, workflow.disabled_reason).await;
+        return;
+    }
+
+    // The access policy can park this leg even though the line's VoWiFi switch
+    // is on: `CellularPreferred` keeps WLAN down while the cellular leg is
+    // usable. Asked in the bring-up form, so "WLAN is not up yet" is not itself
+    // the reason for refusing. The user's enable intent is left untouched --
+    // flipping the preference must be enough to bring this leg back.
+    let wlan_decision = line_ims_access_permits_bringup(
+        &app,
+        scope.line(),
+        crate::connectivity::core::ims_access::ImsAccess::Wlan,
+    )
+    .await;
+    if !wlan_decision.permits(crate::connectivity::core::ims_access::ImsAccess::Wlan) {
+        tracing::debug!(
+            line_id = %workflow.line_id,
+            reason = wlan_decision.code,
+            "Skipping WiFi Calling restore: IMS access policy does not permit the WLAN leg"
+        );
         return;
     }
 
@@ -6491,6 +7154,8 @@ pub struct VowifiLineConfigResponse {
     pub runtime_restore_in_progress: bool,
     pub runtime_error: Option<String>,
     pub matched_profile_id: Option<String>,
+    pub matched_profile_source: Option<String>,
+    pub matched_profile_fallback_reason: Option<String>,
 }
 
 async fn build_vowifi_line_response(
@@ -6509,7 +7174,15 @@ async fn build_vowifi_line_response(
     let operator_ready =
         crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&modem.line_id)
             .is_available();
-    let (runtime_phase, runtime_stage, runtime_registered, runtime_error, matched_profile_id) = {
+    let (
+        runtime_phase,
+        runtime_stage,
+        runtime_registered,
+        runtime_error,
+        matched_profile_id,
+        matched_profile_source,
+        matched_profile_fallback_reason,
+    ) = {
         let stage = if config.enabled && status.phase == "not_started" {
             "starting".to_string()
         } else if config.enabled && status.readiness.ims_registered && !operator_ready {
@@ -6530,6 +7203,8 @@ async fn build_vowifi_line_response(
                 .profile
                 .profile
                 .map(|profile| profile.profile_id.to_string()),
+            status.profile.profile_source,
+            status.profile.profile_fallback_reason,
         )
     };
     VowifiLineConfigResponse {
@@ -6542,6 +7217,8 @@ async fn build_vowifi_line_response(
         runtime_restore_in_progress: line.vowifi_restore_in_progress(),
         runtime_error,
         matched_profile_id,
+        matched_profile_source,
+        matched_profile_fallback_reason,
     }
 }
 
@@ -6605,6 +7282,7 @@ pub async fn set_vowifi_line_config_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
     }
+    sync_line_video_capabilities(&app).await;
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
@@ -6666,6 +7344,7 @@ pub async fn set_vowifi_line_connection_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
     }
+    sync_line_video_capabilities(&app).await;
     if !binding.present {
         return (
             StatusCode::OK,
@@ -7284,19 +7963,103 @@ fn line_volte_enabled(app: &AppState, line: &crate::services::line_registry::Lin
     binding.present && profile.enabled && profile.volte_connection_enabled
 }
 
+/// Whether this line presents a user-supplied IMEI rather than the modem's own.
+///
+/// Reading the SIM override is a database load, so failures resolve to `false`:
+/// an unreadable override must not silently switch a line into the
+/// spoofed-identity regime and take the cellular leg down.
+async fn line_device_identity_spoofed(app: &AppState, line_id: &str) -> bool {
+    use crate::connectivity::modems::ims::effective_profile::resolve_effective_device_identity;
+    let Ok((_, sim_override)) = ims_override_for_line(app, line_id).await else {
+        return false;
+    };
+    // `None` for the modem IMEI is deliberate: only the override decides
+    // whether the presented identity is user-supplied, and an invalid custom
+    // IMEI is already rejected by the resolver.
+    resolve_effective_device_identity(Some(&sim_override), None).source
+        == OverrideSource::SimOverride
+}
+
+/// Which IMS access legs may hold a registration for this line right now.
+///
+/// See `connectivity::core::ims_access` for the standards reasoning. Two input
+/// choices are worth stating explicitly:
+///
+/// * `wlan_available` means the WLAN leg is *actually* up or coming up, not
+///   merely configured. Treating "enabled" as "available" would let a preferred
+///   but unreachable Wi-Fi leg hold the cellular leg down and leave the line
+///   with no registration at all.
+/// * `cellular_available` requires a present modem binding and no airplane
+///   mode, matching the existing VoLTE gates.
+async fn line_ims_access_decision(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+) -> crate::connectivity::core::ims_access::ImsAccessDecision {
+    line_ims_access_decision_assuming(app, line, None).await
+}
+
+/// [`line_ims_access_decision`], optionally treating one leg as available.
+///
+/// `assume_available` exists because a bring-up gate cannot ask "is this leg
+/// already up?" -- that is what it is about to establish. Evaluating the policy
+/// with the target leg pinned available answers the question that gate actually
+/// has: *if* this leg came up, would the policy let it hold a registration?
+/// Without this, `WlanPreferred` would refuse to start WLAN (it is not up yet),
+/// fall back to cellular, and the preferred leg could never be reached.
+async fn line_ims_access_decision_assuming(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+    assume_available: Option<crate::connectivity::core::ims_access::ImsAccess>,
+) -> crate::connectivity::core::ims_access::ImsAccessDecision {
+    use crate::connectivity::core::ims_access::{decide, ImsAccess, ImsAccessInputs};
+
+    let binding = line.binding();
+    let line_id = binding.line_id.clone();
+    let profile = app.config_manager.get_line_profile(&line_id);
+    let wlan_up =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
+            .is_available()
+            || line.vowifi_restore_in_progress();
+
+    decide(ImsAccessInputs {
+        cellular_enabled: profile.enabled && profile.volte_connection_enabled,
+        wlan_enabled: profile.enabled && profile.vowifi.enabled,
+        cellular_available: (binding.present && !profile.airplane_mode_enabled)
+            || assume_available == Some(ImsAccess::Cellular),
+        wlan_available: wlan_up || assume_available == Some(ImsAccess::Wlan),
+        device_identity_spoofed: line_device_identity_spoofed(app, &line_id).await,
+        preference: profile.ims_access_preference,
+    })
+}
+
+/// Whether the access policy would let `access` hold a registration if its
+/// bring-up succeeded. This is the form the restore gates want; see
+/// [`line_ims_access_decision_assuming`] for why they cannot use the plain
+/// observed-state decision.
+async fn line_ims_access_permits_bringup(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+    access: crate::connectivity::core::ims_access::ImsAccess,
+) -> crate::connectivity::core::ims_access::ImsAccessDecision {
+    line_ims_access_decision_assuming(app, line, Some(access)).await
+}
+
 async fn sync_line_video_capabilities(app: &AppState) {
     for line in app.line_registry.all().await {
         let line_id = line.binding().line_id;
+        // A connected IMS leg is a voice-capable leg. There is no separate
+        // "voice enabled" opinion to AND in any more: MMTEL voice and video are
+        // why the line registers at all, and a carrier that withholds them
+        // answers the REGISTER or the INVITE with a SIP error.
         let line_enabled = line_volte_enabled(app, &line);
-        let voice_enabled = app.config_manager.get_line_volte_voice_enabled(&line_id);
         let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
         let registered = line.volte.status().await.registered;
         line.volte_live
             .operator_link()
-            .set_ready(line_enabled && voice_enabled && registered);
+            .set_ready(line_enabled && registered);
         line.voice_access.set_backend_video_enabled(
             AccessPathKind::Volte,
-            line_enabled && voice_enabled && ims_video.volte_enabled,
+            line_enabled && ims_video.volte_enabled,
         );
         let vowifi = app.config_manager.get_line_profile(&line_id).vowifi;
         line.voice_access.set_backend_video_enabled(
@@ -7306,10 +8069,16 @@ async fn sync_line_video_capabilities(app: &AppState) {
     }
 }
 
-/// VoLTE voice (gateway-mode) status. Voice is a forward-looking extension: the
-/// target device relays RTP between the operator IMS leg and an internal SIP UA;
-/// it never plays audio locally. `enabled` reflects this line's IMS connection
-/// and voice switches; `gateway_mode` is always true on this hardware class.
+/// VoLTE voice (gateway-mode) status. The target device relays RTP between the
+/// operator IMS leg and an internal SIP UA; it never plays audio locally.
+///
+/// MMTEL voice is the reason this project registers IMS at all, so there is no
+/// separate voice switch to report: `enabled` follows the line's IMS connection.
+/// `voice_enabled` is retained as a response field for API compatibility and is
+/// now a mirror of `ims_connection_enabled`. A carrier that does not permit
+/// voice answers the REGISTER or the INVITE with a SIP error, which the runtime
+/// surfaces instead of pre-emptively refusing locally. `gateway_mode` is always
+/// true on this hardware class.
 #[derive(Debug, serde::Serialize, Default)]
 pub struct VolteVoiceStatusResponse {
     pub line_id: String,
@@ -7322,12 +8091,12 @@ pub struct VolteVoiceStatusResponse {
 }
 
 impl VolteVoiceStatusResponse {
-    fn build(line_id: String, line_enabled: bool, voice_enabled: bool, registered: bool) -> Self {
+    fn build(line_id: String, line_enabled: bool, registered: bool) -> Self {
         Self {
             line_id,
-            enabled: line_enabled && voice_enabled,
+            enabled: line_enabled,
             ims_connection_enabled: line_enabled,
-            voice_enabled,
+            voice_enabled: line_enabled,
             registered,
             // Qualcomm 410 pocket-WiFi has no mic/speaker/PCM: relay only.
             gateway_mode: true,
@@ -7342,12 +8111,7 @@ async fn current_volte_voice_status(
 ) -> VolteVoiceStatusResponse {
     let line_id = line.binding().line_id;
     let registered = line.volte.status().await.registered;
-    VolteVoiceStatusResponse::build(
-        line_id.clone(),
-        line_volte_enabled(app, line),
-        app.config_manager.get_line_volte_voice_enabled(&line_id),
-        registered,
-    )
+    VolteVoiceStatusResponse::build(line_id, line_volte_enabled(app, line), registered)
 }
 
 pub async fn get_volte_call_status_handler(
@@ -7367,40 +8131,6 @@ pub async fn get_volte_call_status_handler(
             current_volte_voice_status(&app, &line).await,
         )),
     )
-}
-
-pub async fn set_volte_voice_handler(
-    State(app): State<AppState>,
-    Path(line_id): Path<String>,
-    Json(payload): Json<VolteControlToggleRequest>,
-) -> (StatusCode, Json<ApiResponse<VolteVoiceStatusResponse>>) {
-    let Some(line) = resolve_control_line(&app, &line_id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("line_not_found")),
-        );
-    };
-    match app
-        .config_manager
-        .set_line_volte_voice_enabled(&line_id, payload.enabled)
-    {
-        Ok(_) => {
-            sync_line_video_capabilities(&app).await;
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Success",
-                    current_volte_voice_status(&app, &line).await,
-                )),
-            )
-        }
-        Err(err) => (
-            StatusCode::OK,
-            Json(ApiResponse::<VolteVoiceStatusResponse>::error(format!(
-                "Failed: {err}"
-            ))),
-        ),
-    }
 }
 
 // ============ SMS multi-path orchestration policy (phase C) ============
@@ -7483,8 +8213,7 @@ impl VilteStatusResponse {
     async fn build(app: &AppState, line: &crate::services::line_registry::LineRuntime) -> Self {
         let line_id = line.binding().line_id;
         let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
-        let voice_ready = line_volte_enabled(app, line)
-            && app.config_manager.get_line_volte_voice_enabled(&line_id);
+        let voice_ready = line_volte_enabled(app, line);
         Self {
             line_id,
             enabled: voice_ready && ims_video.volte_enabled,
@@ -7517,42 +8246,8 @@ pub async fn get_vilte_control_handler(
     )
 }
 
-pub async fn set_vilte_feature_handler(
-    State(app): State<AppState>,
-    Path(line_id): Path<String>,
-    Json(payload): Json<VolteControlToggleRequest>,
-) -> (StatusCode, Json<ApiResponse<VilteStatusResponse>>) {
-    let Some(line) = resolve_control_line(&app, &line_id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("line_not_found")),
-        );
-    };
-    match app
-        .config_manager
-        .set_line_ims_video_volte_enabled(&line_id, payload.enabled)
-    {
-        Ok(_) => {
-            sync_line_video_capabilities(&app).await;
-            let status = VilteStatusResponse::build(&app, &line).await;
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message("Success", status)),
-            )
-        }
-        Err(err) => (
-            StatusCode::OK,
-            Json(ApiResponse::<VilteStatusResponse>::error(format!(
-                "Failed: {err}"
-            ))),
-        ),
-    }
-}
-
-/// Replace the full IMS video config (codec / payload type / fmtp). The
-/// `volte_enabled` gate is honored only when VoLTE voice is enabled, and
-/// `vowifi_enabled` only when VoWiFi voice is enabled; otherwise each gate is
-/// forced off by the config layer.
+/// Replace the IMS video codec / payload type / fmtp settings. Access enablement
+/// is derived from the corresponding VoLTE and VoWiFi connection settings.
 pub async fn set_vilte_config_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
@@ -8055,7 +8750,10 @@ async fn schedule_vowifi_auto_restore(
     );
     let restore_app = app.clone();
     tokio::spawn(async move {
-        run_vowifi_restore_workflow(restore_app, workflow).await;
+        // Attributed to the line rather than the shared scheduler loop that
+        // queued it: everything this workflow publishes belongs to one UE.
+        diagnostic_log::with_ue_worker_context(run_vowifi_restore_workflow(restore_app, workflow))
+            .await;
     });
 }
 
@@ -8068,7 +8766,58 @@ async fn start_line_volte_restore(
     line: Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
 ) -> bool {
-    if !line_volte_restore_enabled(&app, &line) || !line.begin_volte_retry() {
+    if !line_volte_restore_enabled(&app, &line) {
+        return false;
+    }
+    // The access policy can forbid this leg even when the line's own VoLTE
+    // switch is on: a presented device identity excludes the cellular leg
+    // outright, and a single-registration preference parks it behind WLAN. Both
+    // are configuration the user chose, so refusing here is not a failure --
+    // hence debug rather than warn.
+    let decision = line_ims_access_decision(&app, &line).await;
+    if !decision.permits(crate::connectivity::core::ims_access::ImsAccess::Cellular) {
+        tracing::debug!(
+            line_id = %line.binding().line_id,
+            reason = decision.code,
+            "Skipping VoLTE restore: IMS access policy does not permit the cellular leg"
+        );
+        return false;
+    }
+    if line.baseband_wedge_permanent() {
+        tracing::warn!(
+            line_id = %line.binding().line_id,
+            source,
+            "Skipping VoLTE restore: Qualcomm bam-dmux is latched until a full system reboot"
+        );
+        line.volte
+            .update(|state| {
+                state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+                state.recovery_state =
+                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
+                state.manual_retry_available = false;
+                state.next_retry_at = None;
+                state.last_error = Some(
+                    "volte_baseband_wedged:volte_bearer_netdev_runtime_error:full_system_reboot_required"
+                        .to_string(),
+                );
+            })
+            .await;
+        return false;
+    }
+    // An operator asking explicitly may always try; only the unattended pass is
+    // suppressed, because that is the one that loops the baseband into a crash
+    // every time its cooldown is lost to re-enumeration.
+    if source == "automatic" {
+        if let Some(remaining) = line.baseband_wedge_remaining() {
+            tracing::debug!(
+                line_id = %line.binding().line_id,
+                remaining_secs = remaining.as_secs(),
+                "Skipping automatic VoLTE restore: baseband wedge cooldown active"
+            );
+            return false;
+        }
+    }
+    if !line.begin_volte_retry() {
         return false;
     }
     let line_id = line.binding().line_id;
@@ -8079,12 +8828,9 @@ async fn start_line_volte_restore(
             .attempts
             .clamp(1, 5),
     );
-    let voice_enabled = app.config_manager.get_line_volte_voice_enabled(&line_id);
     let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
-    line.voice_access.set_backend_video_enabled(
-        AccessPathKind::Volte,
-        voice_enabled && ims_video.volte_enabled,
-    );
+    line.voice_access
+        .set_backend_video_enabled(AccessPathKind::Volte, ims_video.volte_enabled);
     line.volte
         .update(|state| {
             state.recovery_state =
@@ -8100,8 +8846,16 @@ async fn start_line_volte_restore(
         })
         .await;
     tokio::spawn(async move {
-        run_line_volte_restore_batch(&app, &line, source).await;
-        line.finish_volte_retry();
+        // Attributes this line's registration diagnostics to per-line UE work.
+        // This is the path that produces the nested
+        // `volte_runtime_mm_bearer_connect_failed:...` chains, so separating it
+        // from the device-wide schedulers is what makes the log readable when
+        // several cards are retrying at once.
+        diagnostic_log::with_ue_worker_context(async {
+            run_line_volte_restore_batch(&app, &line, source).await;
+            line.finish_volte_retry();
+        })
+        .await;
     });
     true
 }
@@ -8117,7 +8871,7 @@ fn line_volte_restore_enabled(
     line: &crate::services::line_registry::LineRuntime,
 ) -> bool {
     let profile = app.config_manager.get_line_profile(&line.binding().line_id);
-    profile.enabled && profile.volte_connection_enabled
+    profile.enabled && profile.volte_connection_enabled && !profile.airplane_mode_enabled
 }
 
 async fn wait_for_line_modem(
@@ -8128,8 +8882,12 @@ async fn wait_for_line_modem(
         if !line_volte_restore_enabled(app, line) {
             return LineModemWait::Cancelled;
         }
-        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
-        if line.binding().present {
+        let refreshed = app
+            .line_registry
+            .refresh(app.dbus_conn.as_ref())
+            .await
+            .is_ok();
+        if refreshed && line.binding().present {
             return LineModemWait::Ready;
         }
         line.volte
@@ -8210,7 +8968,25 @@ async fn run_line_volte_restore_batch(
                 .await;
             return;
         }
-        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        if let Err(error) = refreshed {
+            line.volte
+                .update(|state| {
+                    state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+                    state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Modem;
+                    state.recovery_state =
+                        crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
+                    state.last_error = Some(format!("volte_modem_refresh_failed:{error}"));
+                    state.next_retry_at =
+                        Some(volte_next_retry_at(VOLTE_MODEM_MISSING_POLL_DELAY_SECS));
+                })
+                .await;
+            if attempt < max_attempts {
+                tokio::time::sleep(Duration::from_secs(VOLTE_MODEM_MISSING_POLL_DELAY_SECS)).await;
+                continue;
+            }
+            break;
+        }
         if !line.binding().present {
             match wait_for_line_modem(app, line).await {
                 LineModemWait::Ready => {}
@@ -8264,9 +9040,9 @@ async fn run_line_volte_restore_batch(
                             &line.volte_live,
                             &device,
                             &line.volte,
-                            app.config_manager
-                                .get_line_volte_voice_enabled(&binding.line_id),
                             &ip_families,
+                            app.config_manager
+                                .get_line_volte_ip_families_auto(&binding.line_id),
                             profile.roaming_allowed,
                             data_slot_mode,
                             app.config_manager
@@ -8285,6 +9061,10 @@ async fn run_line_volte_restore_batch(
         };
         match result {
             Ok(_) => {
+                // This baseband accepted an IMS session, so any earlier wedge was
+                // a transient firmware race rather than a standing refusal. Drop
+                // the backoff so the next failure starts from the base window.
+                line.clear_baseband_wedge();
                 line.volte
                     .update(|state| {
                         state.recovery_state =
@@ -8302,13 +9082,25 @@ async fn run_line_volte_restore_batch(
                 // activation against it can escalate to a modem subsystem
                 // restart and take the whole device down, so stop the batch and
                 // wait for an explicit operator retry instead.
-                if crate::connectivity::modems::ims::volte::plan::FailureClass::from_details(
-                    error.detail().unwrap_or_default(),
-                ) == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
+                if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(&error)
+                    == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
                 {
+                    // The crash this abort guards against re-enumerates the
+                    // modem, and that hotplug resets the VoLTE snapshot. Record
+                    // the cooldown on the line instead, where it survives.
+                    let permanent = error.code()
+                        == crate::connectivity::modems::ims::volte::errors::code::BEARER_NETDEV_RUNTIME_ERROR;
+                    let cooldown = if permanent {
+                        line.note_baseband_wedged_permanent();
+                        None
+                    } else {
+                        Some(line.note_baseband_wedged())
+                    };
                     warn!(
                         line_id = %binding.line_id,
                         error = %error,
+                        permanent,
+                        cooldown_secs = cooldown.map(|value| value.as_secs()),
                         "VoLTE IMS restore aborted: the baseband refused the session in a way that is unsafe to retry"
                     );
                     line.volte
@@ -8316,7 +9108,7 @@ async fn run_line_volte_restore_batch(
                             state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
                             state.recovery_state =
                                 crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
-                            state.manual_retry_available = true;
+                            state.manual_retry_available = !permanent;
                             state.next_retry_at = None;
                             state.last_error = Some(format!("volte_baseband_wedged:{error}"));
                             state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
@@ -8361,7 +9153,11 @@ pub fn spawn_volte_auto_restore(app: AppState) {
                 .config_manager
                 .get_line_profiles()
                 .iter()
-                .filter(|profile| profile.enabled && profile.volte_connection_enabled)
+                .filter(|profile| {
+                    profile.enabled
+                        && profile.volte_connection_enabled
+                        && !profile.airplane_mode_enabled
+                })
             {
                 if started_at.elapsed()
                     < Duration::from_secs(
@@ -8673,6 +9469,72 @@ pub async fn set_voice_path_policy_handler(
                 Json(ApiResponse::success_with_message("Saved", policy)),
             )
         }
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+/// Which IMS access legs may hold a *registration* for this line.
+///
+/// Deliberately a separate endpoint from `voice/path-policy`: that orders
+/// **originating** calls across already-registered legs, while this decides which
+/// legs register at all. See `connectivity::core::ims_access`.
+// `Default` is required by `ApiResponse::error`, which both handlers below use
+// on the not-found path.
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+pub struct ImsAccessPreferencePayload {
+    pub preference: crate::connectivity::core::ims_access::ImsAccessPreference,
+}
+
+pub async fn get_ims_access_preference_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<ImsAccessPreferencePayload>>) {
+    if resolve_control_line(&app, &line_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            ImsAccessPreferencePayload {
+                preference: app.config_manager.get_line_ims_access_preference(&line_id),
+            },
+        )),
+    )
+}
+
+pub async fn set_ims_access_preference_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<ImsAccessPreferencePayload>,
+) -> (StatusCode, Json<ApiResponse<ImsAccessPreferencePayload>>) {
+    if resolve_control_line(&app, &line_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    }
+    match app
+        .config_manager
+        .set_line_ims_access_preference(&line_id, payload.preference)
+    {
+        // Only the stored preference changes here. Legs are not torn down or
+        // brought up inline: the restore workflows consult the policy on their
+        // next pass, and the per-line enable intent is left exactly as the user
+        // set it.
+        Ok(preference) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Saved",
+                ImsAccessPreferencePayload { preference },
+            )),
+        ),
         Err(err) => (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {err}"))),
@@ -10001,27 +10863,14 @@ fn resolve_ims_catalog(
     pinned: Option<&str>,
     access: CatalogAccessKind,
 ) -> Option<&'static CarrierProfile> {
-    if let Some(profile_id) = pinned.filter(|value| !value.trim().is_empty()) {
-        if let Ok(Some(profile)) = app.carrier_catalog.get(profile_id, access) {
-            if let Some(interned) = catalog_profile_to_static(&profile) {
-                return Some(interned);
-            }
-        }
-    }
-    if let Some(imsi) = imsi {
-        if let Ok(Some(profile)) = app.carrier_catalog.resolve_for_imsi(imsi, None, access) {
-            if let Some(interned) = catalog_profile_to_static(&profile) {
-                return Some(interned);
-            }
-        }
-    }
-    None
-}
-
-fn catalog_profile_to_static(
-    profile: &crate::connectivity::modems::ims::vowifi::carrier_catalog::CatalogProfile,
-) -> Option<&'static CarrierProfile> {
-    Some(profile.record.intern())
+    crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore::new(
+        Arc::clone(&app.carrier_catalog),
+        Arc::clone(&app.database),
+    )
+    .resolve_for_imsi_access(pinned, imsi.unwrap_or_default(), None, access)
+    .ok()
+    .flatten()
+    .map(|resolved| resolved.profile)
 }
 
 async fn query_sim_voicemail_number(modem_id: &str) -> Option<String> {
@@ -11518,6 +12367,7 @@ mod tests {
             answered_at: None,
             answered: false,
             missing_polls: 0,
+            media_offer: None,
         };
 
         assert!(!call_poll_marks_finished(&mut record, false));
@@ -11529,11 +12379,55 @@ mod tests {
     }
 
     #[test]
+    fn ims_call_paths_scope_identical_call_ids_to_their_line() {
+        let line_a = "line-0123456789abcdef0123456789abcdef";
+        let line_b = "line-fedcba9876543210fedcba9876543210";
+        let call_id = "same-call-id@carrier.example";
+        let path_a = ims_call_path(line_a, call_id);
+        let path_b = ims_call_path(line_b, call_id);
+
+        assert_ne!(path_a, path_b);
+        assert_eq!(ims_call_id_for_line(&path_a, line_a), Some(call_id));
+        assert_eq!(ims_call_id_for_line(&path_b, line_b), Some(call_id));
+        assert_eq!(ims_call_id_for_line(&path_a, line_b), None);
+        assert_eq!(ims_call_id_for_line(&path_b, line_a), None);
+        assert_eq!(ims_call_id_for_line("ims:same-call-id", line_a), None);
+    }
+
+    #[test]
+    fn poll_reconciliation_never_finishes_ims_event_records() {
+        let mut ims_record = crate::state::ActiveCallRecord {
+            id: 1,
+            line_id: "line-a".to_string(),
+            direction: "outgoing".to_string(),
+            phone_number: "+10000".to_string(),
+            state: "dialing".to_string(),
+            answered_at: None,
+            answered: false,
+            missing_polls: 0,
+            media_offer: None,
+        };
+
+        assert!(is_ims_call_path("ims:line-a:call-a"));
+        assert!(!call_poll_marks_finished(&mut ims_record, true));
+        assert_eq!(ims_record.missing_polls, 0);
+    }
+
+    #[test]
     fn enabled_line_participates_in_vowifi_restore() {
         let mut offline = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
         offline.vowifi.enabled = true;
 
         assert!(line_vowifi_restore_enabled(&offline));
+    }
+
+    #[test]
+    fn airplane_mode_keeps_non_three_gpp_restore_enabled() {
+        let mut airplane = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        airplane.airplane_mode_enabled = true;
+        airplane.vowifi.enabled = true;
+
+        assert!(line_vowifi_restore_enabled(&airplane));
     }
 
     #[test]
@@ -11551,11 +12445,9 @@ mod tests {
             "line-0123456789abcdef0123456789abcdef".to_string(),
             true,
             true,
-            true,
         );
         let disabled = VolteVoiceStatusResponse::build(
             "line-fedcba9876543210fedcba9876543210".to_string(),
-            true,
             false,
             false,
         );
@@ -11563,10 +12455,29 @@ mod tests {
         assert!(enabled.enabled);
         assert!(enabled.registered);
         assert!(!disabled.enabled);
-        assert!(disabled.ims_connection_enabled);
-        assert!(!disabled.voice_enabled);
+        assert!(!disabled.ims_connection_enabled);
         assert!(!disabled.registered);
         assert_ne!(enabled.line_id, disabled.line_id);
+    }
+
+    #[test]
+    fn volte_voice_is_available_whenever_the_ims_connection_is() {
+        // Voice used to need its own switch on top of the IMS connection, so a
+        // connected line could still report voice unavailable and refuse calls
+        // locally. MMTEL voice is the reason this project registers IMS, so the
+        // only local precondition is the connection itself; a carrier that
+        // withholds voice says so with a SIP error.
+        let connected = VolteVoiceStatusResponse::build(
+            "line-0123456789abcdef0123456789abcdef".to_string(),
+            true,
+            false,
+        );
+
+        assert!(connected.enabled);
+        assert!(connected.voice_enabled);
+        assert!(connected.ims_connection_enabled);
+        assert!(connected.gateway_mode);
+        assert!(!connected.local_audio_capable);
     }
 
     #[test]

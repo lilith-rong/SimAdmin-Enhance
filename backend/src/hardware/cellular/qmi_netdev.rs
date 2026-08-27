@@ -26,14 +26,20 @@
 //! specific, reported failure.
 
 use std::{
+    io,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
     net::UdpSocket,
     process::Command,
     time::{sleep, timeout},
+};
+
+use crate::platform::network_routing::{
+    host_selector, network_address, route_table, rule_priority, source_selector, RouteDomain,
 };
 use tracing::{debug, info, warn};
 
@@ -112,6 +118,14 @@ pub enum NetdevError {
     NoCandidates(String),
     /// Candidates exist but none could be configured with the session address.
     ConfigureFailed(String),
+    /// Candidates exist and the kernel refuses to bring *every* one of them up.
+    ///
+    /// This is a statement about the baseband, not about any single interface.
+    /// All candidates hang off one `bam-dmux` parent device, and once that parent
+    /// latches a runtime-PM error the kernel answers `EINVAL` to an
+    /// administrative UP on all of its netdevs at once. Nothing this module does
+    /// clears that; the baseband has to be restarted.
+    LinkUnavailable(String),
 }
 
 impl std::fmt::Display for NetdevError {
@@ -119,11 +133,34 @@ impl std::fmt::Display for NetdevError {
         match self {
             Self::NoCandidates(d) => write!(f, "qmi_netdev_no_candidates:{d}"),
             Self::ConfigureFailed(d) => write!(f, "qmi_netdev_configure_failed:{d}"),
+            Self::LinkUnavailable(d) => write!(f, "qmi_netdev_link_unavailable:{d}"),
         }
     }
 }
 
 impl std::error::Error for NetdevError {}
+
+/// Why one candidate could not be configured.
+///
+/// The distinction the resolver cares about is whether the failure is a property
+/// of the *interface* (wrong MUX channel, address clash) or of the *baseband*
+/// they all share. A refused UP is the latter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigureError {
+    /// The kernel refused an administrative UP on the interface.
+    LinkUp(String),
+    /// An address, rule or route step failed.
+    Step(String),
+}
+
+impl std::fmt::Display for ConfigureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LinkUp(d) => write!(f, "link will not come up: {d}"),
+            Self::Step(d) => f.write_str(d),
+        }
+    }
+}
 
 /// The address configuration a session needs on its interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +226,21 @@ pub fn candidates_for_baseband(baseband: &str) -> Vec<String> {
     candidates
 }
 
+/// Drop the caller's reserved interfaces from a candidate list.
+///
+/// Filtering happens once, at the top of resolution, rather than at each
+/// decision point. Resolution has three exits -- sole candidate, probe answered,
+/// and assumed -- and the assumed exit is the one that actually misfired on this
+/// target: with no probe reply it takes the lowest-numbered candidate, which is
+/// `wwan0`. A filter per exit would have to be correct three times; a filter on
+/// the input is correct once.
+fn usable_candidates(candidates: Vec<String>, reserved: ReservedNetdevs<'_>) -> Vec<String> {
+    candidates
+        .into_iter()
+        .filter(|name| !reserved.contains(&name.as_str()))
+        .collect()
+}
+
 /// Numeric suffix of an interface name, for natural ordering (`wwan10` after
 /// `wwan9`).
 fn trailing_number(name: &str) -> u32 {
@@ -217,6 +269,15 @@ pub fn read_counters(interface: &str) -> LinkCounters {
     }
 }
 
+/// Interfaces a caller must never be given, even as a last-resort guess.
+///
+/// The MSM8916 firmware cannot keep IMS and Internet bearers alive through the
+/// same data slot, so the two runtimes divide the netdevs between them. Handing
+/// a caller an interface that belongs to the other one does not fail loudly: it
+/// produces a session on a link whose packets belong to somebody else, which
+/// looks like an unreachable peer several layers up.
+pub type ReservedNetdevs<'a> = &'a [&'a str];
+
 /// Find the interface carrying a session, and leave it configured.
 ///
 /// Each candidate is configured, probed, and — if it does not answer — stripped
@@ -226,8 +287,19 @@ pub fn read_counters(interface: &str) -> LinkCounters {
 /// A single candidate is accepted without probing: there is nothing to
 /// disambiguate, and spending a probe timeout on the USB/single-netdev case would
 /// slow down every connection for no information.
-pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNetdev, NetdevError> {
-    let candidates = candidates_for_baseband(baseband);
+///
+/// `reserved` names interfaces this caller must not be given under any
+/// circumstance — not as a probe candidate and not as the assumed fallback. The
+/// fallback is the reason this parameter exists: when no candidate answers,
+/// resolution picks the lowest-numbered one, which on this target is `wwan0`,
+/// the port ModemManager holds for IMS. Filtering at the top means a caller can
+/// never receive a reserved interface, however resolution ends up deciding.
+pub async fn resolve(
+    baseband: &str,
+    config: &NetdevConfig,
+    reserved: ReservedNetdevs<'_>,
+) -> Result<ResolvedNetdev, NetdevError> {
+    let candidates = usable_candidates(candidates_for_baseband(baseband), reserved);
     if candidates.is_empty() {
         return Err(NetdevError::NoCandidates(baseband.to_string()));
     }
@@ -235,7 +307,7 @@ pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNe
     if let [only] = candidates.as_slice() {
         configure(only, config)
             .await
-            .map_err(|error| NetdevError::ConfigureFailed(format!("{only}: {error}")))?;
+            .map_err(|error| classify(&[(only.clone(), error)]))?;
         info!(interface = %only, "Data netdev resolved: sole candidate for this baseband");
         return Ok(ResolvedNetdev {
             interface: only.clone(),
@@ -244,17 +316,17 @@ pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNe
         });
     }
 
-    let mut configure_errors = Vec::new();
+    let mut configure_errors: Vec<(String, ConfigureError)> = Vec::new();
     for candidate in &candidates {
         if let Err(error) = configure(candidate, config).await {
             debug!(interface = %candidate, error = %error, "Candidate could not be configured");
-            configure_errors.push(format!("{candidate}: {error}"));
+            configure_errors.push((candidate.clone(), error));
             continue;
         }
         sleep(LINK_SETTLE).await;
 
         let before = read_counters(candidate);
-        let socket_replied = send_probe(config).await;
+        let socket_replied = send_probe(config, candidate).await;
         let after = read_counters(candidate);
 
         if probe_observed(socket_replied, before, after) {
@@ -277,7 +349,7 @@ pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNe
     }
 
     if configure_errors.len() == candidates.len() {
-        return Err(NetdevError::ConfigureFailed(configure_errors.join("; ")));
+        return Err(classify(&configure_errors));
     }
 
     // Nothing answered. This is expected when the session's network offers no
@@ -288,14 +360,12 @@ pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNe
         .find(|candidate| {
             !configure_errors
                 .iter()
-                .any(|error| error.starts_with(&format!("{candidate}: ")))
+                .any(|(failed, _)| failed == *candidate)
         })
         .cloned()
         .unwrap_or_else(|| candidates[0].clone());
-    if configure(&assumed, config).await.is_err() {
-        return Err(NetdevError::ConfigureFailed(format!(
-            "no candidate answered and {assumed} could not be reconfigured"
-        )));
+    if let Err(error) = configure(&assumed, config).await {
+        return Err(classify(&[(assumed, error)]));
     }
     warn!(
         interface = %assumed,
@@ -310,8 +380,52 @@ pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNe
 }
 
 /// Bring an interface up with the session's address, MTU and probe route.
-async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String> {
-    run_ip(&["link", "set", "dev", interface, "up"]).await?;
+///
+/// On failure nothing is left behind: an address that outlives its candidate
+/// accumulates on every retry and, being on the wrong MUX channel, does not even
+/// carry traffic.
+async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), ConfigureError> {
+    // A link that will not come up cannot be configured, probed, or used. Report
+    // it instead of continuing: every later step fails too, and the route error
+    // that surfaces ("Device for nexthop is not up") describes the symptom rather
+    // than the cause.
+    if let Err(error) = run_ip(&["link", "set", "dev", interface, "up"]).await {
+        return Err(ConfigureError::LinkUp(error));
+    }
+    // `ip` reports success once the request is accepted. Confirm the kernel
+    // actually set IFF_UP — checking the administrative flag, not `operstate`,
+    // because a bam-dmux netdev has no carrier and stays `unknown` forever.
+    if !link_is_up(interface) {
+        return Err(ConfigureError::LinkUp(
+            "administrative UP was accepted but IFF_UP is not set".to_string(),
+        ));
+    }
+    if let Err(error) = configure_addressing(interface, config).await {
+        // Undo the partial state; `address replace` may already have landed.
+        deconfigure(interface, config).await;
+        return Err(ConfigureError::Step(error));
+    }
+    Ok(())
+}
+
+/// Whether the kernel has IFF_UP set on this interface.
+fn link_is_up(interface: &str) -> bool {
+    let path = format!("/sys/class/net/{interface}/flags");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        // Unreadable sysfs is not evidence of a down link; leave the verdict to
+        // the steps that follow rather than rejecting a usable candidate.
+        return true;
+    };
+    let text = raw.trim();
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    match u32::from_str_radix(digits, 16) {
+        Ok(flags) => flags & libc::IFF_UP as u32 != 0,
+        Err(_) => true,
+    }
+}
+
+/// Apply the address, MTU, policy rule and routes for a session.
+async fn configure_addressing(interface: &str, config: &NetdevConfig) -> Result<(), String> {
     if let Some(mtu) = config.mtu {
         // A rejected MTU is not fatal; the link still carries traffic at its
         // default, and failing here would discard an otherwise working candidate.
@@ -333,17 +447,33 @@ async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String>
     // Keep bearer traffic out of the host's main routing table. A source rule
     // gives probes (and, for a data bearer, the proxy) a private table without
     // replacing Wi-Fi/Ethernet defaults or another PDP context's DNS routes.
-    let table = routing_table(interface, config.address).to_string();
+    let table = route_table(RouteDomain::ModemData, interface, config.address).to_string();
+    let priority = rule_priority(RouteDomain::ModemData, interface, config.address).to_string();
     let source = source_selector(config.address);
     let mut delete_rule = family_arg.to_vec();
-    delete_rule.extend_from_slice(&["rule", "del", "from", &source, "table", &table]);
+    delete_rule.extend_from_slice(&["rule", "del", "priority", &priority]);
     let _ = run_ip(&delete_rule).await;
     let mut add_rule = family_arg.to_vec();
-    add_rule.extend_from_slice(&["rule", "add", "from", &source, "table", &table]);
+    add_rule.extend_from_slice(&[
+        "rule", "add", "priority", &priority, "from", &source, "table", &table,
+    ]);
     run_ip(&add_rule).await?;
 
+    // Keep the connected network in the private table. The interface address
+    // itself is a host address and cannot be used as an IPv4 /30 route target.
+    let connected = format!(
+        "{}/{}",
+        network_address(config.address, config.prefix),
+        config.prefix
+    );
+    let mut connected_route = family_arg.to_vec();
+    connected_route.extend_from_slice(&[
+        "route", "replace", &connected, "dev", interface, "table", &table,
+    ]);
+    run_ip(&connected_route).await?;
+
     if let Some(target) = config.probe_target {
-        let destination = format!("{}/{}", target, if target.is_ipv6() { 128 } else { 32 });
+        let destination = host_selector(target);
         let mut args = family_arg.to_vec();
         args.extend_from_slice(&[
             "route",
@@ -362,6 +492,84 @@ async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String>
     Ok(())
 }
 
+/// Restore a session interface in the host namespace after an attempted UE
+/// namespace migration. This is the public counterpart of the resolver's
+/// private candidate setup and includes the proxy default route.
+pub async fn configure_host_data_path(
+    interface: &str,
+    config: &NetdevConfig,
+) -> Result<(), String> {
+    configure(interface, config)
+        .await
+        .map_err(|error| error.to_string())?;
+    install_default_route(interface, config).await
+}
+
+/// Turn per-candidate failures into the error the caller acts on.
+///
+/// A refused UP on *every* candidate is the baseband, not the interfaces: they
+/// all hang off one `bam-dmux` parent, and a latched runtime-PM error there makes
+/// the kernel answer `EINVAL` to an administrative UP on all of them. Reporting
+/// that as `ConfigureFailed` sends the caller looking for an address or route
+/// problem that does not exist, so it gets its own variant.
+fn classify(failures: &[(String, ConfigureError)]) -> NetdevError {
+    let detail = failures
+        .iter()
+        .map(|(interface, error)| format!("{interface}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failures
+        .iter()
+        .all(|(_, error)| matches!(error, ConfigureError::LinkUp(_)))
+    {
+        // Name the parent's runtime-PM state in the message. `runtime_status=error`
+        // is the difference between "restart the baseband" and "look for a bug
+        // here", and it is not otherwise visible: this kernel is built without
+        // CONFIG_PM_DEBUG, so the PM core logs nothing when it latches.
+        let pm = failures
+            .first()
+            .map(|(interface, _)| interface.as_str())
+            .and_then(parent_pm_status)
+            .map(|status| format!(" [bam-dmux runtime_status={status}]"))
+            .unwrap_or_default();
+        return NetdevError::LinkUnavailable(format!("{detail}{pm}"));
+    }
+    NetdevError::ConfigureFailed(detail)
+}
+
+/// The latched runtime-PM status of a baseband's netdevs, if it has one.
+///
+/// Every candidate hangs off the same `bam-dmux` parent, so a single read answers
+/// for all of them and no session or address is needed to ask. Callers check this
+/// *before* allocating a WDS client: once the parent has latched, the kernel
+/// answers `EINVAL` to an administrative UP on every candidate, so the session
+/// cannot succeed — but by the time resolution discovers that, the client and its
+/// packet data handle already exist, and tearing down a session whose netdev was
+/// never resolved leaks the CID. Asking first is what keeps a latched baseband
+/// from accumulating one leaked `wds` client per retry, and stops the retry loop
+/// from re-arming a baseband that is already recovering from a crash.
+///
+/// Only `error` is reported. `suspended` is this driver's normal idle state and
+/// resumes on demand.
+pub fn baseband_runtime_is_latched(baseband: &str) -> Option<String> {
+    candidates_for_baseband(baseband)
+        .iter()
+        .find_map(|interface| parent_pm_status(interface))
+        .filter(|status| status.eq_ignore_ascii_case("error"))
+}
+
+/// Runtime-PM status of the parent device every candidate netdev shares.
+///
+/// Read through the netdev's own `device` link rather than a fixed SoC path, so
+/// this holds on any host whose netdevs hang off one parent.
+fn parent_pm_status(interface: &str) -> Option<String> {
+    let path = format!("/sys/class/net/{interface}/device/power/runtime_status");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Remove what `configure` added, so a rejected candidate holds no state.
 async fn deconfigure(interface: &str, config: &NetdevConfig) {
     let family_arg: &[&str] = if config.address.is_ipv6() {
@@ -369,13 +577,13 @@ async fn deconfigure(interface: &str, config: &NetdevConfig) {
     } else {
         &[]
     };
-    let table = routing_table(interface, config.address).to_string();
-    let source = source_selector(config.address);
+    let table = route_table(RouteDomain::ModemData, interface, config.address).to_string();
+    let priority = rule_priority(RouteDomain::ModemData, interface, config.address).to_string();
     let mut args = family_arg.to_vec();
     args.extend_from_slice(&["route", "flush", "table", &table]);
     let _ = run_ip(&args).await;
     let mut args = family_arg.to_vec();
-    args.extend_from_slice(&["rule", "del", "from", &source, "table", &table]);
+    args.extend_from_slice(&["rule", "del", "priority", &priority]);
     let _ = run_ip(&args).await;
     let address = format!("{}/{}", config.address, config.prefix);
     let mut args = family_arg.to_vec();
@@ -392,7 +600,7 @@ pub async fn install_default_route(interface: &str, config: &NetdevConfig) -> Re
     } else {
         &[]
     };
-    let table = routing_table(interface, config.address).to_string();
+    let table = route_table(RouteDomain::ModemData, interface, config.address).to_string();
     let mut args = family_arg.to_vec();
     args.extend_from_slice(&[
         "route", "replace", "default", "dev", interface, "table", &table,
@@ -407,15 +615,6 @@ pub async fn teardown(interface: &str, config: &NetdevConfig) {
     deconfigure(interface, config).await;
 }
 
-fn source_selector(address: IpAddr) -> String {
-    format!("{}/{}", address, if address.is_ipv6() { 128 } else { 32 })
-}
-
-fn routing_table(interface: &str, address: IpAddr) -> u32 {
-    let suffix = trailing_number(interface).min(999);
-    12_000 + suffix * 2 + u32::from(address.is_ipv6())
-}
-
 /// Send one packet the network should answer, from the session address.
 ///
 /// A DNS query is used because it is a plain UDP datagram that needs no
@@ -423,12 +622,12 @@ fn routing_table(interface: &str, address: IpAddr) -> u32 {
 /// is irrelevant — only that *some* bytes come back on the source-bound socket
 /// (or, as a fallback, move the interface RX counter). Failures are ignored: an
 /// unreachable target simply means this candidate does not answer.
-async fn send_probe(config: &NetdevConfig) -> bool {
+async fn send_probe(config: &NetdevConfig, interface: &str) -> bool {
     let Some(target) = config.probe_target else {
         return false;
     };
     let bind = SocketAddr::new(config.address, 0);
-    let Ok(socket) = UdpSocket::bind(bind).await else {
+    let Ok(socket) = bind_probe_socket(bind, interface) else {
         debug!(?bind, "Probe socket could not bind to the session address");
         return false;
     };
@@ -459,6 +658,42 @@ async fn send_probe(config: &NetdevConfig) -> bool {
         timeout(PROBE_REPLY_WAIT, socket.recv_from(&mut response)).await,
         Ok(Ok((length, _))) if length > 0
     )
+}
+
+fn bind_probe_socket(local: SocketAddr, interface: &str) -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    bind_probe_socket_to_device(&socket, interface)?;
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket.into())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_probe_socket_to_device(socket: &Socket, interface: &str) -> io::Result<()> {
+    use std::{ffi::CString, os::fd::AsRawFd};
+
+    let name = CString::new(interface)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface contains NUL"))?;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr().cast(),
+            name.as_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_probe_socket_to_device(_socket: &Socket, _interface: &str) -> io::Result<()> {
+    Ok(())
 }
 
 fn probe_observed(socket_replied: bool, before: LinkCounters, after: LinkCounters) -> bool {
@@ -587,9 +822,9 @@ mod tests {
     fn data_policy_tables_are_stable_and_family_separated() {
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         let v6 = IpAddr::V6("2001:db8::2".parse().unwrap());
-        assert_eq!(routing_table("wwan0", v4), 12_000);
-        assert_eq!(routing_table("wwan0", v6), 12_001);
-        assert_eq!(routing_table("wwan7", v4), 12_014);
+        assert_eq!(route_table(RouteDomain::ModemData, "wwan0", v4), 12_000);
+        assert_eq!(route_table(RouteDomain::ModemData, "wwan0", v6), 12_001);
+        assert_eq!(route_table(RouteDomain::ModemData, "wwan7", v4), 12_014);
         assert_eq!(source_selector(v4), "10.0.0.2/32");
         assert_eq!(source_selector(v6), "2001:db8::2/128");
     }
@@ -607,6 +842,45 @@ mod tests {
     }
 
     #[test]
+    fn reserved_netdevs_are_removed_from_resolution() {
+        let all = vec![
+            "wwan0".to_string(),
+            "wwan2".to_string(),
+            "wwan3".to_string(),
+        ];
+        assert_eq!(
+            usable_candidates(all.clone(), &["wwan0"]),
+            vec!["wwan2", "wwan3"]
+        );
+        // Nothing reserved leaves the list untouched: the IMS caller owns the
+        // primary netdev and must still be able to resolve onto it.
+        assert_eq!(usable_candidates(all.clone(), &[]), all);
+    }
+
+    #[test]
+    fn a_reserved_netdev_can_never_become_the_assumed_fallback() {
+        // The actual failure this guards. No candidate answered the probe, so
+        // resolution falls back to the lowest-numbered one -- wwan0, the netdev
+        // ModemManager holds for IMS. DATA6 taking it stops the IMS PDN from
+        // establishing, and the VoLTE REGISTER then leaves over Wi-Fi toward a
+        // carrier-private P-CSCF that cannot answer. Filtering the input means
+        // the fallback has no way to select it.
+        let candidates = usable_candidates(
+            vec!["wwan0".to_string(), "wwan2".to_string()],
+            &["wwan0"],
+        );
+        let assumed = candidates.first().cloned();
+        assert_eq!(assumed.as_deref(), Some("wwan2"));
+    }
+
+    #[test]
+    fn reserving_every_candidate_reports_no_candidates_rather_than_guessing() {
+        // Better a named failure than a session on somebody else's link: a wrong
+        // interface produces no error at any layer, just a peer that never replies.
+        assert!(usable_candidates(vec!["wwan0".to_string()], &["wwan0"]).is_empty());
+    }
+
+    #[test]
     fn error_codes_are_stable_and_prefixed() {
         assert_eq!(
             NetdevError::NoCandidates("4080000.remoteproc".into()).to_string(),
@@ -616,6 +890,63 @@ mod tests {
             NetdevError::ConfigureFailed("wwan0: EINVAL".into()).to_string(),
             "qmi_netdev_configure_failed:wwan0: EINVAL"
         );
+        assert_eq!(
+            NetdevError::LinkUnavailable("wwan0: link will not come up: EINVAL".into()).to_string(),
+            "qmi_netdev_link_unavailable:wwan0: link will not come up: EINVAL"
+        );
+    }
+
+    #[test]
+    fn every_candidate_refusing_up_is_reported_as_a_baseband_fault() {
+        // All candidates share one bam-dmux parent. Once that parent latches a
+        // runtime-PM error the kernel answers EINVAL to an administrative UP on
+        // every netdev under it at once, so a clean sweep of refused UPs says the
+        // baseband is unusable — not that seven interfaces are individually broken.
+        let refused: Vec<(String, ConfigureError)> = (0..3)
+            .map(|index| {
+                (
+                    format!("wwan{index}"),
+                    ConfigureError::LinkUp("RTNETLINK answers: Invalid argument".to_string()),
+                )
+            })
+            .collect();
+        let error = classify(&refused);
+        assert!(
+            matches!(error, NetdevError::LinkUnavailable(_)),
+            "all-refused must classify as LinkUnavailable, got {error:?}"
+        );
+        // The detail names every interface and preserves the kernel's own wording,
+        // because "Device for nexthop is not up" is what used to surface instead.
+        let detail = error.to_string();
+        for index in 0..3 {
+            assert!(detail.contains(&format!("wwan{index}")), "missing wwan{index} in {detail}");
+        }
+        assert!(detail.contains("RTNETLINK answers: Invalid argument"));
+    }
+
+    #[test]
+    fn one_configurable_link_keeps_the_failure_per_interface() {
+        // A mix means the parent is fine: at least one link came up and failed
+        // later, so the fault is a property of interfaces, not of the baseband.
+        let failures = vec![
+            (
+                "wwan0".to_string(),
+                ConfigureError::LinkUp("RTNETLINK answers: Invalid argument".to_string()),
+            ),
+            (
+                "wwan1".to_string(),
+                ConfigureError::Step("wwan1: Device for nexthop is not up".to_string()),
+            ),
+        ];
+        assert!(matches!(
+            classify(&failures),
+            NetdevError::ConfigureFailed(_)
+        ));
+        // A single non-link failure is likewise not a baseband verdict.
+        assert!(matches!(
+            classify(&failures[1..]),
+            NetdevError::ConfigureFailed(_)
+        ));
     }
 
     #[test]
