@@ -18,13 +18,9 @@ use crate::{
         qmi_wds,
     },
     platform::{config::ApnConfig, netns},
-<<<<<<< Updated upstream
     services::ue_worker::{
         worker_for_line_feature, NetConfigOp, UeWorkerBinding, UeWorkerFeatures, UeWorkerHandle,
     },
-=======
-    services::ue_worker::{worker_for_line_feature, NetConfigOp, UeWorkerFeatures, UeWorkerHandle},
->>>>>>> Stashed changes
 };
 
 use super::secondary_qmi::{self, SecondaryQmiEndpoint};
@@ -38,11 +34,7 @@ struct SecondaryDataSession {
     endpoint: SecondaryQmiEndpoint,
     netdev: ResolvedNetdev,
     netdev_config: NetdevConfig,
-<<<<<<< Updated upstream
     worker: Option<UeWorkerBinding>,
-=======
-    worker: Option<UeWorkerHandle>,
->>>>>>> Stashed changes
 }
 
 #[derive(Default)]
@@ -162,11 +154,7 @@ impl SecondaryDataRuntime {
         let mut errors = Vec::new();
 
         for family in families {
-<<<<<<< Updated upstream
             match start_family(&endpoint, &baseband, apn, &apn_name, family).await {
-=======
-            match start_family(&endpoint, apn, &apn_name, family).await {
->>>>>>> Stashed changes
                 Ok(mut session) => {
                     if let Some(worker) = data_worker_for_line(line_id).await {
                         if let Err(error) =
@@ -282,7 +270,6 @@ async fn data_worker_for_line(line_id: &str) -> Option<UeWorkerHandle> {
     worker.status().await.ready.then_some(worker)
 }
 
-<<<<<<< Updated upstream
 /// Verify that a retained DATA bearer still belongs to the currently
 /// registered worker generation. A QMI CID can remain connected after a
 /// worker exits or its namespace is recreated, so checking only modem status
@@ -315,14 +302,11 @@ async fn retained_session_worker_is_usable(line_id: &str, session: &SecondaryDat
     }
 }
 
-=======
->>>>>>> Stashed changes
 async fn move_data_session_into_worker(
     session: &mut SecondaryDataSession,
     worker: UeWorkerHandle,
 ) -> Result<(), String> {
     let interface = session.netdev.interface.as_str();
-<<<<<<< Updated upstream
     // Belt to the resolver's braces. Resolution can no longer hand back a
     // reserved interface, so reaching this is a bug rather than a race -- but a
     // DATA6 session on the IMS netdev is silent breakage several layers up, so
@@ -337,11 +321,6 @@ async fn move_data_session_into_worker(
     // that respawns during migration must invalidate this session rather than
     // inherit an interface it never configured.
     let binding = worker.bind();
-=======
-    if interface == "wwan0" {
-        return Err("cellular_data_refuses_primary_interface_wwan0".to_string());
-    }
->>>>>>> Stashed changes
     // Remove host policy state before the interface crosses namespaces. The
     // retained WDS session remains alive and owns the raw-IP data channel.
     qmi_netdev::teardown(interface, &session.netdev_config).await;
@@ -397,11 +376,7 @@ async fn move_data_session_into_worker(
         let _ = qmi_netdev::configure_host_data_path(interface, config).await;
         return Err("cellular_data_worker_interface_missing".to_string());
     }
-<<<<<<< Updated upstream
     session.worker = Some(binding);
-=======
-    session.worker = Some(worker);
->>>>>>> Stashed changes
     Ok(())
 }
 
@@ -650,7 +625,6 @@ async fn stop_session(mut session: SecondaryDataSession) {
         client_id: std::mem::take(&mut session.client_id),
         packet_data_handle: std::mem::take(&mut session.packet_data_handle),
     };
-<<<<<<< Updated upstream
     if let Some(binding) = session.worker.take() {
         // Only the generation that configured the interface can clean it up.
         // A replacement worker owns a different namespace instance, so its
@@ -680,26 +654,6 @@ async fn stop_session(mut session: SecondaryDataSession) {
         // worker namespace disappeared. Always remove this session's host
         // address/policy state before releasing its QMI CID.
         qmi_netdev::teardown(&session.netdev.interface, &session.netdev_config).await;
-=======
-    if let Some(worker) = session.worker.take() {
-        let _ = worker
-            .apply_net_config(vec![
-                NetConfigOp::FlushRoutesForDevice {
-                    ifname: session.netdev.interface.clone(),
-                    ipv6: session.netdev_config.address.is_ipv6(),
-                },
-                NetConfigOp::AddrDel {
-                    ifname: session.netdev.interface.clone(),
-                    cidr: format!(
-                        "{}/{}",
-                        session.netdev_config.address, session.netdev_config.prefix
-                    ),
-                },
-            ])
-            .await;
-        let _ = netns::move_iface_out(worker.namespace(), &session.netdev.interface).await;
-        let _ = worker.refresh_net_status().await;
->>>>>>> Stashed changes
     } else {
         qmi_netdev::teardown(&session.netdev.interface, &session.netdev_config).await;
     }

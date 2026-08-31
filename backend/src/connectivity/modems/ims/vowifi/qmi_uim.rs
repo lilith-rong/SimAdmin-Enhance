@@ -89,7 +89,6 @@ pub struct UsimIdentity {
     pub mnc_length: Option<u8>,
 }
 
-<<<<<<< Updated upstream
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsimEpdgAddress {
     Fqdn(String),
@@ -177,8 +176,6 @@ pub struct UsimEpdgConfig {
     pub selection: Vec<UsimEpdgSelectionEntry>,
 }
 
-=======
->>>>>>> Stashed changes
 #[derive(Debug)]
 pub enum QmiUimError {
     Io(io::Error),
@@ -190,10 +187,7 @@ pub enum QmiUimError {
     InvalidApduResponse,
     InvalidAkaResponse,
     InvalidIdentityResponse,
-<<<<<<< Updated upstream
     InvalidEpdgConfig,
-=======
->>>>>>> Stashed changes
 }
 
 impl fmt::Display for QmiUimError {
@@ -208,10 +202,7 @@ impl fmt::Display for QmiUimError {
             Self::InvalidApduResponse => write!(f, "invalid UIM APDU response"),
             Self::InvalidAkaResponse => write!(f, "invalid USIM AKA response"),
             Self::InvalidIdentityResponse => write!(f, "invalid USIM identity response"),
-<<<<<<< Updated upstream
             Self::InvalidEpdgConfig => write!(f, "invalid USIM ePDG configuration"),
-=======
->>>>>>> Stashed changes
         }
     }
 }
@@ -469,7 +460,6 @@ pub fn parse_ef_ad_mnc_length(data: &[u8]) -> Option<u8> {
         .filter(|length| matches!(*length, 2 | 3))
 }
 
-<<<<<<< Updated upstream
 /// Validate and canonicalize an ASCII ePDG FQDN read from a UICC or line
 /// setting. URI syntax, ports, control characters and IDNA are intentionally
 /// rejected: the DNS codec currently accepts DNS labels, not arbitrary URLs.
@@ -873,8 +863,6 @@ pub(crate) fn parse_fcp_file_size(data: &[u8]) -> Option<usize> {
     None
 }
 
-=======
->>>>>>> Stashed changes
 pub fn read_usim_identity_via_proxy_reason(
     proxy_socket: &str,
     device_path: &str,
@@ -1537,7 +1525,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< Updated upstream
     fn parses_uicc_epdg_identifiers_and_normalizes_fqdns() {
         let fqdn = b"EPDG.Example.ORG.";
         let mut data = vec![0x80, (fqdn.len() + 1) as u8, 0x00];
@@ -1649,8 +1636,6 @@ mod tests {
         );
     }
     #[test]
-=======
->>>>>>> Stashed changes
     fn encodes_ctl_proxy_and_allocate_cid_frames() {
         let proxy = build_proxy_open_frame("/dev/wwan0qmi0", 1).expect("proxy frame");
         assert_eq!(&proxy[..4], &[1, 28, 0, 0]);

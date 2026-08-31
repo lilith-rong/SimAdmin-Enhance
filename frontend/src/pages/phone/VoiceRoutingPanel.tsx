@@ -166,20 +166,11 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
         <Typography variant="h6">IMS 视频能力</Typography>
         <Alert severity="info" sx={{ my: 2 }}>视频中继自动跟随当前线路的 VoLTE 语音和 VoWiFi 连接，不需要单独开关。这里仅配置 H.264 中继参数，不会启动摄像头或主动发起视频呼叫。</Alert>
         {vilte && <Stack spacing={2}>
-<<<<<<< Updated upstream
           <Typography variant="body2" color="text.secondary">
             VoLTE 语音：{volteVoice?.ims_connection_enabled ? '随 IMS 连接自动可用' : '请先启用当前线路的 VoLTE IMS 连接'}
           </Typography>
           <Typography variant="body2" color="text.secondary">
             VoLTE 视频：{vilte.config.volte_enabled ? '已随连接启用' : '等待 VoLTE 连接启用'}；VoWiFi 视频：{vilte.config.vowifi_enabled ? '已随连接启用' : '等待 VoWiFi 连接启用'}
-=======
-          <FormControlLabel
-            control={<Switch checked={volteVoice?.voice_enabled ?? false} disabled={!volteVoice?.ims_connection_enabled || saving} onChange={(_, enabled) => void toggleVolteVoice(enabled)} />}
-            label={volteVoice?.ims_connection_enabled ? '当前线路 VoLTE 语音网关能力' : '请先启用当前线路的 VoLTE IMS 连接'}
-          />
-          <Typography variant="body2" color="text.secondary">
-            VoLTE 视频：{vilte.config.volte_enabled ? '已随语音启用' : '等待 VoLTE 连接与语音启用'}；VoWiFi 视频：{vilte.config.vowifi_enabled ? '已随连接启用' : '等待 VoWiFi 连接启用'}
->>>>>>> Stashed changes
           </Typography>
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={2}>
             <FormControl fullWidth>

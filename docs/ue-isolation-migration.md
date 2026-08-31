@@ -1,6 +1,5 @@
 # 多 UE 隔离架构迁移文档（Option B：per-UE worker + setns）
 
-<<<<<<< Updated upstream
 > 状态：**阶段一至四已完成代码实现，并已在 410 实机全量验证 —— 隔离四门中
 > `enabled` / `vowifi_tun_in_namespace` / `three_gpp_ims_sockets_in_worker` /
 > `data_proxy_in_worker` 全部打开时，VoWiFi、VoLTE 与蜂窝数据三条业务同时在线
@@ -13,12 +12,6 @@
 > §8.5–8.9，约 420 行）。那些是过程记录，git 历史里能查到，留在文档里只会让人
 > 分不清"设计如此"和"某一轮临时结论"。§8.7 那 170 行 `smd_dsm_memcpy.c:297`
 > 根因分析也删了——那是 `QCM410_BAM_DMUX_MODEM_CRASH.md` 的主题，那份讲得更完整。
-=======
-> 状态：**阶段一至四已完成代码实现，待 410 分阶段实机回归；阶段五已完成不改变现有硬件行为的通用模型底座**。
-> 本文档是 `multi_ue_ims_volte_vowifi_architecture.md` 的落地实现记录，记录了已完成的
-> 实机验证、当前代码状态、控制协议，以及 VoWiFi → VoLTE → 数据代理/Trunk → 5G
-> 的逐步迁移计划与验收标准。
->>>>>>> Stashed changes
 
 ---
 
@@ -157,30 +150,11 @@ IMS 状态机保持在主进程，通过 fd 引用 UE netns 内创建的 socket�
 | `hardware/cellular/data_proxy.rs` | HTTP/SOCKS5 监听仍在宿主，出站 TCP socket 由对应线路 worker 创建并绑定该线路接口 |
 | `platform/config.rs` | `ue_isolation` 配置块（见 §6） |
 
-<<<<<<< Updated upstream
 ### 4.1.1 本阶段的实现细节
 
 worker 生命周期、线路刷新发布一致性、worker 代次（generation）绑定和 socket 的
 close-on-exec 都已落地，单元测试在 `services/ue_worker.rs` 内。具体的修复过程和
 当时的取舍记录在 git 历史里，不在这里复述——需要时按上表的文件名查 blame。
-=======
-### 4.1.1 worker 生命周期修复（本轮）
-
-实机日志暴露出一个会影响所有隔离功能的边界问题：父进程 reader 在控制通道
-连续空闲 60 秒时，把 `poll(2)` 超时误当作通道关闭，worker 随后退出；旧 PID
-还留在状态快照中，线路刷新也不会重新拉起 worker。结果是后续 IKE/SIP/RTP
-请求统一报 `worker control channel is not up`。
-
-现已修复：
-
-- 空闲超时发送 `Ping`，只有真正 EOF 或 I/O 错误才关闭控制通道；
-- 控制通道关闭时立即失败所有未完成的 net-config/socket 请求；
-- 回收旧 child、清除 PID，下一次线路 reconcile 可自动重启 worker；
-- 增加 Unix 控制帧的“空闲超时”和“真实 EOF”回归测试。
-
-这项修复必须先在 410 上验证 worker 能持续运行超过 60 秒，再判断 IMS
-注册、媒体或数据代理本身是否有问题。
->>>>>>> Stashed changes
 
 ### 4.2 worker 控制协议（当前）
 
@@ -301,7 +275,6 @@ ue_isolation:
   trunk_sockets_in_worker: false # stage-4：operator RTP socket；Asterisk/internal leg 留宿主
 ```
 
-<<<<<<< Updated upstream
 `trunk_sockets_in_worker` **依赖 `three_gpp_ims_sockets_in_worker`**：trunk 媒体只能
 跟随一个已经进入 UE netns 的 bearer。只开 trunk gate 会宣告一个看不到 bearer 接口的
 worker，RTP socket 要么绑定失败、要么沿一条含糊的宿主路由发出去——一种“看似已启用、
@@ -311,8 +284,6 @@ worker，RTP socket 要么绑定失败、要么沿一条含糊的宿主路由发
 注意 `volte/live.rs` 中 `three_gpp_ims || trunk_sockets` 是有意的：bearer 一旦进入
 worker，媒体 socket 必须跟随，即使 trunk gate 没开。
 
-=======
->>>>>>> Stashed changes
 只有 `enabled && vowifi_tun_in_namespace` 同时为 true 时，线路注册表才会：
 
 1. 创建 netns 并拉起 worker；
@@ -326,7 +297,6 @@ worker，媒体 socket 必须跟随，即使 trunk gate 没开。
 
 任何一步失败都只告警并**回退到旧的宿主路径**（`None` 分支），不中断现有功能。
 
-<<<<<<< Updated upstream
 回退不再是“只发布 `None`”：egress 准备过程可能已经建好 worker、veth、NAT 规则和
 namespace，只把 socket context 置空会把这些资源留成孤儿，并让一个仍在运行的 worker
 继续持有 DATA 接口。现在失败路径执行**完整 teardown**，顺序固定为：
@@ -341,8 +311,6 @@ namespace，只把 socket context 置空会把这些资源留成孤儿，并让�
 反过来先杀 worker 会让 DATA 的 netns 内清理指令发不出去。下一次线路刷新会重新
 `ensure_netns` + `spawn`，因此该路径是自愈的。
 
-=======
->>>>>>> Stashed changes
 四个功能门默认均为 `false`。虽然阶段三/四代码已经完成，410 回归仍必须按
 VoWiFi → VoLTE → 数据代理/Trunk 的顺序逐个启用；不能一次打开全部功能后把故障归因给
 任意一层。
@@ -362,16 +330,11 @@ VoWiFi → VoLTE → 数据代理/Trunk 的顺序逐个启用；不能一次打�
 
 已实现：
 
-<<<<<<< Updated upstream
 - 仅把 SimAdmin 本次 native QMI IMS session 自己创建的 secondary 接口迁入 worker；
   明确拒绝迁移 ModemManager 主接口；
 - 迁移判定已改为读取 bearer provider 的 `interface_ownership`：QCM410 DATA6
   标记为 `sim_admin_owned_secondary`，`host_managed_primary` 和 `unknown` 均拒绝迁移，
   不再把接口名称当作所有权依据；
-=======
-- 仅把 SimAdmin 本次 native QMI IMS session 自己创建的非 `wwan0` 接口迁入 worker；
-  明确拒绝迁移 ModemManager 主接口 `wwan0`；
->>>>>>> Stashed changes
 - worker 内配置 IMS 地址、MTU、P-CSCF/DNS/媒体路由；
 - P-CSCF DNS、`VolteSipChannel`、Security-Agree 端口、XFRM、音频/视频 RTP socket
   均可在对应线路 worker 内创建；
@@ -401,12 +364,9 @@ UE netns → per-UE proxy（监听 UE 侧地址）→ 宿主 → 对应 Modem/ww
 - `data_proxy` runtime 继续按线路持有；HTTP/SOCKS5 listener 留在宿主以保持入口兼容，
   每条连接的 outbound TCP socket 由该线路 worker 创建并 `SO_BINDTODEVICE`；
 - qcm410 secondary DATA/DATA6 bearer 可迁入该线路 worker；停止时只清理该接口并移回宿主；
-<<<<<<< Updated upstream
 - retained DATA session 复用前会同时验证 QMI CID、当前 worker generation 和 worker 内接口快照；
   worker 崩溃/namespace 重建后不会继续复用悬空接口，而是先释放旧 session 再重新建立；
 - 线路移除、禁用隔离或 worker reconcile 失败时，会先停止 secondary DATA，再拆除 worker/veth/namespace；
-=======
->>>>>>> Stashed changes
 - Trunk/operator RTP socket 可由线路 worker 创建；Asterisk/internal leg 留在宿主，
   dialog、自动化和通知继续按 `line_id` 归属；
 - 接口与 worker 的选择来自线路注册表，不再以运营商分配的 IP 推断 UE，因此不同 UE
@@ -458,7 +418,6 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 
 ### 8.1 worker 与 VoWiFi
 
-<<<<<<< Updated upstream
 - [x] 只开启 `enabled + vowifi_tun_in_namespace`，确认 netns、worker Hello、veth/NAT 成功；
 - [x] worker 空闲超过 60 秒仍保持 `ready=true`，Ping/Pong 可见，控制通道不被误关闭；
       （2026-08-22 / 9ae297a：静置 150 秒跨两个 60s 读超时，worker pid 不变，控制通道错误 0 条）
@@ -475,14 +434,6 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
       `Voice over IMS signaling readiness validated preferred_codec="amr-wb"`；
       受保护的 ipsec-3gpp 两条流（5063↔7807、5064↔7777）均在 UE netns 内 ESTAB。
 - [ ] VoWiFi 短信、来电/接听、双向 RTP、DTMF、挂断同步正常；（signaling 已就绪，待拨打测试）
-=======
-- [ ] 只开启 `enabled + vowifi_tun_in_namespace`，确认 netns、worker Hello、veth/NAT 成功；
-- [ ] worker 空闲超过 60 秒仍保持 `ready=true`，Ping/Pong 可见，控制通道不被误关闭；
-- [ ] worker 进程异常退出后，状态清除旧 PID，下一次 reconcile 自动重启且无 zombie；
-- [ ] worker 内可见 `lo`、`save<hex>`、`sa_vwf<hex>`；IKE、TUN、XFRM、SIP、RTP
-  均属于当前线路 namespace；
-- [ ] VoWiFi REGISTER、短信、来电/接听、双向 RTP、DTMF、挂断同步正常；
->>>>>>> Stashed changes
 - [ ] 飞行模式下仍可用 VoWiFi，退出后 TUN/XFRM/路由均无残留；
 - [ ] P-CSCF 或 worker socket 失败时错误可观测，worker 崩溃后线路能恢复。
 
@@ -499,7 +450,6 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 ### 8.3 数据代理与 Trunk
 
 - [ ] 开启 `data_proxy_in_worker`，DATA6/secondary bearer 迁入正确 worker；
-<<<<<<< Updated upstream
       **被硬件门阻塞**：DATA6 需 `SIMADMIN_ENABLE_SECONDARY_QMI=1`，而该开关被标注为
       「410 固件把 AT 端点强制以 QMI 打开时可能导致 modem 崩溃」，默认关闭。2026-08-22
       回归时明确选择不启用，因此本节数据代理各项均未实机验证。
@@ -511,25 +461,19 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
       （2026-08-22 / 9ae297a：注入非法 `veth_mtu=999999` 使 `ensure_veth_pair_host_side`
       失败后，netns/veth/NAT/worker 计数全部归 0，zombie 0，服务未崩溃；改回 1500 后
       自动重建且各资源仍各 1 份）
-=======
->>>>>>> Stashed changes
 - [ ] HTTP CONNECT、普通 HTTP、SOCKS5 的 DNS/IP 目标都从对应线路出站；
 - [ ] 停止代理/数据连接后接口回宿主，worker 内只清理该接口路由；
 - [ ] 开启 `trunk_sockets_in_worker`，operator RTP 属于当前线路 worker，Asterisk leg
   仍在宿主且双向媒体正常；
-<<<<<<< Updated upstream
 - [x] 只开 `trunk_sockets_in_worker` 而不开 `three_gpp_ims_sockets_in_worker` 时，
   日志出现一次抑制告警，operator RTP 仍留在宿主（不得出现半迁移）；
       （2026-08-22 / 9ae297a：窗口内发生 4 次 reconcile（4 次 worker ready + 4 次 egress
       veth configured），抑制告警恰好 1 条，证明 `Once` 生效且不随刷新刷屏）
-=======
->>>>>>> Stashed changes
 - [ ] Trunk 注册、来电、挂断和转发规则仍只作用于当前线路。
 
 ### 8.4 多线路强隔离
 
 - [ ] 两个 UE 同时获得相同 UE IP、网关、P-CSCF、RTP 对端时仍能分别注册和传输；
-<<<<<<< Updated upstream
       （410 上目前只插了 1 张卡，`line_profiles` 只有一条线路，无法验证）
 - [ ] 每条线路的 SIP dialog、XFRM、RTP、数据代理计数与 Trunk 映射不串线；
 - [ ] 单个 worker 崩溃、线路断开或 bearer 重连不破坏另一条线路；
@@ -537,8 +481,3 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
       （2026-08-22 / 9ae297a：本轮回归共重启服务 6 次、重启 worker 5 次，
       `sa-ue286e0c9d2870` / `savh0c9d2870` / MASQUERADE 规则始终各 1 份，无累积）
 
-=======
-- [ ] 每条线路的 SIP dialog、XFRM、RTP、数据代理计数与 Trunk 映射不串线；
-- [ ] 单个 worker 崩溃、线路断开或 bearer 重连不破坏另一条线路；
-- [ ] 重启 SimAdmin 后稳定命名能够回收旧资源，不生成重复 namespace/veth/NAT 规则。
->>>>>>> Stashed changes

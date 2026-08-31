@@ -112,7 +112,6 @@ impl ImsIpSettings {
         }
     }
 
-<<<<<<< Updated upstream
     /// Select the modem-provided next hop for a destination family.
     ///
     /// QMI/WWAN links are point-to-point even though ModemManager reports a
@@ -126,8 +125,6 @@ impl ImsIpSettings {
         }
     }
 
-=======
->>>>>>> Stashed changes
     /// Available bearer addresses in the plan's family order.
     pub fn ordered_local_addrs(&self, plan: &ImsConnectionPlan) -> Vec<IpAddr> {
         let mut addresses = Vec::with_capacity(2);
@@ -1091,7 +1088,6 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-<<<<<<< Updated upstream
     fn gateway_for_family_matches_destination_and_omits_cross_family() {
         let settings = parse_ip_settings(SAMPLE);
         assert_eq!(
@@ -1105,8 +1101,6 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-=======
->>>>>>> Stashed changes
     fn resolve_pcscf_accepts_only_explicit_pco_address() {
         let mut s = parse_ip_settings(SAMPLE);
         assert_eq!(

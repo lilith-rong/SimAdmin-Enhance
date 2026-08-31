@@ -380,7 +380,6 @@ pub async fn resolve(
 }
 
 /// Bring an interface up with the session's address, MTU and probe route.
-<<<<<<< Updated upstream
 ///
 /// On failure nothing is left behind: an address that outlives its candidate
 /// accumulates on every retry and, being on the wrong MUX channel, does not even
@@ -434,16 +433,6 @@ fn link_is_up(interface: &str) -> bool {
 
 /// Apply the address, MTU, policy rule and routes for a session.
 async fn configure_addressing(interface: &str, config: &NetdevConfig) -> Result<(), String> {
-=======
-async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String> {
-    if let Err(error) = run_ip(&["link", "set", "dev", interface, "up"]).await {
-        debug!(
-            interface,
-            error = %error,
-            "Data bearer netdev did not accept an administrative UP request; continuing"
-        );
-    }
->>>>>>> Stashed changes
     if let Some(mtu) = config.mtu {
         // A rejected MTU is not fatal; the link still carries traffic at its
         // default, and failing here would discard an otherwise working candidate.
@@ -517,7 +506,6 @@ pub async fn configure_host_data_path(
     interface: &str,
     config: &NetdevConfig,
 ) -> Result<(), String> {
-<<<<<<< Updated upstream
     configure(interface, config)
         .await
         .map_err(|error| error.to_string())?;
@@ -589,12 +577,6 @@ fn parent_pm_status(interface: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-=======
-    configure(interface, config).await?;
-    install_default_route(interface, config).await
-}
-
->>>>>>> Stashed changes
 /// Remove what `configure` added, so a rejected candidate holds no state.
 async fn deconfigure(interface: &str, config: &NetdevConfig) {
     let family_arg: &[&str] = if config.address.is_ipv6() {

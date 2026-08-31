@@ -369,11 +369,7 @@ async fn run_router(
                     if response.is_closed() {
                         continue;
                     }
-<<<<<<< Updated upstream
                     let result = route_call_plan(plan, &trunk, &policy, &backends, &mut routes, trunk_vowifi_only.load(Ordering::SeqCst));
-=======
-                    let result = route_call_plan(plan, &trunk, &policy, &backends, &mut routes);
->>>>>>> Stashed changes
                     let _ = response.send(result);
                 }
                 Some(RouterRequest::CallAccess { call_id, response }) => {

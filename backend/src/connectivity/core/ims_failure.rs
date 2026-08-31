@@ -80,7 +80,6 @@ impl ImsFailureDiagnostic {
     }
 }
 
-<<<<<<< Updated upstream
 /// What the network said about our right to use MMTEL voice/video on this
 /// registration.
 ///
@@ -357,8 +356,6 @@ fn uri_is_telephone_identity(value: &str) -> bool {
             })
 }
 
-=======
->>>>>>> Stashed changes
 fn rule(code: &'static str, category: &'static str, retryable: bool) -> FailureRule {
     FailureRule {
         code,
@@ -633,7 +630,6 @@ mod tests {
         assert_eq!(diagnostic.q850_cause, Some(41));
         assert_eq!(diagnostic.code, "temporary_failure");
     }
-<<<<<<< Updated upstream
 
     #[test]
     fn register_success_with_telephone_identity_permits_voice() {
@@ -829,6 +825,4 @@ mod tests {
         assert_eq!(verdict.voice, ImsServiceState::Unknown);
         assert!(verdict.voice.permits_calls());
     }
-=======
->>>>>>> Stashed changes
 }

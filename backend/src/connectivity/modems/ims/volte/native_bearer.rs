@@ -86,7 +86,6 @@ pub struct NativeImsBearer {
 
 impl NativeImsBearer {
     /// Move the dedicated native netdev into this line's UE namespace. The
-<<<<<<< Updated upstream
     /// primary ModemManager interface is intentionally rejected; only a
     /// provider-declared SimAdmin-owned secondary bearer may cross the
     /// namespace boundary.
@@ -118,17 +117,6 @@ impl NativeImsBearer {
                 return Ok(());
             }
             BearerInterfaceOwnership::SimAdminOwnedSecondary => {}
-=======
-    /// primary ModemManager interface (`wwan0`) is intentionally rejected;
-    /// only the secondary QMI bearer created by this session may cross the
-    /// namespace boundary.
-    pub async fn move_into_worker(&mut self, worker: UeWorkerHandle) -> Result<(), VolteError> {
-        if self.interface == "wwan0" {
-            return Err(VolteError::with_detail(
-                code::COMMAND_FAILED,
-                "native bearer refuses to move ModemManager primary interface wwan0",
-            ));
->>>>>>> Stashed changes
         }
         if self.moved_to_worker {
             return Ok(());

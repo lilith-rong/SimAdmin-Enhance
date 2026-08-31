@@ -967,7 +967,6 @@ pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
 static DERIVED_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
     OnceLock::new();
 
-<<<<<<< Updated upstream
 fn standard_public_plmn<'a>(mcc: &'a str, mnc: &str) -> Option<(&'a str, String)> {
     let mcc = mcc.trim();
     let mnc = mnc.trim();
@@ -1077,19 +1076,11 @@ pub fn standard_tai_epdg_fqdn(mcc: &str, mnc: &str, tac: u32, technology: &str) 
 /// snapshot exists. Initial empty Authorization, visited-network identity and
 /// mandatory sec-agree remain disabled until a database/catalog profile opts in
 /// or the network challenges the UE.
-=======
-/// Generate a conservative profile from public 3GPP naming rules.
-///
-/// This is an explicitly unverified last resort. It intentionally does not
-/// guess a static P-CSCF, entitlement/XCAP endpoints, a visited-network value,
-/// or carrier-specific SIP security requirements.
->>>>>>> Stashed changes
 pub fn derive_standard_3gpp_profile(
     mcc: &str,
     mnc: &str,
     access: Standard3gppAccess,
 ) -> Option<&'static CarrierProfile> {
-<<<<<<< Updated upstream
     let mcc = mcc.trim();
     let mnc = mnc.trim();
     let epdg_host = standard_operator_epdg_fqdn(mcc, mnc)?;
@@ -1108,34 +1099,6 @@ pub fn derive_standard_3gpp_profile(
 
     let epdg_host = Box::leak(epdg_host.into_boxed_str());
     let ims_domain = Box::leak(ims_domain.into_boxed_str());
-=======
-    if mcc.len() != 3
-        || !matches!(mnc.len(), 2 | 3)
-        || !mcc.bytes().all(|byte| byte.is_ascii_digit())
-        || !mnc.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-
-    let plmn = format!("{}{}", mcc, mnc);
-    let cache_key = format!("{}:{plmn}", access.as_str());
-    let cache = DERIVED_PROFILES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    if let Some(profile) = guard.get(&cache_key) {
-        return Some(*profile);
-    }
-
-    // 3GPP domains always pad the MNC to three digits.
-    let padded_mnc = format!("{:0>3}", mnc);
-    let epdg_host = Box::leak(
-        format!("epdg.epc.mnc{}.mcc{}.pub.3gppnetwork.org", padded_mnc, mcc).into_boxed_str(),
-    );
-    let ims_domain =
-        Box::leak(format!("ims.mnc{}.mcc{}.3gppnetwork.org", padded_mnc, mcc).into_boxed_str());
->>>>>>> Stashed changes
     let profile_id =
         Box::leak(format!("derived_3gpp_{}_{}", access.as_str(), plmn).into_boxed_str());
     let source_refs: &'static [&'static str] = match access {
@@ -1227,11 +1190,7 @@ pub fn derive_standard_3gpp_profile(
                 // A carrier-specific database profile can deliberately select
                 // an SMS-only Contact (as observed with some IPCC profiles).
                 include_mmtel_features: true,
-<<<<<<< Updated upstream
                 include_route_header: false,
-=======
-                include_route_header: true,
->>>>>>> Stashed changes
                 include_visited_network: false,
                 include_p_preferred_identity: true,
                 visited_network_header: None,
@@ -1244,7 +1203,6 @@ pub fn derive_standard_3gpp_profile(
                 sec_agree_mode: "auto",
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
                 access_network_info: access.access_network_info(),
-<<<<<<< Updated upstream
                 pani_identity_policy: match access {
                     Standard3gppAccess::LteEpc => AccessIdentityPolicy::DynamicIfKnown,
                     Standard3gppAccess::WifiEpdg => AccessIdentityPolicy::Static,
@@ -1263,10 +1221,6 @@ pub fn derive_standard_3gpp_profile(
                     ],
                     Standard3gppAccess::WifiEpdg => &[],
                 },
-=======
-                contact_mode: "android_default",
-                contact_param_order: &[],
->>>>>>> Stashed changes
                 temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
                 forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
                 initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
@@ -1351,15 +1305,7 @@ fn derive_standard_match(
                 && plmn.bytes().all(|byte| byte.is_ascii_digit())
                 && digits.starts_with(*plmn)
         })
-<<<<<<< Updated upstream
         .map(str::to_string)?;
-=======
-        .map(str::to_string)
-        .or_else(|| {
-            let length = if digits.starts_with("460") { 5 } else { 6 };
-            digits.get(..length).map(str::to_string)
-        })?;
->>>>>>> Stashed changes
     let profile = derive_standard_3gpp_profile(&plmn[..3], &plmn[3..], access)?;
     Some(CarrierMatch {
         profile,
@@ -1834,7 +1780,6 @@ mod tests {
         assert_eq!(lte.meta.profile_id, "derived_3gpp_lte_26201");
         assert_ne!(lte.meta.profile_id, matched.profile.meta.profile_id);
         assert_eq!(lte.ims.register.access_network_info, "3GPP-E-UTRAN-FDD");
-<<<<<<< Updated upstream
         assert_eq!(lte.ims.transport, "udp");
         assert_eq!(lte.ims.register.sec_agree_mode, "auto");
         assert!(!lte.ims.register.require_sec_agree_headers);
@@ -1894,9 +1839,6 @@ mod tests {
         assert!(standard_tai_epdg_fqdn("345", "12", 0x1_0000, "lte").is_none());
         assert!(standard_tai_epdg_fqdn("345", "12", 0x100_0000, "nr").is_none());
         assert!(standard_tai_epdg_fqdn("345", "12", 1, "wifi").is_none());
-=======
-        assert!(!lte.meta.source_refs[0].contains("legacy-test-profile"));
->>>>>>> Stashed changes
     }
 
     #[test]

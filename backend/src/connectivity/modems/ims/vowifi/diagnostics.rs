@@ -1263,11 +1263,7 @@ mod tests {
             ..Default::default()
         };
 
-<<<<<<< Updated upstream
         let matched = match_profile_from_parts(sim, None, "460001234567890", "46000");
-=======
-        let matched = match_profile_from_parts(sim, None, "460001234567890", "");
->>>>>>> Stashed changes
 
         assert!(matched.matched);
         assert_eq!(matched.profile_source.as_deref(), Some("derived"));

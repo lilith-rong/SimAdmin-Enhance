@@ -175,10 +175,7 @@ async fn establish_bearer(
         ipv6_dns: settings.ipv6_dns,
         ipv6_prefix: settings.ipv6_prefix,
         pcscf: settings.pcscf,
-<<<<<<< Updated upstream
         interface_ownership: BearerInterfaceOwnership::SimAdminOwnedSecondary,
-=======
->>>>>>> Stashed changes
         ..Default::default()
     };
     Ok(Established {

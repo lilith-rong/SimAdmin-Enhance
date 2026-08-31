@@ -59,12 +59,9 @@ export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
   )
 }
 
-<<<<<<< Updated upstream
 /// 前端只渲染最近若干条事件，完整历史保留在后端诊断日志里，避免面板变成长列表。
 const ACTIVITY_LOG_VISIBLE_LIMIT = 20
 
-=======
->>>>>>> Stashed changes
 type ActivityLogEntry = {
   at: string
   source: 'VoLTE' | 'VoWiFi' | 'Trunk' | '短信' | '通话' | '系统'
@@ -236,7 +233,6 @@ export function LineActivityLog({
   }
 
   entries.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
-<<<<<<< Updated upstream
   const visibleEntries = entries.slice(0, ACTIVITY_LOG_VISIBLE_LIMIT)
 
   return (
@@ -245,34 +241,16 @@ export function LineActivityLog({
       <Typography variant="caption" color="text.secondary" display="block" mb={1.5}>
         最近 {ACTIVITY_LOG_VISIBLE_LIMIT} 条 IMS、短信、通话与 Trunk 关键事件；单栈/双栈及回退过程会记录在这里。
         完整历史与未截断的错误串见后端诊断日志。
-=======
-  const visibleEntries = entries.slice(0, 100)
-
-  return (
-    <Box>
-      <Typography variant="subtitle2" mb={0.25}>线路活动日志</Typography>
-      <Typography variant="caption" color="text.secondary" display="block" mb={1}>
-        最近 100 条 IMS、短信、通话与 Trunk 关键事件；单栈/双栈及回退过程会记录在这里。
->>>>>>> Stashed changes
       </Typography>
       <Box sx={{ maxHeight: 360, overflowY: 'auto', borderTop: 1, borderColor: 'divider' }}>
         {visibleEntries.length === 0 && <Typography variant="body2" color="text.secondary" py={1}>尚无活动记录</Typography>}
         {visibleEntries.map((entry, index) => (
-<<<<<<< Updated upstream
           <Box key={`${entry.source}-${entry.at}-${index}`} display="grid" gridTemplateColumns={{ xs: '1fr auto', sm: '150px 72px minmax(0, 1fr) auto' }} gap={2} py={1} borderBottom={1} borderColor="divider" alignItems="center">
             <Typography variant="caption" color="text.secondary">{new Date(entry.at).toLocaleString()}</Typography>
             <Chip size="small" variant="outlined" label={entry.source} />
             <Box minWidth={0}>
               <Typography variant="body2" sx={{ mt: 0.25, wordBreak: 'break-word' }}>{entry.stage}</Typography>
               {entry.detail && <Typography variant="caption" color="text.secondary" display="block" sx={{ wordBreak: 'break-word' }}>{entry.detail}</Typography>}
-=======
-          <Box key={`${entry.source}-${entry.at}-${index}`} display="grid" gridTemplateColumns={{ xs: '1fr auto', sm: '150px 72px minmax(0, 1fr) auto' }} gap={1} py={0.75} borderBottom={1} borderColor="divider" alignItems="center">
-            <Typography variant="caption" color="text.secondary">{new Date(entry.at).toLocaleString()}</Typography>
-            <Chip size="small" variant="outlined" label={entry.source} />
-            <Box minWidth={0}>
-              <Typography variant="body2" sx={{ wordBreak: 'break-word' }}>{entry.stage}</Typography>
-              {entry.detail && <Typography variant="caption" color="text.secondary" sx={{ wordBreak: 'break-word' }}>{entry.detail}</Typography>}
->>>>>>> Stashed changes
               {entry.error && <Typography variant="caption" color="error" display="block" sx={{ wordBreak: 'break-all' }}>{entry.error}</Typography>}
             </Box>
             <Chip size="small" variant="outlined" color={activityOutcomeColor(entry.outcome)} label={activityOutcomeLabel(entry.outcome)} />

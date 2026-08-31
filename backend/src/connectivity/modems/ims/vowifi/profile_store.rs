@@ -7,15 +7,10 @@
 //! [`ProfileStore::publish`].
 //!
 //! Automatic matching may use a clearly marked, conservative 3GPP-derived
-<<<<<<< Updated upstream
 //! fallback when neither source has a usable access profile. Legacy generic
 //! profile-resolution APIs keep explicit pins strict; the per-line VoLTE
 //! candidate API deliberately falls back inside the same logical slot when a
 //! previously selected source row disappears or loses its LTE projection.
-=======
-//! fallback when neither source has a usable access profile. Explicit profile
-//! pins remain strict and never silently fall back.
->>>>>>> Stashed changes
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -634,7 +629,6 @@ impl ProfileStore {
             .unique_for_plmn(&plmn, CatalogAccessKind::WifiEpdg)
         {
             return Some(ResolvedProfile {
-<<<<<<< Updated upstream
                 profile: entry.record.intern(),
                 origin: ProfileOrigin::Catalog,
                 fallback_reason: None,
@@ -859,21 +853,6 @@ impl ProfileStore {
             CatalogAccessKind::LteEpc,
             format!("volte_profile_source_unavailable:{}", source.as_str()),
         ))
-=======
-                profile: record.intern(),
-                origin: ProfileOrigin::Database,
-                fallback_reason: None,
-            });
-        }
-        self.catalog
-            .unique_for_plmn(&plmn, CatalogAccessKind::WifiEpdg)
-            .ok()?
-            .map(|entry| ResolvedProfile {
-                profile: entry.record.intern(),
-                origin: ProfileOrigin::Catalog,
-                fallback_reason: None,
-            })
->>>>>>> Stashed changes
     }
 
     /// Resolve a profile for one registration access. A pinned profile id is
@@ -929,7 +908,6 @@ impl ProfileStore {
             })
             .map(str::to_string);
         let (custom_records, custom_lookup_error) = match self.custom_records() {
-<<<<<<< Updated upstream
             Ok(records) => {
                 let relevant_errors = records
                     .invalid
@@ -947,9 +925,6 @@ impl ProfileStore {
                     (!relevant_errors.is_empty()).then(|| relevant_errors.join("|")),
                 )
             }
-=======
-            Ok(records) => (records, None),
->>>>>>> Stashed changes
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -1024,7 +999,6 @@ impl ProfileStore {
     }
 }
 
-<<<<<<< Updated upstream
 fn profile_origin_rank(origin: ProfileOrigin) -> u8 {
     match origin {
         ProfileOrigin::Database => 0,
@@ -1044,30 +1018,17 @@ fn normalized_home_plmn(imsi: &str, home_plmn: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-=======
->>>>>>> Stashed changes
 fn derive_standard_fallback(
     imsi: &str,
     home_plmn: Option<&str>,
     access: CatalogAccessKind,
     fallback_reason: String,
 ) -> Option<ResolvedProfile> {
-<<<<<<< Updated upstream
     let plmn = home_plmn.filter(|plmn| {
         matches!(plmn.len(), 5 | 6)
             && plmn.bytes().all(|byte| byte.is_ascii_digit())
             && imsi.starts_with(*plmn)
     })?;
-=======
-    let inferred_length = if imsi.starts_with("460") { 5 } else { 6 };
-    let plmn = home_plmn
-        .filter(|plmn| {
-            matches!(plmn.len(), 5 | 6)
-                && plmn.bytes().all(|byte| byte.is_ascii_digit())
-                && imsi.starts_with(*plmn)
-        })
-        .or_else(|| imsi.get(..inferred_length))?;
->>>>>>> Stashed changes
     let standard_access = match access {
         CatalogAccessKind::LteEpc => profiles::Standard3gppAccess::LteEpc,
         CatalogAccessKind::WifiEpdg => profiles::Standard3gppAccess::WifiEpdg,
@@ -1199,7 +1160,6 @@ mod tests {
         assert_eq!(listed[0].profile_id, "test-v7-23433");
         assert_eq!(listed[1].profile_id, "test-v7-23434");
         assert!(listed[0].source.starts_with("carrier_catalog:"));
-<<<<<<< Updated upstream
         let direct_fallback = store
             .resolve_by_plmn("460", "01")
             .expect("standard PLMN fallback");
@@ -1215,11 +1175,6 @@ mod tests {
                 Some("46001"),
                 CatalogAccessKind::LteEpc,
             )
-=======
-        assert!(store.resolve_by_plmn("460", "01").is_none());
-        let fallback = store
-            .resolve_for_imsi_access(None, "460011234567890", None, CatalogAccessKind::LteEpc)
->>>>>>> Stashed changes
             .expect("unknown profile query")
             .expect("standard fallback");
         assert_eq!(fallback.origin, ProfileOrigin::Derived);

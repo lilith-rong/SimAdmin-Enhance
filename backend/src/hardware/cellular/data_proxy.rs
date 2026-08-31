@@ -22,12 +22,8 @@ use tokio::{
 
 use crate::platform::config::LineDataProxyConfig;
 use crate::services::ue_worker::{
-<<<<<<< Updated upstream
     worker_for_line_feature, UeSocket, UeSocketSpec, UeWorkerBinding, UeWorkerFeatures,
     UeWorkerHandle,
-=======
-    worker_for_line_feature, UeSocket, UeSocketSpec, UeWorkerFeatures, UeWorkerHandle,
->>>>>>> Stashed changes
 };
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -324,7 +320,6 @@ impl DataProxyRuntime {
         let worker = match worker_for_line_feature(line_id, data_proxy_worker_enabled) {
             Some(worker) => {
                 let status = worker.status().await;
-<<<<<<< Updated upstream
                 if !status.ready {
                     None
                 } else {
@@ -347,18 +342,6 @@ impl DataProxyRuntime {
                         _ => None,
                     }
                 }
-=======
-                status
-                    .last_net_status
-                    .as_ref()
-                    .is_some_and(|snapshot| {
-                        snapshot
-                            .interfaces
-                            .iter()
-                            .any(|name| name == interface_name)
-                    })
-                    .then_some(worker)
->>>>>>> Stashed changes
             }
             None => None,
         };
@@ -369,11 +352,7 @@ impl DataProxyRuntime {
         &self,
         interface_name: &str,
         config: &LineDataProxyConfig,
-<<<<<<< Updated upstream
         worker: Option<UeWorkerBinding>,
-=======
-        worker: Option<UeWorkerHandle>,
->>>>>>> Stashed changes
     ) -> Result<DataProxyStatus, String> {
         let interface_name = interface_name.trim();
         if interface_name.is_empty() {
@@ -406,11 +385,7 @@ impl DataProxyRuntime {
             .port();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let outbound_interface = interface_name.to_string();
-<<<<<<< Updated upstream
         let outbound_worker = worker.as_ref().map(|binding| binding.worker().clone());
-=======
-        let outbound_worker = worker.clone();
->>>>>>> Stashed changes
         let username = config.username.clone();
         let password = config.password.clone();
         let counters = Arc::clone(&self.counters);
@@ -501,10 +476,6 @@ impl DataProxyRuntime {
         let state = self.state.lock().await;
         state.status.running && worker_binding_matches_state(state.worker.as_ref(), expected)
     }
-}
-
-fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
-    features.data_proxy
 }
 
 fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {

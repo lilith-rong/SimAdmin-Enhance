@@ -604,16 +604,12 @@ pub struct UeIsolationConfig {
     pub data_proxy_in_worker: bool,
     /// Stage 4 gate for trunk media sockets. Signalling and dialog ownership
     /// are already line-scoped; this controls only operator RTP socket creation.
-<<<<<<< Updated upstream
     /// Depends on `three_gpp_ims_sockets_in_worker`; read it through
     /// [`UeIsolationConfig::effective_trunk_sockets_in_worker`].
-=======
->>>>>>> Stashed changes
     #[serde(default)]
     pub trunk_sockets_in_worker: bool,
 }
 
-<<<<<<< Updated upstream
 impl UeIsolationConfig {
     /// Whether operator RTP sockets may actually be created inside the worker.
     ///
@@ -633,8 +629,6 @@ impl UeIsolationConfig {
     }
 }
 
-=======
->>>>>>> Stashed changes
 impl Default for UeIsolationConfig {
     fn default() -> Self {
         Self {
@@ -2136,7 +2130,6 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-<<<<<<< Updated upstream
     /// The registration preference must never edit the enable intent.
     ///
     /// Companion to `enabling_one_ims_access_never_disables_the_other`: that test
@@ -2215,8 +2208,6 @@ mod tests {
         );
     }
 
-=======
->>>>>>> Stashed changes
     #[test]
     fn esim_reader_settings_are_isolated_per_line() {
         let path = std::env::temp_dir().join(format!(
@@ -2785,7 +2776,6 @@ mod tests {
         }))
         .unwrap();
         assert!(profile.volte_ip_families_auto);
-<<<<<<< Updated upstream
     }
 
     #[test]
@@ -2911,8 +2901,6 @@ mod tests {
             validate_volte_profile_selection(&mut invalid),
             Err("volte_derived_profile_id_not_allowed".to_string())
         );
-=======
->>>>>>> Stashed changes
     }
 
     #[test]
@@ -2953,23 +2941,12 @@ mod tests {
         let line_a = "line-0123456789abcdef0123456789abcdef";
         let line_b = "line-fedcba9876543210fedcba9876543210";
 
-<<<<<<< Updated upstream
         // IMS video follows the access leg's connection: there is no separate
         // voice or video switch to set. Connecting VoLTE on line_b is therefore
         // the whole action, and line_a stays off because it is not connected.
         manager
             .set_line_volte_connection_enabled(line_b, true)
             .unwrap();
-=======
-        manager.set_line_volte_voice_enabled(line_a, false).unwrap();
-        manager
-            .set_line_volte_connection_enabled(line_b, true)
-            .unwrap();
-        assert!(!manager.get_line_ims_video_config(line_b).volte_enabled);
-        manager.set_line_volte_voice_enabled(line_b, true).unwrap();
-        assert!(!manager.get_line_volte_voice_enabled(line_a));
-        assert!(manager.get_line_volte_voice_enabled(line_b));
->>>>>>> Stashed changes
         assert!(!manager.get_line_ims_video_config(line_a).volte_enabled);
         assert!(manager.get_line_ims_video_config(line_b).volte_enabled);
 
@@ -3042,49 +3019,6 @@ mod tests {
         assert!(!reloaded.get_line_ims_video_config(line_b).volte_enabled);
         assert!(reloaded.get_line_ims_video_config(line_b).vowifi_enabled);
 
-<<<<<<< Updated upstream
-=======
-        let _ = std::fs::remove_file(path.with_extension("bak"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn stale_ims_video_gates_are_normalized_when_config_loads() {
-        let path = std::env::temp_dir().join(format!(
-            "simadmin_vilte_normalize_{}_{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let line_id = "line-0123456789abcdef0123456789abcdef";
-        let mut config = AppConfig::default();
-        let mut profile = LineProfileConfig::for_line(line_id);
-        profile.volte_connection_enabled = true;
-        profile.volte_voice_enabled = true;
-        profile.vowifi.enabled = true;
-        assert!(!profile.ims_video.volte_enabled);
-        assert!(!profile.ims_video.vowifi_enabled);
-        config.line_profiles.push(profile);
-        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-
-        let manager = ConfigManager::new(path.clone());
-        let normalized = manager.get_line_ims_video_config(line_id);
-        assert!(normalized.volte_enabled);
-        assert!(normalized.vowifi_enabled);
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            persisted["line_profiles"][0]["ims_video"]["volte_enabled"],
-            serde_json::Value::Bool(true)
-        );
-        assert_eq!(
-            persisted["line_profiles"][0]["ims_video"]["vowifi_enabled"],
-            serde_json::Value::Bool(true)
-        );
-
->>>>>>> Stashed changes
         let _ = std::fs::remove_file(path.with_extension("bak"));
         let _ = std::fs::remove_file(path);
     }
@@ -4347,7 +4281,6 @@ fn default_line_volte_ip_families() -> Vec<VolteIpFamily> {
     VolteIpFamilyPreference::default().to_families()
 }
 
-<<<<<<< Updated upstream
 /// Older releases used `[ipv4v6, ipv4, ipv6]` for automatic lines. Keep
 /// explicit operator choices intact, but migrate that generated default to the
 /// current dual-stack -> IPv6 -> IPv4 order when loading persisted settings.
@@ -4371,8 +4304,6 @@ fn migrate_legacy_volte_ip_family_defaults(config: &mut AppConfig) -> bool {
     changed
 }
 
-=======
->>>>>>> Stashed changes
 fn default_line_volte_ip_families_auto() -> bool {
     true
 }
@@ -4777,7 +4708,6 @@ fn default_line_enabled() -> bool {
 }
 
 impl LineProfileConfig {
-<<<<<<< Updated upstream
     /// Mirror each access leg's presence onto its IMS video state.
     ///
     /// These are status mirrors, not feature switches. IMS voice and video are
@@ -4788,10 +4718,6 @@ impl LineProfileConfig {
     /// or 380 on the registration) which the runtime surfaces as-is.
     fn sync_ims_video_access_gates(&mut self) {
         self.ims_video.volte_enabled = self.volte_connection_enabled;
-=======
-    fn sync_ims_video_access_gates(&mut self) {
-        self.ims_video.volte_enabled = self.volte_connection_enabled && self.volte_voice_enabled;
->>>>>>> Stashed changes
         self.ims_video.vowifi_enabled = self.vowifi.enabled;
     }
 
@@ -5725,18 +5651,12 @@ impl ConfigManager {
             (MainConfig::default(), false)
         };
 
-<<<<<<< Updated upstream
         let stored = crate::platform::config_store::load(&database)?;
         let mut config = AppConfig::merge(main, stored);
 
         let templates_changed = migrate_templates_to_remove_md5(&mut config);
         let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
         let volte_ip_family_defaults_changed = migrate_legacy_volte_ip_family_defaults(&mut config);
-=======
-        let templates_changed = migrate_templates_to_remove_md5(&mut config);
-        let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
-        let changed = templates_changed || video_gates_changed || canonical_rewrite_required;
->>>>>>> Stashed changes
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
@@ -5755,41 +5675,12 @@ impl ConfigManager {
         Ok(manager)
     }
 
-<<<<<<< Updated upstream
     /// Test constructor. Derives the database beside the configuration file so a
     /// test can reload from the same path and see what it saved, which is the
     /// pattern the existing tests already use.
     #[cfg(test)]
     fn new(config_path: PathBuf) -> Self {
         Self::try_new_for_test(config_path).expect("test configuration must load")
-=======
-    fn try_new_sqlite(config_path: PathBuf) -> Result<Self, String> {
-        let connection = open_config_database(&config_path)?;
-        let stored = load_config_document(&connection, &config_path)?;
-        let database_was_empty = stored.is_none();
-
-        let (mut config, canonical_rewrite_required) = match stored {
-            Some((config, rewrite)) => (config, rewrite),
-            None => {
-                info!(path = ?config_path, "No SQLite configuration found, using defaults");
-                (AppConfig::default(), false)
-            }
-        };
-
-        let templates_changed = migrate_templates_to_remove_md5(&mut config);
-        let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
-        let changed = templates_changed || video_gates_changed || canonical_rewrite_required;
-        let manager = Self {
-            config: Arc::new(RwLock::new(config)),
-            storage: ConfigStorage::Sqlite(config_path.clone()),
-            save_lock: Mutex::new(()),
-        };
-
-        if database_was_empty || changed {
-            manager.save()?;
-        }
-        Ok(manager)
->>>>>>> Stashed changes
     }
 
     #[cfg(test)]
@@ -6423,7 +6314,6 @@ impl ConfigManager {
         self.get_line_profile(line_id).volte_ip_families_auto
     }
 
-<<<<<<< Updated upstream
     pub fn get_line_volte_profile_selection(&self, line_id: &str) -> VolteProfileSelectionConfig {
         self.get_line_profile(line_id).volte_profile_selection
     }
@@ -6439,8 +6329,6 @@ impl ConfigManager {
         })
     }
 
-=======
->>>>>>> Stashed changes
     pub fn set_line_vowifi_config(
         &self,
         line_id: &str,
@@ -6840,24 +6728,7 @@ impl ConfigManager {
     /// does not permit voice answers the REGISTER or the INVITE with a SIP
     /// error, which the runtime reports instead of pre-emptively refusing.
     pub fn get_line_volte_voice_enabled(&self, line_id: &str) -> bool {
-<<<<<<< Updated upstream
         self.get_line_profile(line_id).volte_connection_enabled
-=======
-        self.get_line_profile(line_id).volte_voice_enabled
-    }
-
-    /// Toggle VoLTE voice handling for exactly one registered IMS line. IMS
-    /// video follows the connection and voice gates automatically.
-    pub fn set_line_volte_voice_enabled(
-        &self,
-        line_id: &str,
-        enabled: bool,
-    ) -> Result<LineProfileConfig, String> {
-        self.update_line_profile(line_id, |profile| {
-            profile.volte_voice_enabled = enabled;
-            profile.sync_ims_video_access_gates();
-        })
->>>>>>> Stashed changes
     }
 
     /// SMS path policy for one line.

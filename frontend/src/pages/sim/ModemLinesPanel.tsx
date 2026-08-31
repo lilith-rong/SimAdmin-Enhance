@@ -35,10 +35,7 @@ import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableM
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
 import DataProxyDialog from './DataProxyDialog'
-<<<<<<< Updated upstream
 import VolteProfileDialog from './VolteProfileDialog'
-=======
->>>>>>> Stashed changes
 import { LineActivityLog, LineTrunkDetails, LineVolteDetails, LineVowifiDetails } from './LineRuntimeDetails'
 import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
@@ -1002,7 +999,6 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     {!isReader && (!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} flexDirection={{ xs: 'column', sm: 'row' }} gap={1} mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
                       <Box minWidth={0}>
                         <Typography variant="body2" fontWeight={600}>VoLTE IMS 连接</Typography>
-<<<<<<< Updated upstream
                       </Box>
                       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
                         <Chip size="small" label={imsConnectionSummary(line)} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
@@ -1019,14 +1015,6 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         >
                           配置
                         </Button>
-=======
-                        <Typography variant="caption" color="text.secondary">
-                          独立于其他基带管理；连接阶段与地址族详情见线路活动日志
-                        </Typography>
-                      </Box>
-                      <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
-                        <Chip size="small" label={imsConnectionSummary(line)} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
->>>>>>> Stashed changes
                         {(volteBusy || retryBusy) && <CircularProgress size={18} />}
                         {line.profile.volte_connection_enabled && line.runtime.manual_retry_available && (
                           <Tooltip title={recoveryRunning ? '自动恢复正在进行' : `立即开始新的 ${line.runtime.retry_max || 3} 次恢复批次`}>
@@ -1050,13 +1038,9 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         />
                       </Box>
                     </Box>}
-<<<<<<< Updated upstream
                     {/* 工作台的 IMS 标签页不再重复渲染阶段进度：线路卡片顶部已有同源的
                         阶段条，两处并列只是同一份 connection_attempts 的两种画法。 */}
                     {!isReader && !workbench && <VolteStageTimeline line={line} />}
-=======
-                    {!isReader && (!workbench || workbenchTab === 'ims') && <VolteStageTimeline line={line} />}
->>>>>>> Stashed changes
                     {(!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">

@@ -23,10 +23,7 @@ pub mod context;
 pub mod device_identity;
 pub mod digest_aka;
 pub mod entitlement;
-<<<<<<< Updated upstream
 pub mod ims_access;
-=======
->>>>>>> Stashed changes
 pub mod ims_failure;
 pub mod ims_video;
 pub mod media;

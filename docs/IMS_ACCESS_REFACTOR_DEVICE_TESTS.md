@@ -1,17 +1,11 @@
 # IMS 接入路径重构：410 实机回归清单
 
-<<<<<<< Updated upstream
 > 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `48e7e41` 的
 > GitHub Actions ARM64 产物。当前已确认 per-UE namespace、worker、veth、NAT
 > 基础设施能够启动，且 VoWiFi 的 IKEv2/EAP-AKA/CHILD_SA/ESP/TUN socket 已在
 > worker netns 内创建。只读回归还确认飞行模式下 3GPP/VoLTE 为 down，VoWiFi 的
 > ePDG/IKE/CHILD_SA/ESP/TUN 保持 ready；当前 IMS REGISTER 仍收到运营商 `421`
 > 拒绝，因此短信、语音等业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
-=======
-> 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `103743c` 的
-> GitHub Actions ARM64 产物。当前已确认 per-UE namespace、worker、veth、NAT
-> 基础设施能够启动；下列业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
->>>>>>> Stashed changes
 
 ## 本轮变更
 
@@ -23,15 +17,12 @@
 
 ## 410 分阶段必测
 
-<<<<<<< Updated upstream
 ### 测试设备映射
 
 - 410 实机：`192.168.100.13`，ADB serial `0123456789`；部署登录密码由设备环境提供。
 - 卡一拨号/媒体测试设备：ADB serial `98d45ad8`。
 - 本轮仅使用 410 做实机回归；EC20/EC25/EG25/EG600 与 USB/PCSC reader 保持待测。
 
-=======
->>>>>>> Stashed changes
 ### 飞行模式与 VoWiFi
 
 - [ ] 开启飞行模式后 data 停止、3GPP/VoLTE 为 `down`，不继续显示 registered。
@@ -119,7 +110,6 @@ ip netns list
   `sa-ue286e0c9d2870` namespace、veth `/30` 地址和宿主 NAT；这些只证明隔离底座
   已启动，不等于 VoWiFi、VoLTE、数据代理或 Trunk 业务验收完成。
 - 当前 VoWiFi 已完成 ePDG、IKE、CHILD_SA、ESP 与 TUN，但 IMS REGISTER 收到
-<<<<<<< Updated upstream
   SIP `421`，尚未进入 `voice_ready`；应先排除此注册阻碍，再执行真实短信/语音测试。
 - 本轮实机确认主进程创建的 IKE socket 位于 worker 的 netns，worker 内可见
   `lo`、`save<hex>` 与 `sa_vwf<hex>`，宿主没有对应的 500/4500 socket；飞行模式下
@@ -131,11 +121,6 @@ ip netns list
 - 线路刷新已改为先准备 UE worker/socket 状态、再与 binding 一起发布；DATA6 保留会话
   会检查 worker 实例和 netdev 可见性。以上只证明代码路径具备失效保护，仍需在 410
   上验证 worker 重建、secondary bearer 回宿主和重新建立的完整过程。
-=======
-  SIP `421`，尚未进入 `voice_ready`；应先排除此注册阻碍，再执行真实语音测试。
-- 当前 VoLTE、数据代理与 Trunk worker 功能门仍需逐项启用并回归，首次验证不得同时
-  打开多个功能门。
->>>>>>> Stashed changes
 - 不在本机生成 production 构建或发布包；发布构建继续交给 GitHub Actions。
 - 暂不执行 EC20、EC25、EG25、EG600 与 PCSC/USB SIM reader 实机测试。
 - 暂不承诺通话中的无缝 access handover、IMS service continuity 或 SRVCC。

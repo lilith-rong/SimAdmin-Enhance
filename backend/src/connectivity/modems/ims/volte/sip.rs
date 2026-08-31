@@ -270,10 +270,7 @@ pub fn build_register_with_policy(
         sip_instance,
         policy,
         None,
-<<<<<<< Updated upstream
         None,
-=======
->>>>>>> Stashed changes
     )
 }
 
@@ -364,7 +361,6 @@ pub fn build_register_from_profile_with_target_and_visited(
     policy: RegisterRequestPolicy,
     visited_network_override: Option<&str>,
 ) -> Vec<u8> {
-<<<<<<< Updated upstream
     build_register_from_profile_with_target_visited_and_access(
         profile,
         target,
@@ -404,8 +400,6 @@ pub fn build_register_from_profile_with_target_visited_and_access(
     visited_network_override: Option<&str>,
     access_network: Option<&ImsAccessNetworkContext>,
 ) -> Vec<u8> {
-=======
->>>>>>> Stashed changes
     build_register_internal(
         Some(profile),
         Some(target),
@@ -420,10 +414,7 @@ pub fn build_register_from_profile_with_target_visited_and_access(
         sip_instance,
         policy,
         visited_network_override,
-<<<<<<< Updated upstream
         access_network,
-=======
->>>>>>> Stashed changes
     )
 }
 
@@ -483,10 +474,7 @@ fn build_register_internal(
     sip_instance: &str,
     policy: RegisterRequestPolicy,
     visited_network_override: Option<&str>,
-<<<<<<< Updated upstream
     access_network: Option<&ImsAccessNetworkContext>,
-=======
->>>>>>> Stashed changes
 ) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
@@ -643,7 +631,6 @@ fn build_register_internal(
         contact.push(';');
         contact.push_str(&parameter);
     }
-<<<<<<< Updated upstream
     // RFC 3455 §4.3.2.1 says a SIP UA SHOULD NOT originate
     // P-Visited-Network-ID.  A profile may still opt in for a field-tested
     // carrier exception, but a candidate that disables the policy must also
@@ -668,29 +655,6 @@ fn build_register_internal(
                 })
         })
         .flatten();
-=======
-    if !advertises_sms_over_ip {
-        contact.push_str(";+g.3gpp.smsip");
-    }
-    if profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance) {
-        contact.push_str(&format!(";+sip.instance=\"<{}>\";reg-id=1", sip_instance));
-    }
-    let visited_network = visited_network_override
-        .map(str::to_string)
-        .or_else(|| {
-            profile
-                .and_then(|profile| profile.ims.register.visited_network_header)
-                .map(str::to_string)
-        })
-        .or_else(|| (profile.is_none() && policy.include_visited_network).then(String::new))
-        .map(|value| {
-            if value.is_empty() {
-                format!("\"{}\"", identity.home_domain)
-            } else {
-                value
-            }
-        });
->>>>>>> Stashed changes
     crate::connectivity::core::register_message::build_register(&RegisterRequest {
         request_uri,
         advertised_route: *route,
@@ -1678,7 +1642,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< Updated upstream
     fn ue_omission_policy_suppresses_static_and_runtime_visited_network() {
         let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         let frame = build_register_from_profile_with_target_and_visited(
@@ -1701,8 +1664,6 @@ mod tests {
     }
 
     #[test]
-=======
->>>>>>> Stashed changes
     fn carrier_policy_adds_imei_sip_instance_and_reg_id_to_contact() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         profile.ims.register.always_add_sip_instance = true;
