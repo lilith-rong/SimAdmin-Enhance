@@ -13,12 +13,15 @@ use serde_json::Value;
 use super::{
     db_error, default_access_network_info, expand_ims_static_template, expand_static_template,
     normalize_home_plmn, normalize_ip_family, CatalogAccessKind, CatalogIdentityMatch,
-    CatalogProfile, CatalogProfileIcon, CatalogRelease, CatalogServiceCapabilities, ProfileMetaRow,
+    CatalogProfile, CatalogProfileIcon, CatalogProfileSummary, CatalogRelease,
+    CatalogServiceCapabilities, ProfileMetaRow,
 };
+use crate::connectivity::core::access_network::AccessIdentityPolicy;
 use crate::connectivity::modems::ims::vowifi::profile_record::{
     CarrierProfileMetaRecord, CarrierProfileRecord, E911PolicyRecord, EpdgPolicyRecord,
     Ikev2PolicyRecord, ImsPolicyRecord, ProfileIdentityPolicyRecord, RegisterPolicyRecord,
     SmsPolicyRecord, UtPolicyRecord, VoiceCodecPolicyRecord, VoicePolicyRecord,
+    CURRENT_SCHEMA_VERSION,
 };
 use crate::connectivity::modems::ims::vowifi::profiles;
 
@@ -199,6 +202,90 @@ pub(super) fn list(
         }
     }
     Ok(profiles)
+}
+
+pub(super) fn list_summaries(conn: &Connection) -> Result<Vec<CatalogProfileSummary>, String> {
+    let release = read_release(conn)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT cp.profile_id,
+                    (SELECT mr.plmn
+                       FROM profile_match_rules AS mr
+                      WHERE mr.profile_id = cp.profile_id
+                        AND mr.is_exclusion = 0 AND mr.plmn IS NOT NULL
+                      ORDER BY mr.priority, length(mr.plmn) DESC
+                      LIMIT 1),
+                    COALESCE(c.brand_name, c.canonical_name, cp.display_name),
+                    COALESCE(c.aliases_json, '[]'),
+                    cp.lte_ims_status = 'ready',
+                    cp.vowifi_status = 'ready',
+                    COALESCE(json_extract(cp.config_json, '$.services.vilte'), 0),
+                    COALESCE(json_extract(cp.config_json, '$.services.smsoip'), 0),
+                    COALESCE(json_extract(cp.config_json, '$.services.ut_xcap'), 0)
+               FROM carrier_profiles AS cp
+               LEFT JOIN carriers AS c ON c.carrier_id = cp.carrier_id
+              WHERE cp.lte_ims_status = 'ready' OR cp.vowifi_status = 'ready'
+              ORDER BY cp.priority, cp.profile_id",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, i64>(5)? != 0,
+                row.get::<_, i64>(6)? != 0,
+                row.get::<_, i64>(7)? != 0,
+                row.get::<_, i64>(8)? != 0,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut summaries = Vec::new();
+    for row in rows {
+        let (
+            profile_id,
+            plmn,
+            brand,
+            aliases_json,
+            volte_ready,
+            vowifi_ready,
+            vilte_enabled,
+            smsoip_enabled,
+            ut_xcap_enabled,
+        ) = row.map_err(db_error)?;
+        let Some(plmn) = plmn else {
+            tracing::warn!(profile_id, "Skipping catalog summary without a PLMN rule");
+            continue;
+        };
+        if !matches!(plmn.len(), 5 | 6) || !plmn.bytes().all(|byte| byte.is_ascii_digit()) {
+            tracing::warn!(
+                profile_id,
+                plmn,
+                "Skipping catalog summary with invalid PLMN"
+            );
+            continue;
+        }
+        let aliases = serde_json::from_str::<Vec<String>>(&aliases_json)
+            .map_err(|error| format!("carrier_catalog_v7_aliases_invalid:{profile_id}:{error}"))?;
+        summaries.push(CatalogProfileSummary {
+            profile_id,
+            mcc: plmn[..3].to_string(),
+            plmn,
+            operator_legal_name: brand.clone(),
+            brand,
+            aliases,
+            release: release.clone(),
+            volte_ready,
+            vowifi_ready,
+            vilte_enabled,
+            smsoip_enabled,
+            ut_xcap_enabled,
+        });
+    }
+    Ok(summaries)
 }
 
 pub(super) fn service_capabilities(
@@ -599,12 +686,26 @@ fn project_config(
     access: CatalogAccessKind,
     config: &Value,
 ) -> Result<CarrierProfileRecord, String> {
-    let standard_domain = format!("ims.mnc{:0>3}.mcc{}.3gppnetwork.org", meta.mnc, meta.mcc);
-    let domain = string_at(config, "/ims/home_domain")
-        .map(|value| expand_static_template(value, meta, "ims_home_domain"))
-        .transpose()?
-        .unwrap_or(standard_domain);
-    let realm = string_at(config, "/ims/realm")
+    // A public PLMN has a standards-defined IMS home domain. MCC 999 is
+    // reserved for private networks, however, so a catalog row for it must
+    // carry the deployment's actual domain instead of leaking a public-DNS
+    // guess into registration. Empty strings are treated as absent so public
+    // rows can still receive the standards-derived baseline.
+    let explicit_domain = string_at(config, "/ims/home_domain")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let standard_domain_derived = explicit_domain.is_none();
+    let domain = match explicit_domain {
+        Some(value) => expand_static_template(value, meta, "ims_home_domain")?,
+        None => profiles::standard_ims_home_domain(&meta.mcc, &meta.mnc).ok_or_else(|| {
+            format!("carrier_catalog_private_ims_home_domain_required:{profile_id}")
+        })?,
+    };
+    let explicit_realm = string_at(config, "/ims/realm")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let standard_realm_derived = explicit_realm.is_none();
+    let realm = explicit_realm
         .map(|value| expand_ims_static_template(value, meta, &domain, "ims_realm"))
         .transpose()?
         .unwrap_or_else(|| domain.clone());
@@ -646,8 +747,11 @@ fn project_config(
         .to_string();
     let ip_family = normalize_ip_family(string_at(access_config, "/ip_family").unwrap_or("ipv4v6"));
 
-    let (epdg, ikev2) = match access {
-        CatalogAccessKind::LteEpc => empty_non_wifi_access(&apn, &ip_family),
+    let (epdg, ikev2, standard_epdg_derived, standard_ike_identity_derived) = match access {
+        CatalogAccessKind::LteEpc => {
+            let (epdg, ikev2) = empty_non_wifi_access(&apn, &ip_family);
+            (epdg, ikev2, false, false)
+        }
         CatalogAccessKind::WifiEpdg => {
             project_vowifi_access(profile_id, meta, access_config, &apn, &ip_family)?
         }
@@ -693,7 +797,23 @@ fn project_config(
         preferred_codecs
     };
 
+    let mut source_refs = vec![format!("carrier_catalog:{}", release.release_id)];
+    if standard_domain_derived {
+        source_refs.push("unverified-3gpp-standard-fallback:ims-home-domain".to_string());
+    }
+    if standard_realm_derived {
+        source_refs
+            .push("unverified-3gpp-standard-fallback:ims-realm-from-home-domain".to_string());
+    }
+    if standard_epdg_derived {
+        source_refs.push("unverified-3gpp-standard-fallback:epdg-operator-identifier".to_string());
+    }
+    if standard_ike_identity_derived {
+        source_refs.push("unverified-3gpp-standard-fallback:ike-permanent-nai".to_string());
+    }
+
     let record = CarrierProfileRecord {
+        schema_version: CURRENT_SCHEMA_VERSION,
         meta: CarrierProfileMetaRecord {
             profile_id: profile_id.to_string(),
             mcc: meta.mcc.clone(),
@@ -708,7 +828,7 @@ fn project_config(
             },
             operator_legal_name: meta.legal_name.clone(),
             aliases,
-            source_refs: vec![format!("carrier_catalog:{}", release.release_id)],
+            source_refs,
             last_verified: release.generated_at.chars().take(10).collect(),
         },
         identity: ProfileIdentityPolicyRecord {
@@ -946,6 +1066,7 @@ fn empty_non_wifi_access(apn: &str, ip_family: &str) -> (EpdgPolicyRecord, Ikev2
             esp_proposals: Vec::new(),
             aka_challenge_mode: String::new(),
             include_epdg_idr: false,
+            identity_template: None,
         },
     )
 }
@@ -956,24 +1077,28 @@ fn project_vowifi_access(
     access: &Value,
     apn: &str,
     ip_family: &str,
-) -> Result<(EpdgPolicyRecord, Ikev2PolicyRecord), String> {
+) -> Result<(EpdgPolicyRecord, Ikev2PolicyRecord, bool, bool), String> {
     let epdg = access
         .pointer("/epdg")
         .and_then(Value::as_array)
         .and_then(|values| values.first());
-    // Last-resort ePDG endpoint: when the catalog carries no ePDG entry (or no
-    // address), derive the TS 24.302 default FQDN from the profile PLMN, e.g.
-    // epdg.epc.mnc012.mcc502.pub.3gppnetwork.org. The runtime DNS resolution
-    // still decides whether the operator actually publishes the name.
-    let (host, epdg_port) = match epdg {
-        Some(entry) => match string_at(entry, "/address") {
-            Some(address) => (
-                expand_static_template(address, meta, "epdg_endpoint")?,
-                u16_at(entry, "/port"),
-            ),
-            None => (derived_epdg_fqdn(meta), u16_at(entry, "/port")),
-        },
-        None => (derived_epdg_fqdn(meta), None),
+    // Last-resort ePDG endpoint for public PLMNs: when the catalog carries no
+    // usable ePDG address, derive the TS 24.302 Operator Identifier FQDN. A
+    // private-network row (MCC 999) must provide its real endpoint; baseband
+    // PLMN/TAC facts are useful for selecting provisioned private data but are
+    // not enough to invent a globally resolvable private ePDG name.
+    let epdg_port = epdg.and_then(|entry| u16_at(entry, "/port"));
+    let explicit_host = epdg
+        .and_then(|entry| string_at(entry, "/address"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|address| expand_static_template(address, meta, "epdg_endpoint"))
+        .transpose()?;
+    let standard_epdg_derived = explicit_host.is_none();
+    let host = match explicit_host {
+        Some(host) => host,
+        None => profiles::standard_operator_epdg_fqdn(&meta.mcc, &meta.mnc)
+            .ok_or_else(|| format!("carrier_catalog_private_epdg_required:{profile_id}"))?,
     };
     let ike = access.pointer("/ike").unwrap_or(&Value::Null);
     let dns_servers = string_array_at(access, "/dns_servers").unwrap_or_default();
@@ -1025,6 +1150,27 @@ fn project_vowifi_access(
     } else {
         baseline_esp()
     };
+    let identity_template = ike
+        .pointer("/identities/idi")
+        .and_then(Value::as_array)
+        .and_then(|rules| {
+            rules.iter().find_map(|rule| {
+                let identity_type = string_at(rule, "/identity_type").unwrap_or("id_rfc822_addr");
+                if !identity_type.eq_ignore_ascii_case("id_rfc822_addr") {
+                    return None;
+                }
+                string_at(rule, "/value_template")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.replace("{home_domain}", "{ims_domain}"))
+            })
+        });
+    if meta.mcc == "999" && identity_template.is_none() {
+        return Err(format!(
+            "carrier_catalog_private_ike_identity_required:{profile_id}"
+        ));
+    }
+    let standard_ike_identity_derived = identity_template.is_none();
     let include_epdg_idr = ike
         .pointer("/identities/idr")
         .and_then(Value::as_array)
@@ -1054,15 +1200,11 @@ fn project_vowifi_access(
             esp_proposals,
             aka_challenge_mode: eap_method.to_string(),
             include_epdg_idr,
+            identity_template,
         },
+        standard_epdg_derived,
+        standard_ike_identity_derived,
     ))
-}
-
-fn derived_epdg_fqdn(meta: &ProfileMetaRow) -> String {
-    format!(
-        "epdg.epc.mnc{:0>3}.mcc{}.pub.3gppnetwork.org",
-        meta.mnc, meta.mcc
-    )
 }
 
 fn structured_ike_proposals(proposals: &[Value], profile_id: &str) -> Vec<String> {
@@ -1196,8 +1338,13 @@ fn project_register(
     let register = config
         .pointer("/sip/common/register")
         .unwrap_or(&Value::Null);
+    // Missing carrier data is not permission to demand sec-agree. Offer a
+    // compatible Security-Client proposal in `auto` mode and only add
+    // Require/Proxy-Require when the bundle explicitly requires it or the
+    // P-CSCF answers 421/494. Explicit `disabled`/`omit` remains authoritative.
     let sec_agree_mode = match string_at(register, "/security_agreement").unwrap_or("auto") {
         value @ ("auto" | "required" | "disabled") => value.to_string(),
+        "omit" => "disabled".to_string(),
         unsupported => {
             return Err(format!(
                 "carrier_catalog_sec_agree_unsupported:{profile_id}:{unsupported}"
@@ -1208,16 +1355,13 @@ fn project_register(
     if sec_agree_mode != "disabled" && security_client.is_empty() {
         security_client.push(BASELINE_SECURITY_CLIENT.to_string());
     }
-    // Offering ipsec-3gpp through Security-Client commits the UE to the
-    // security agreement, so the same REGISTER has to advertise and demand it:
-    // RFC 3329 §2.3 requires Supported/Require/Proxy-Require to travel with the
-    // offer, and TS 24.229 §5.1.1.2.2 requires the empty AKA Authorization.
-    // Bundles extracted from real handsets frequently omit
-    // `security_agreement`, which lands here as "auto"; sending the offer
-    // without the declaration makes the request self-contradictory and IMS
-    // cores answer 421 Extension Required.
+    // Keep `sec-agree` in Supported when a Security-Client proposal exists.
+    // Require and Proxy-Require are controlled independently below; an `auto`
+    // profile starts without demanding the extension and can be upgraded after
+    // a 421/494 response.
     let offers_sec_agree = !security_client.is_empty();
-    let mut supported = string_array_or_csv(register, "/supported").unwrap_or_default();
+    let mut supported = string_array_or_csv(register, "/supported")
+        .unwrap_or_else(|| vec!["path".to_string(), "gruu".to_string()]);
     if offers_sec_agree
         && !supported
             .iter()
@@ -1232,15 +1376,37 @@ fn project_register(
     let country_of_origination_format = string_at(register, "/country_of_origination_format")
         .unwrap_or("")
         .to_string();
-    let country_needs_pani = matches!(country_of_origination_format.as_str(), "PANI" | "BOTH");
+    let baseline_includes_pani = match country_of_origination_format.as_str() {
+        "PANI" | "BOTH" => true,
+        "NONE" => false,
+        // LTE catalog rows use the standard access-type-only PANI fallback.
+        // Wi-Fi rows must opt in because handset bundles differ substantially.
+        _ => matches!(access, CatalogAccessKind::LteEpc),
+    };
     let include_pani_initial =
-        bool_at(register, "/include_pani_initial").unwrap_or(country_needs_pani);
+        bool_at_or_omit(register, "/include_pani_initial")?.unwrap_or(baseline_includes_pani);
     let include_pani_authenticated =
-        bool_at(register, "/include_pani_authenticated").unwrap_or(country_needs_pani);
+        bool_at_or_omit(register, "/include_pani_authenticated")?.unwrap_or(baseline_includes_pani);
     let pani = string_at(register, "/access_network_info")
         .map(|value| expand_ims_static_template(value, meta, domain, "sip_access_network_info"))
         .transpose()?
         .unwrap_or_else(|| default_access_network_info(access).to_string());
+    let pani_identity_policy = access_identity_policy_at(register, "/pani_identity_policy")?
+        .unwrap_or(match access {
+            CatalogAccessKind::LteEpc => AccessIdentityPolicy::DynamicIfKnown,
+            CatalogAccessKind::WifiEpdg => AccessIdentityPolicy::Static,
+        });
+    let enable_cellular_network_info =
+        bool_at_or_omit(register, "/enable_cellular_network_info")?.unwrap_or(false);
+    let cellular_network_info = string_at(register, "/cellular_network_info")
+        .map(|value| expand_ims_static_template(value, meta, domain, "sip_cellular_network_info"))
+        .transpose()?;
+    let cni_identity_policy = access_identity_policy_at(register, "/cni_identity_policy")?
+        .unwrap_or(if enable_cellular_network_info {
+            AccessIdentityPolicy::DynamicIfKnown
+        } else {
+            AccessIdentityPolicy::Omit
+        });
     let visited_network_header = string_at(register, "/visited_network_header")
         .map(|value| expand_ims_static_template(value, meta, domain, "sip_visited_network_id"))
         .transpose()?;
@@ -1257,17 +1423,11 @@ fn project_register(
             "audio" | "+g.3gpp.icsi-ref"
         )
     });
-    // Most bundles (Maxis among them, and all 1444 rows currently shipped)
-    // carry no `sip.common.contact_parameters` at all. Deriving MMTEL purely
-    // from that absent list made every such profile register as non-voice: no
-    // `+g.3gpp.icsi-ref` reaches the S-CSCF, so it never selects the MMTEL AS
-    // for terminating requests and MT calls are simply never delivered --
-    // while REGISTER still answers 200 OK, which makes the fault look like a
-    // network problem rather than ours. A real UE advertises the voice feature
-    // tags on any voice-capable registration, and a core that does not offer
-    // MMTEL just ignores them, so the safe default when the bundle expresses
-    // no Contact opinion is to advertise -- only an explicit `services` flag
-    // turning the access off suppresses it.
+    // Contact feature tags describe service capability; they are not a
+    // substitute for access identity. Preserve an explicit bundle list exactly,
+    // otherwise advertise MMTEL for any access whose service declaration says
+    // it is voice-capable. Carrier-specific SMS-only/IPCC bindings must opt out
+    // explicitly instead of becoming the global Wi-Fi default.
     let declares_voice_service = match access {
         CatalogAccessKind::LteEpc => bool_at(config, "/services/volte").unwrap_or(true),
         CatalogAccessKind::WifiEpdg => bool_at(config, "/services/vowifi").unwrap_or(true),
@@ -1287,49 +1447,52 @@ fn project_register(
         // Offering ipsec-3gpp means we are doing IMS AKA, so default to that
         // shape; a core that demands sec-agree has no way to start the
         // challenge without it and answers 400. The explicit JSON value still
-        // wins, and hardcoded profiles in profiles.rs are unaffected.
+        // Empty AKA Authorization is carrier/profile specific. Unknown
+        // bundles use challenge-first Digest/AKA and may opt in explicitly.
         initial_authorization: string_at(register, "/initial_authorization")
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if offers_sec_agree {
-                    "aka_empty".to_string()
-                } else {
-                    "none".to_string()
-                }
-            }),
+            .unwrap_or("none")
+            .to_string(),
         include_mmtel_features,
-        include_route_header: bool_at(register, "/include_route_header").unwrap_or(false),
+        include_route_header: bool_at_or_omit(register, "/include_route_header")?.unwrap_or(false),
         include_visited_network: visited_network_header.is_some(),
-        include_p_preferred_identity: bool_at(register, "/include_p_preferred_identity")
+        include_p_preferred_identity: bool_at_or_omit(register, "/include_p_preferred_identity")?
             .unwrap_or(true),
         visited_network_header,
         allow_methods: string_array_or_csv(register, "/allow_methods")
             .map(|methods| methods.join(",")),
         strict_security_server_offer: !security_client.is_empty(),
-        enable_initial_reject_fallback: false,
+        enable_initial_reject_fallback: bool_at_or_omit(
+            register,
+            "/enable_initial_reject_fallback",
+        )?
+        .unwrap_or(false),
         use_plain_digest_placeholder: false,
-        require_sec_agree_headers: bool_at(register, "/require_sec_agree_headers").unwrap_or(false),
-        // RFC 3329 §2.3: Require and Proxy-Require travel together. The
-        // builder already gates this on require_sec_agree, so defaulting it on
-        // only takes effect once we actually send Require -- either because
-        // the bundle marks security_agreement=required or because the core
-        // answered 421 and we escalated. Maxis answers 400 Bad Request to a
-        // Require without the matching Proxy-Require.
-        proxy_require_sec_agree_headers: bool_at(register, "/proxy_require_sec_agree_headers")
-            .unwrap_or(true),
+        require_sec_agree_headers: bool_at_or_omit(register, "/require_sec_agree_headers")?
+            .unwrap_or(false),
+        proxy_require_sec_agree_headers: bool_at_or_omit(
+            register,
+            "/proxy_require_sec_agree_headers",
+        )?
+        .unwrap_or(false),
         sec_agree_mode,
         security_client_mechanisms: security_client,
         live_header_variant_set: "catalog_v7".to_string(),
         expires_seconds: u32_at(register, "/requested_expires_seconds")
             .unwrap_or(profiles::DEFAULT_REGISTER_EXPIRES_SECONDS),
         access_network_info: pani,
+        pani_identity_policy,
+        cellular_network_info,
+        cni_identity_policy,
         contact_mode: string_at(register, "/contact_mode")
             .unwrap_or("standard")
             .to_string(),
         contact_param_order,
-        always_add_sip_instance: bool_at(register, "/always_add_sip_instance").unwrap_or(false),
-        enable_cellular_network_info: bool_at(register, "/enable_cellular_network_info")
-            .unwrap_or(false),
+        // Stable flow identity is part of the generic registration baseline.
+        // CNI is conditionally applicable and may disclose serving-cell data;
+        // only an explicit carrier/database policy enables it.
+        always_add_sip_instance: bool_at_or_omit(register, "/always_add_sip_instance")?
+            .unwrap_or(true),
+        enable_cellular_network_info,
         temporary_status_codes: u16_array_at(register, "/temporary_status_codes")
             .unwrap_or_else(|| profiles::DEFAULT_TEMPORARY_STATUS_CODES.to_vec()),
         forbidden_status_codes: u16_array_at(register, "/forbidden_status_codes")
@@ -1468,6 +1631,56 @@ fn string_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
 
 fn bool_at(value: &Value, pointer: &str) -> Option<bool> {
     value.pointer(pointer).and_then(Value::as_bool)
+}
+
+fn access_identity_policy_at(
+    value: &Value,
+    pointer: &str,
+) -> Result<Option<AccessIdentityPolicy>, String> {
+    let Some(raw) = string_at(value, pointer) else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    let policy = match normalized.as_str() {
+        "omit" => AccessIdentityPolicy::Omit,
+        "static" => AccessIdentityPolicy::Static,
+        "dynamic_if_known" => AccessIdentityPolicy::DynamicIfKnown,
+        "required_dynamic" => AccessIdentityPolicy::RequiredDynamic,
+        _ => {
+            return Err(format!(
+                "carrier_catalog_access_identity_policy_invalid:{pointer}:{raw}"
+            ));
+        }
+    };
+    Ok(Some(policy))
+}
+
+/// Database bundles express "explicitly do not send this header" as the
+/// string `omit`.  Treat that exactly like `false`: the caller receives
+/// `Some(false)` and its default no longer kicks in, while a missing field
+/// still returns `None` so the baseline default applies.  `"true"`/`"false"`
+/// strings are accepted as well for bundles that store booleans as text.
+///
+/// An unrecognised value is an error, not a `None`.  Returning `None` would
+/// hand the decision back to the caller's baseline, so a bundle saying `"no"`
+/// or `"disabled"` — plainly meaning "do not send" — would enable a header
+/// whose default is `true`, silently and on the registration path.  A bad
+/// value is a bundle authoring mistake and must be visible.
+fn bool_at_or_omit(value: &Value, pointer: &str) -> Result<Option<bool>, String> {
+    match value.pointer(pointer) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(true)),
+            "false" | "omit" => Ok(Some(false)),
+            other => Err(format!(
+                "carrier_catalog_register_bool_invalid:{pointer}:{other}"
+            )),
+        },
+        Some(other) => Err(format!(
+            "carrier_catalog_register_bool_invalid:{pointer}:{other}"
+        )),
+    }
 }
 
 fn u16_at(value: &Value, pointer: &str) -> Option<u16> {
@@ -1803,6 +2016,169 @@ mod tests {
         (catalog, path)
     }
 
+    fn rewrite_fixture_profile_network(
+        path: &std::path::Path,
+        plmn: &str,
+        home_domain: Option<&str>,
+        epdg_address: Option<&str>,
+    ) {
+        let conn = Connection::open(path).expect("open fixture for network rewrite");
+        conn.execute(
+            "UPDATE profile_match_rules
+                SET plmn = ?1, imsi_prefix = ?2
+              WHERE profile_id = 'test-v7-23433'",
+            params![plmn, format!("{plmn}0")],
+        )
+        .expect("rewrite fixture PLMN");
+        let config_json = conn
+            .query_row(
+                "SELECT config_json FROM carrier_profiles WHERE profile_id = 'test-v7-23433'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read fixture config");
+        let mut config: Value = serde_json::from_str(&config_json).expect("parse fixture config");
+        let ims = config
+            .pointer_mut("/ims")
+            .and_then(Value::as_object_mut)
+            .expect("fixture IMS object");
+        match home_domain {
+            Some(domain) => {
+                ims.insert("home_domain".to_string(), Value::String(domain.to_string()));
+            }
+            None => {
+                ims.remove("home_domain");
+            }
+        }
+        let vowifi = config
+            .pointer_mut("/access/vowifi")
+            .and_then(Value::as_object_mut)
+            .expect("fixture VoWiFi access object");
+        if plmn.starts_with("999") {
+            let ike = vowifi
+                .get_mut("ike")
+                .and_then(Value::as_object_mut)
+                .expect("fixture VoWiFi IKE object");
+            ike.insert(
+                "identities".to_string(),
+                serde_json::json!({
+                    "idi": [{
+                        "identity_type": "id_rfc822_addr",
+                        "source": "configured_template",
+                        "value_template": "private-{imsi}@{ims_realm}"
+                    }],
+                    "idr": [{ "source": "epdg_fqdn" }]
+                }),
+            );
+        }
+        match epdg_address {
+            Some(address) => {
+                vowifi.insert(
+                    "epdg".to_string(),
+                    serde_json::json!([{ "address": address, "port": 500 }]),
+                );
+            }
+            None => {
+                vowifi.remove("epdg");
+            }
+        }
+        conn.execute(
+            "UPDATE carrier_profiles SET config_json = ?1 WHERE profile_id = 'test-v7-23433'",
+            [serde_json::to_string(&config).expect("serialize fixture config")],
+        )
+        .expect("write fixture config");
+    }
+
+    #[test]
+    fn private_catalog_projection_requires_and_preserves_explicit_network_endpoints() {
+        let (catalog, path) = fixture();
+        rewrite_fixture_profile_network(
+            &path,
+            "99999",
+            Some("ims.private.example"),
+            Some("epdg.private.example"),
+        );
+
+        let lte = catalog
+            .get("test-v7-23433", CatalogAccessKind::LteEpc)
+            .expect("explicit private LTE query")
+            .expect("explicit private LTE projection");
+        assert_eq!(lte.record.ims.domain, "ims.private.example");
+        assert!(!lte.record.ims.domain.contains("3gppnetwork.org"));
+        assert!(lte
+            .record
+            .meta
+            .source_refs
+            .iter()
+            .all(|source| !source.starts_with("unverified-3gpp-standard-fallback:")));
+
+        let wifi = catalog
+            .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+            .expect("explicit private VoWiFi query")
+            .expect("explicit private VoWiFi projection");
+        assert_eq!(wifi.record.epdg.host, "epdg.private.example");
+        assert!(!wifi.record.epdg.host.contains("3gppnetwork.org"));
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn private_catalog_projection_rejects_missing_ims_home_domain() {
+        let (catalog, path) = fixture();
+        rewrite_fixture_profile_network(&path, "99999", None, Some("epdg.private.example"));
+
+        let error = catalog
+            .get("test-v7-23433", CatalogAccessKind::LteEpc)
+            .expect_err("private IMS domain must be explicit");
+        assert_eq!(
+            error,
+            "carrier_catalog_private_ims_home_domain_required:test-v7-23433"
+        );
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn private_catalog_projection_rejects_missing_vowifi_epdg() {
+        let (catalog, path) = fixture();
+        rewrite_fixture_profile_network(&path, "99999", Some("ims.private.example"), None);
+
+        let error = catalog
+            .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+            .expect_err("private ePDG must be explicit");
+        assert_eq!(error, "carrier_catalog_private_epdg_required:test-v7-23433");
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn public_catalog_projection_derives_missing_standard_domain_and_epdg() {
+        let (catalog, path) = fixture();
+        rewrite_fixture_profile_network(&path, "23433", None, None);
+
+        let wifi = catalog
+            .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+            .expect("public standards-derived query")
+            .expect("public standards-derived projection");
+        assert_eq!(wifi.record.ims.domain, "ims.mnc033.mcc234.3gppnetwork.org");
+        assert_eq!(
+            wifi.record.epdg.host,
+            "epdg.epc.mnc033.mcc234.pub.3gppnetwork.org"
+        );
+        assert!(wifi
+            .record
+            .meta
+            .source_refs
+            .contains(&"unverified-3gpp-standard-fallback:ims-home-domain".to_string()));
+        assert!(wifi
+            .record
+            .meta
+            .source_refs
+            .contains(&"unverified-3gpp-standard-fallback:epdg-operator-identifier".to_string()));
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
     #[test]
     fn resolves_compiled_v7_json_for_lte_and_vowifi() {
         let (catalog, path) = fixture();
@@ -1851,14 +2227,11 @@ mod tests {
     }
 
     #[test]
-    fn voice_service_declaration_drives_mmtel_features_without_contact_parameters() {
+    fn voice_service_declaration_enables_mmtel_on_each_voice_access() {
         let (catalog, path) = fixture();
-        // The fixture bundle declares services.volte/vowifi but carries no
-        // sip.common.contact_parameters -- the shape of essentially every real
-        // bundle. Deriving MMTEL from the absent parameter list alone left the
-        // REGISTER Contact without +g.3gpp.icsi-ref, so the S-CSCF never
-        // treated the registration as voice capable and MT calls were dropped
-        // while REGISTER still answered 200 OK.
+        // The fixture declares services.volte/vowifi but carries no explicit
+        // Contact parameters. Both voice-capable access legs use the standard
+        // MMTEL baseline; an SMS-only binding must be explicit in the bundle.
         for access in [CatalogAccessKind::LteEpc, CatalogAccessKind::WifiEpdg] {
             let resolved = catalog
                 .resolve_for_imsi("234330123456789", None, access)
@@ -1871,7 +2244,7 @@ mod tests {
             );
             assert!(
                 resolved.record.ims.register.include_mmtel_features,
-                "{} should advertise MMTEL from the service declaration",
+                "{} should advertise MMTEL for a declared voice service",
                 access.as_str()
             );
         }
@@ -2075,13 +2448,166 @@ mod tests {
         // are filtered out; the supported AES-CBC/SHA1 entry remains.
         assert_eq!(wifi.record.ikev2.ike_proposals, ["aes128-sha1-modp2048"]);
         assert_eq!(wifi.record.ikev2.esp_proposals, ["aes128-sha1"]);
-        // security_agreement removed -> mode auto -> baseline Security-Client applied.
+        // Missing security_agreement is challenge-driven rather than forced.
+        assert_eq!(wifi.record.ims.register.sec_agree_mode, "auto");
+        assert!(!wifi.record.ims.register.include_pani_initial);
+        assert!(!wifi.record.ims.register.include_pani_authenticated);
+        assert!(!wifi.record.ims.register.enable_cellular_network_info);
+        assert!(wifi.record.ims.register.always_add_sip_instance);
         assert_eq!(
             wifi.record.ims.register.security_client_mechanisms,
             ["hmac-sha-1-96/aes-cbc/esp/trans"]
         );
 
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn explicit_omit_in_database_bundle_disables_optional_register_headers() {
+        let (catalog, path) = fixture();
+        {
+            let conn = Connection::open(&path).expect("open fixture for mutation");
+            conn.execute_batch(
+                "INSERT INTO carrier_profiles(
+                     profile_id, carrier_id, display_name, profile_kind,
+                     priority, confidence, lte_ims_status, nr_ims_status,
+                     vowifi_status, profile_asset_id, config_json
+                 )
+                 SELECT 'test-v7-23438', carrier_id, 'Test v7 omit', profile_kind,
+                        20, confidence, lte_ims_status, nr_ims_status,
+                        'ready', profile_asset_id,
+                        json_set(
+                            config_json,
+                            '$.sip.common.register.security_agreement', 'omit',
+                            '$.sip.common.register.include_pani_initial', 'omit',
+                            '$.sip.common.register.include_pani_authenticated', 'omit',
+                            '$.sip.common.register.include_route_header', 'omit',
+                            '$.sip.common.register.include_p_preferred_identity', 'omit',
+                            '$.sip.common.register.always_add_sip_instance', 'omit',
+                            '$.sip.common.register.enable_cellular_network_info', 'omit',
+                            '$.sip.common.register.require_sec_agree_headers', 'omit',
+                            '$.sip.common.register.proxy_require_sec_agree_headers', 'omit'
+                        )
+                 FROM carrier_profiles WHERE profile_id = 'test-v7-23433';
+                 INSERT INTO profile_match_rules VALUES (
+                     7, 'test-v7-23438', 1, '23438', '234380', NULL, NULL, NULL, NULL, 0
+                 );",
+            )
+            .expect("insert omit profile");
+        }
+
+        let lte = catalog
+            .resolve_for_imsi("234380123456789", None, CatalogAccessKind::LteEpc)
+            .expect("query")
+            .expect("profile");
+        let register = &lte.record.ims.register;
+        // `omit` is an explicit instruction, not a missing field: the
+        // baseline defaults (PANI on, CNI on, sip.instance on, sec-agree
+        // required) must not kick in for these switches.
+        assert_eq!(register.sec_agree_mode, "disabled");
+        assert!(!register.include_pani_initial);
+        assert!(!register.include_pani_authenticated);
+        assert!(!register.include_route_header);
+        assert!(!register.include_p_preferred_identity);
+        assert!(!register.require_sec_agree_headers);
+        assert!(!register.proxy_require_sec_agree_headers);
+        assert!(!register.always_add_sip_instance);
+        assert!(!register.enable_cellular_network_info);
+        // The source bundle's explicit Security-Client list is preserved, but
+        // `disabled` means the live layer never sends the RFC 3329 offer.
+        assert_eq!(
+            register.security_client_mechanisms,
+            ["hmac-sha-1-96/aes-cbc/esp/trans"]
+        );
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    /// A tri-state switch only has three legal spellings: `true`, `false` and
+    /// `omit`.  Anything else used to return `None`, which handed the decision
+    /// to the caller's baseline — so a bundle saying `"no"` enabled a header
+    /// whose default is `true`.  The projection must refuse the row instead.
+    #[test]
+    fn wrongly_typed_register_switch_is_rejected_instead_of_defaulting() {
+        for (bad_value, expected_fragment) in [
+            ("'no'", "no"),
+            ("'yes'", "yes"),
+            ("'disabled'", "disabled"),
+            ("1", "1"),
+        ] {
+            let (catalog, path) = fixture();
+            {
+                let conn = Connection::open(&path).expect("open fixture for mutation");
+                conn.execute_batch(&format!(
+                    "UPDATE carrier_profiles
+                        SET config_json = json_set(
+                            config_json,
+                            '$.sip.common.register.always_add_sip_instance',
+                            {bad_value}
+                        )
+                      WHERE profile_id = 'test-v7-23433';"
+                ))
+                .expect("write wrongly typed switch");
+            }
+
+            let error = catalog
+                .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+                .expect_err("a wrongly typed switch must not fall back to the default");
+            assert!(
+                error.contains("carrier_catalog_register_bool_invalid"),
+                "unexpected error for {bad_value}: {error}"
+            );
+            assert!(
+                error.contains("always_add_sip_instance"),
+                "error must name the offending pointer, got: {error}"
+            );
+            assert!(
+                error.contains(expected_fragment),
+                "error must quote the offending value, got: {error}"
+            );
+
+            std::fs::remove_file(path).expect("remove fixture");
+        }
+    }
+
+    /// `true`, `false` and `omit` all stay accepted, in both JSON-native and
+    /// string spellings, so tightening the error path above cannot reject a
+    /// bundle that was previously valid.
+    #[test]
+    fn legal_register_switch_spellings_are_all_still_accepted() {
+        for (value, expected) in [
+            ("json('true')", true),
+            ("json('false')", false),
+            ("'true'", true),
+            ("'false'", false),
+            ("'omit'", false),
+            ("'OMIT'", false),
+        ] {
+            let (catalog, path) = fixture();
+            {
+                let conn = Connection::open(&path).expect("open fixture for mutation");
+                conn.execute_batch(&format!(
+                    "UPDATE carrier_profiles
+                        SET config_json = json_set(
+                            config_json,
+                            '$.sip.common.register.always_add_sip_instance',
+                            {value}
+                        )
+                      WHERE profile_id = 'test-v7-23433';"
+                ))
+                .expect("write legal switch value");
+            }
+
+            let profile = catalog
+                .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+                .unwrap_or_else(|error| panic!("{value} must stay accepted, got: {error}"))
+                .unwrap_or_else(|| panic!("{value} must still resolve a profile"));
+            assert_eq!(
+                profile.record.ims.register.always_add_sip_instance, expected,
+                "{value} projected to the wrong boolean"
+            );
+
+            std::fs::remove_file(path).expect("remove fixture");
+        }
     }
 
     #[test]

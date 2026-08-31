@@ -35,7 +35,7 @@ use api::handlers::*;
 use hardware::cellular::modem_manager::ensure_nm_modem_profile;
 use hardware::sim::esim::EsimSupervisor;
 use platform::config::{get_default_config_path, ConfigManager};
-use platform::config_maintenance::{backup_database, export_json, import_json, restore_database};
+use platform::config_maintenance;
 use platform::db::Database;
 use services::event_bus::AppEventBus;
 use services::network::device_network::DdnsManager;
@@ -427,7 +427,10 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         println!("secondary-qmi-init: no QMI control port found; nothing to do");
         if !dry_run && std::env::var_os("NOTIFY_SOCKET").is_some() {
             let _ = tokio::process::Command::new("systemd-notify")
-                .args(["--ready", "--status=no QMI control port; primary QMI fallback"])
+                .args([
+                    "--ready",
+                    "--status=no QMI control port; primary QMI fallback",
+                ])
                 .status()
                 .await;
         }
@@ -722,9 +725,11 @@ async fn main() -> Result<()> {
         return run_extract_zip(archive, target);
     }
     if let Some(CliCommand::Auth { command }) = &cli.command {
-        let db = Database::new(get_data_db_path())?;
-        let config_manager =
-            ConfigManager::try_new(get_default_config_path()).map_err(anyhow::Error::msg)?;
+        // One database instance serves both the auth tables and the
+        // configuration's per-line half.
+        let db = Arc::new(Database::new(get_data_db_path())?);
+        let config_manager = ConfigManager::try_new(get_default_config_path(), Arc::clone(&db))
+            .map_err(anyhow::Error::msg)?;
         let security = config_manager.get_security();
         return match command {
             AuthCommand::ResetPassword => {
@@ -734,50 +739,65 @@ async fn main() -> Result<()> {
         };
     }
     if let Some(CliCommand::Config { command }) = &cli.command {
+        // Configuration spans the text file and the application database, so
+        // every command below names both.
         let config_path = get_default_config_path();
+        let database_path = get_data_db_path();
+        let report_rollback = |rollback: &config_maintenance::RollbackPaths, verb: &str| match (
+            &rollback.database,
+            &rollback.config_file,
+        ) {
+            (None, None) => println!("Configuration {verb} onto a device with nothing to keep"),
+            _ => {
+                println!("Configuration {verb}. Kept for rollback:");
+                if let Some(path) = &rollback.database {
+                    println!("  database:    {}", path.display());
+                }
+                if let Some(path) = &rollback.config_file {
+                    println!("  config file: {}", path.display());
+                }
+            }
+        };
         return match command {
             ConfigCommand::Backup { output } => {
-                let override_rows =
-                    backup_database(&config_path, output).map_err(anyhow::Error::msg)?;
+                let summary = config_maintenance::backup(&config_path, &database_path, output)
+                    .map_err(anyhow::Error::msg)?;
+                println!("Configuration backed up to {}", output.display());
                 println!(
-                    "Configuration backup created at {} ({} SIM override rows)",
-                    output.display(),
-                    override_rows
+                    "  {} line profiles, {} modem slots, {} reader slots, {} SIM overrides",
+                    summary.line_profiles,
+                    summary.modem_slots,
+                    summary.standalone_sim_slots,
+                    summary.overrides
                 );
+                if config_path.exists() {
+                    println!("  the config file was saved beside the snapshot");
+                }
                 Ok(())
             }
             ConfigCommand::Export { output } => {
-                let override_rows =
-                    export_json(&config_path, output).map_err(anyhow::Error::msg)?;
+                let summary = config_maintenance::export_json(&config_path, &database_path, output)
+                    .map_err(anyhow::Error::msg)?;
+                println!("Configuration exported to {}", output.display());
                 println!(
-                    "Configuration export created at {} ({} SIM override rows)",
-                    output.display(),
-                    override_rows
+                    "  {} line profiles, {} modem slots, {} reader slots, {} SIM overrides",
+                    summary.line_profiles,
+                    summary.modem_slots,
+                    summary.standalone_sim_slots,
+                    summary.overrides
                 );
                 Ok(())
             }
             ConfigCommand::Import { input } => {
-                let rollback = import_json(&config_path, input).map_err(anyhow::Error::msg)?;
-                if let Some(rollback) = rollback {
-                    println!(
-                        "Configuration imported; rollback snapshot retained at {}",
-                        rollback.display()
-                    );
-                } else {
-                    println!("Configuration imported into a new database");
-                }
+                let rollback = config_maintenance::import_json(&config_path, &database_path, input)
+                    .map_err(anyhow::Error::msg)?;
+                report_rollback(&rollback, "imported");
                 Ok(())
             }
             ConfigCommand::Restore { input } => {
-                let rollback = restore_database(&config_path, input).map_err(anyhow::Error::msg)?;
-                if let Some(rollback) = rollback {
-                    println!(
-                        "Configuration restored; previous database retained at {}",
-                        rollback.display()
-                    );
-                } else {
-                    println!("Configuration restored into a new database");
-                }
+                let rollback = config_maintenance::restore(&config_path, &database_path, input)
+                    .map_err(anyhow::Error::msg)?;
+                report_rollback(&rollback, "restored");
                 Ok(())
             }
         };
@@ -837,9 +857,6 @@ async fn main() -> Result<()> {
         ),
     }
 
-    let sim_overrides =
-        Arc::new(connectivity::modems::ims::profile_override::SimOverrideStore::default());
-
     let e911 = Arc::new(services::e911::orchestrator::E911Orchestrator::new(
         services::e911::state_store::E911StateStore::default(),
         services::e911::registry::E911ProviderRegistry::default(),
@@ -854,14 +871,30 @@ async fn main() -> Result<()> {
     let device_kind = hardware::devices::detect_device_kind();
     info!(?device_kind, "Detected hardware device kind");
 
-    // 创建 SMS 数据库（存储在可执行文件同级目录）
+    // 创建应用数据库（存储在可执行文件同级目录）
+    //
+    // This has to come before both the override store and the configuration
+    // manager: per-SIM IMS overrides are rows in it, and the configuration's
+    // per-line half is read from it at load time.
     let db_path = get_data_db_path();
     let app_db = Arc::new(Database::new(db_path)?);
 
+    // Per-SIM IMS overrides live beside the other per-line records, so a device
+    // backup captures them. `SIMADMIN_OVERRIDES_DIR` still selects the file
+    // backend for recovery.
+    let sim_overrides = Arc::new(
+        connectivity::modems::ims::profile_override::SimOverrideStore::resolve(Arc::clone(&app_db)),
+    );
+
     // 初始化配置管理器
+    //
+    // The main program settings come from the text file; per-line profiles, slot
+    // maps, notification and automation records come from the database.
     let config_path = get_default_config_path();
     info!(path = ?config_path, "Loading config");
-    let config_manager = Arc::new(ConfigManager::try_new(config_path).map_err(anyhow::Error::msg)?);
+    let config_manager = Arc::new(
+        ConfigManager::try_new(config_path, Arc::clone(&app_db)).map_err(anyhow::Error::msg)?,
+    );
     let cell_monitoring_active =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let line_registry = Arc::new(services::line_registry::LineRuntimeRegistry::with_config(
@@ -911,8 +944,7 @@ async fn main() -> Result<()> {
     let diagnostic_log_sink =
         services::system::diagnostic_log::spawn_diagnostic_logger(Arc::clone(&config_manager));
     let event_bus = Arc::new(
-        AppEventBus::new(Arc::clone(&app_db))
-            .with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
+        AppEventBus::new(Arc::clone(&app_db)).with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
     );
     let system_event_emitter = Arc::new(SystemEventEmitter::new(
         Arc::clone(&notification_sender),
@@ -984,7 +1016,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 启动 SMS 监听线程
+    // 启动 SMS 监听线程。MT 短信会通过 broadcast 桥接到 Asterisk trunk，
+    // 由 AppState 就绪后的转发任务负责发布（见 spawn_modem_mt_sms_bridge）。
+    let (modem_mt_sms_tx, modem_mt_sms_rx) =
+        tokio::sync::broadcast::channel::<platform::db::SmsMessage>(256);
     {
         let conn_clone = Connection::system().await?;
         let db_clone = Arc::clone(&app_db);
@@ -992,6 +1027,7 @@ async fn main() -> Result<()> {
         let sms_config_clone = Arc::clone(&config_manager);
         let sms_line_registry = Arc::clone(&line_registry);
         let resync_rx = sms_resync_rx;
+        let mt_sms_tx = modem_mt_sms_tx;
         tokio::spawn(async move {
             let _ = services::messaging::sms_listener::start_sms_listener(
                 conn_clone,
@@ -999,6 +1035,7 @@ async fn main() -> Result<()> {
                 notification_clone,
                 sms_config_clone,
                 sms_line_registry,
+                mt_sms_tx,
                 resync_rx,
             )
             .await;
@@ -1063,6 +1100,8 @@ async fn main() -> Result<()> {
 
     api::handlers::spawn_call_monitor(app_state.clone());
     spawn_runtime_event_bridge(app_state.clone());
+    spawn_trunk_sms_bridge(app_state.clone());
+    spawn_modem_mt_sms_bridge(app_state.clone(), modem_mt_sms_rx);
 
     // Restore only explicitly enabled per-line data and airplane-mode intents.
     {
@@ -1231,6 +1270,349 @@ async fn main() -> Result<()> {
     spawn_vowifi_auto_restore(app_state.clone());
     spawn_volte_auto_restore(app_state.clone());
 
+    let app = build_router(app_state, cors);
+
+    // Start server - 显示版权信息
+    info!(
+        version = env!("APP_VERSION"),
+        branch = env!("GIT_BRANCH"),
+        commit = env!("GIT_COMMIT"),
+        "SimAdmin - Debian SIM Management Service"
+    );
+    info!("Copyright © 2026 GitHub 3899 - SimAdmin");
+
+    // 绑定端口，如果被占用则轮询等待（最多 30 秒）
+    let listener = bind_with_retry(&args.host, args.port, 30).await?;
+    info!(addr = %bind_addr, "Server listening");
+    // 使用优雅关闭
+    axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_controller))
+        .await?;
+
+    // Only reached once the drain completes, which is what the shutdown signal
+    // above makes possible. Releasing the data sessions here is what keeps the
+    // DATA netdev from being left inside a UE namespace.
+    release_data_sessions(&shutdown_registry).await;
+
+    // Exit explicitly rather than returning. Returning drops the tokio runtime,
+    // and that drop blocks until every `spawn_blocking` task has finished --
+    // but several of them never finish by design. `spawn_tun_reader` is the
+    // clearest: it re-checks its shutdown flag only at the top of its loop and
+    // otherwise parks in a blocking `read()` on the IMS TUN fd, so once the
+    // flag is set it still waits for a packet that may never arrive.
+    //
+    // That drop, not the drain, is what held the process for the full 8s
+    // watchdog on the device: the drain finished in 8ms and the bearers were
+    // released 155ms in, after which the log went completely silent until the
+    // watchdog called `exit`. Everything that has to outlive the process has
+    // already happened by this point, so exiting here is deliberate rather
+    // than a shortcut -- and it demotes the watchdog to the backstop it was
+    // meant to be.
+    info!("Shutdown complete; exiting");
+    std::process::exit(0);
+}
+
+/// Bridge SIP MESSAGE requests received by each line's Asterisk trunk into the
+/// existing SMS sender, and forward VoLTE MT SMS toward the trunk as SIP
+/// MESSAGE. Both directions are deliberately independent from the voice event
+/// stream so SMS cannot affect call state or media routing.
+fn spawn_trunk_sms_bridge(app: AppState) {
+    tokio::spawn(async move {
+        let mut attached = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+        loop {
+            for line in app.line_registry.all().await {
+                let line_id = line.binding().line_id;
+                if attached.contains_key(&line_id) {
+                    continue;
+                }
+                let mut requests = line.trunk.operator_link().subscribe_sms_requests();
+                let mut volte_mt = line.volte_live.subscribe_mt_sms();
+                let app_task = app.clone();
+                let attach_id = line_id.clone();
+                let handle = tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            maybe = requests.recv() => {
+                                match maybe {
+                                    Ok(request) => {
+                                        let profile = app_task.config_manager.get_line_profile(&attach_id);
+                                        let target = if request.to.trim().is_empty() {
+                                            request.from.clone()
+                                        } else {
+                                            request.to.clone()
+                                        };
+                                        if let Err(error) = crate::api::handlers::send_sms_on_line_with_vowifi_only(
+                                            &app_task,
+                                            &attach_id,
+                                            &target,
+                                            &request.body,
+                                            profile.trunk.vowifi_only,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(line_id = %attach_id, error = %error, "Trunk SIP MESSAGE SMS send failed");
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                        tracing::warn!(line_id = %attach_id, skipped, "Trunk SMS receiver lagged");
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                            maybe = volte_mt.recv() => {
+                                match maybe {
+                                    Ok(sms) => {
+                                        crate::api::handlers::publish_sms_to_trunk(&app_task, &sms).await;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                        tracing::warn!(line_id = %attach_id, skipped, "VoLTE MT SMS receiver lagged");
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        }
+                    }
+                });
+                attached.insert(line_id, handle);
+            }
+            attached.retain(|_, handle| !handle.is_finished());
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// Forward ModemManager (CS) MT SMS toward each line's Asterisk trunk as SIP
+/// MESSAGE. The listener itself runs before AppState exists, so this task owns
+/// the broadcast receiver and publishes once the app state is available.
+fn spawn_modem_mt_sms_bridge(
+    app: AppState,
+    mut rx: tokio::sync::broadcast::Receiver<platform::db::SmsMessage>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(sms) => crate::api::handlers::publish_sms_to_trunk(&app, &sms).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "Modem MT SMS receiver lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// Deactivate every DATA bearer before the process exits.
+///
+/// `SecondaryDataRuntime::stop` is what moves the DATA netdev back out of the UE
+/// namespace and releases the retained QMI client. Every other caller is either
+/// an API handler or the reconcile path that reacts to a SIM going away, so
+/// before this existed a normal `systemctl restart simadmin` never ran it at
+/// all: the netdev stayed in the namespace, the next process re-attached to that
+/// same namespace, and the data interface was invisible to a resolver that only
+/// enumerates the host. See
+/// [`crate::platform::netns::reclaim_all_stranded_hardware_links`], which cleans
+/// up after the cases this cannot cover (SIGKILL, power loss).
+///
+/// Bounded, because systemd's `TimeoutStopSec` is the next thing in line and a
+/// QMI deactivate can hang on a wedged baseband. Exceeding the bound is not
+/// fatal: the startup reclaim recovers whatever is left behind.
+async fn release_data_sessions(line_registry: &services::line_registry::LineRuntimeRegistry) {
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let lines = line_registry.all().await;
+    if lines.is_empty() {
+        return;
+    }
+
+    let released = tokio::time::timeout(BUDGET, async {
+        for line in lines {
+            let line_id = line.binding().line_id;
+            if line.secondary_data.interface().await.is_none() {
+                continue;
+            }
+            info!(line_id = %line_id, "Releasing DATA bearer for shutdown");
+            line.secondary_data.stop().await;
+        }
+    })
+    .await;
+
+    if released.is_err() {
+        warn!(
+            timeout_s = BUDGET.as_secs(),
+            "DATA bearer release did not finish before the shutdown budget; \
+             the next start will reclaim any netdev left in a namespace"
+        );
+    }
+}
+
+/// 绑定端口，如果被占用则轮询等待
+fn display_bind_addr(host: &str, port: u16) -> String {
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+async fn bind_listener(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let normalized_host = host.trim_matches(|c| c == '[' || c == ']');
+    if normalized_host == "::" {
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_only_v6(false)?;
+        socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())?;
+        socket.listen(1024)?;
+        socket.set_nonblocking(true)?;
+        let listener: std::net::TcpListener = socket.into();
+        return tokio::net::TcpListener::from_std(listener);
+    }
+
+    tokio::net::TcpListener::bind((normalized_host, port)).await
+}
+
+async fn bind_with_retry(
+    host: &str,
+    port: u16,
+    max_retries: u32,
+) -> Result<tokio::net::TcpListener> {
+    use std::time::Duration;
+    let addr = display_bind_addr(host, port);
+
+    for i in 0..max_retries {
+        match bind_listener(host, port).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => {
+                if i == 0 {
+                    warn!(addr = %addr, "Port busy, waiting for release...");
+                }
+                if i + 1 < max_retries {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    return Err(anyhow::anyhow!("Failed to bind to {}: {}", addr, e));
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// 监听 Ctrl+C 和 SIGTERM 信号，用于优雅关闭
+///
+/// Firing `controller` is what lets the drain finish at all. Axum waits for
+/// in-flight responses, and the SSE stream at `/api/events` never ends on its
+/// own, so an open browser tab would otherwise hold the drain until the
+/// watchdog below force-exits -- skipping the session teardown that returns
+/// DATA netdevs to the host namespace.
+async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownController) {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C signal handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    warn!("Shutdown signal received; starting graceful shutdown");
+    // Before the watchdog, so long-lived responses get the whole window to end.
+    controller.trigger();
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
+        std::process::exit(0);
+    });
+}
+
+#[cfg(test)]
+mod udev_rule_tests {
+    use super::secondary_qmi_udev_rules;
+
+    /// The two rules live in different subsystems and getting that wrong is
+    /// silent: a `net` device never matches `SUBSYSTEM=="wwan"`, so the rule
+    /// loads, does nothing, and the interface stays available to ModemManager.
+    #[test]
+    fn the_control_port_and_the_netdev_use_their_own_subsystems() {
+        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+        assert_eq!(rules.len(), 2, "{rules:?}");
+
+        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
+        assert!(rules[0].contains(r#"KERNEL=="wwan0at2""#), "{rules:?}");
+
+        assert!(rules[1].contains(r#"SUBSYSTEM=="net""#), "{rules:?}");
+        assert!(rules[1].contains(r#"KERNEL=="wwan1""#), "{rules:?}");
+
+        for rule in &rules {
+            assert!(rule.contains(r#"ENV{ID_MM_PORT_IGNORE}="1""#), "{rule}");
+        }
+    }
+
+    /// Reserving the data interface is the whole point of the second rule:
+    /// ModemManager tags it ID_MM_CANDIDATE=1 and was observed binding its own
+    /// `ims` APN bearer to wwan1, after which every DATA6 activation failed
+    /// with CallFailed / PolicyMismatch.
+    #[test]
+    fn the_data_interface_is_reserved_whenever_one_is_known() {
+        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+        assert!(
+            rules.iter().any(|rule| rule.contains(r#"KERNEL=="wwan1""#)),
+            "the netdev must be hidden, not just the control port: {rules:?}"
+        );
+    }
+
+    /// A platform may expose the control port without a paired interface.
+    /// Emitting a rule with an empty KERNEL== would match everything in the
+    /// `net` subsystem and hide every interface on the host.
+    #[test]
+    fn no_netdev_means_no_net_rule_at_all() {
+        let rules = secondary_qmi_udev_rules("wwan0qmi1", None);
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.contains(r#"SUBSYSTEM=="net""#)),
+            "{rules:?}"
+        );
+        assert!(
+            !rules.iter().any(|rule| rule.contains(r#"KERNEL=="""#)),
+            "an empty KERNEL== would match every net device: {rules:?}"
+        );
+    }
+
+    /// Port names are per-platform, so nothing may be hardcoded: the same
+    /// channel surfaces as wwan0at2 here and wwan0qmi1 elsewhere.
+    #[test]
+    fn rules_follow_the_observed_names() {
+        let rules = secondary_qmi_udev_rules("wwan3qmi7", Some("wwan9"));
+        assert!(rules[0].contains(r#"KERNEL=="wwan3qmi7""#), "{rules:?}");
+        assert!(rules[1].contains(r#"KERNEL=="wwan9""#), "{rules:?}");
+    }
+}
+
+/// Assemble the HTTP router: public routes, then the authenticated
+/// routes merged in behind `auth_middleware`, then state, CORS and the
+/// SPA fallback.
+///
+/// Extracted from `main` so a test can build the real router. Nothing here
+/// is conditional on having booted: given an `AppState` and a `CorsLayer`
+/// it returns exactly the router the binary serves.
+fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
     let protected_routes = Router::new()
         .route(
             "/api/events",
@@ -1632,8 +2014,16 @@ async fn main() -> Result<()> {
             get(get_vowifi_carrier_profile_icon_handler).options(options_handler),
         )
         .route(
+            "/api/vowifi/carrier-profiles/detail/{origin}/{profile_id}",
+            get(get_vowifi_carrier_profile_handler).options(options_handler),
+        )
+        .route(
             "/api/vowifi/carrier-catalog/status",
             get(get_carrier_catalog_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/carrier-catalog/assets",
+            get(get_carrier_catalog_assets_handler).options(options_handler),
         )
         .route(
             "/api/vowifi/carrier-catalog/install",
@@ -1684,6 +2074,12 @@ async fn main() -> Result<()> {
         .route(
             "/api/volte/lines/{line_id}",
             get(get_volte_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines/{line_id}/profile-selection",
+            get(get_volte_profile_selection_handler)
+                .put(set_volte_profile_selection_handler)
+                .options(options_handler),
         )
         .route(
             "/api/volte/lines/{line_id}/connection",
@@ -1959,244 +2355,758 @@ async fn main() -> Result<()> {
         .layer(cors)
         .fallback(spa_fallback);
 
-    // Start server - 显示版权信息
-    info!(
-        version = env!("APP_VERSION"),
-        branch = env!("GIT_BRANCH"),
-        commit = env!("GIT_COMMIT"),
-        "SimAdmin - Debian SIM Management Service"
-    );
-    info!("Copyright © 2026 GitHub 3899 - SimAdmin");
-
-    // 绑定端口，如果被占用则轮询等待（最多 30 秒）
-    let listener = bind_with_retry(&args.host, args.port, 30).await?;
-    info!(addr = %bind_addr, "Server listening");
-    // 使用优雅关闭
-    axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_controller))
-        .await?;
-
-    // Only reached once the drain completes, which is what the shutdown signal
-    // above makes possible. Releasing the data sessions here is what keeps the
-    // DATA netdev from being left inside a UE namespace.
-    release_data_sessions(&shutdown_registry).await;
-
-    // Exit explicitly rather than returning. Returning drops the tokio runtime,
-    // and that drop blocks until every `spawn_blocking` task has finished --
-    // but several of them never finish by design. `spawn_tun_reader` is the
-    // clearest: it re-checks its shutdown flag only at the top of its loop and
-    // otherwise parks in a blocking `read()` on the IMS TUN fd, so once the
-    // flag is set it still waits for a packet that may never arrive.
-    //
-    // That drop, not the drain, is what held the process for the full 8s
-    // watchdog on the device: the drain finished in 8ms and the bearers were
-    // released 155ms in, after which the log went completely silent until the
-    // watchdog called `exit`. Everything that has to outlive the process has
-    // already happened by this point, so exiting here is deliberate rather
-    // than a shortcut -- and it demotes the watchdog to the backstop it was
-    // meant to be.
-    info!("Shutdown complete; exiting");
-    std::process::exit(0);
+    app
 }
 
-/// Deactivate every DATA bearer before the process exits.
+/// HTTP-level tests against the real router.
 ///
-/// `SecondaryDataRuntime::stop` is what moves the DATA netdev back out of the UE
-/// namespace and releases the retained QMI client. Every other caller is either
-/// an API handler or the reconcile path that reacts to a SIM going away, so
-/// before this existed a normal `systemctl restart simadmin` never ran it at
-/// all: the netdev stayed in the namespace, the next process re-attached to that
-/// same namespace, and the data interface was invisible to a resolver that only
-/// enumerates the host. See
-/// [`crate::platform::netns::reclaim_all_stranded_hardware_links`], which cleans
-/// up after the cases this cannot cover (SIGKILL, power loss).
+/// These need an `AppState`, which needs a D-Bus connection. `Connection::system`
+/// honours `DBUS_SYSTEM_BUS_ADDRESS`, so a session bus can stand in:
 ///
-/// Bounded, because systemd's `TimeoutStopSec` is the next thing in line and a
-/// QMI deactivate can hang on a wedged baseband. Exceeding the bound is not
-/// fatal: the startup reclaim recovers whatever is left behind.
-async fn release_data_sessions(line_registry: &services::line_registry::LineRuntimeRegistry) {
-    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-    let lines = line_registry.all().await;
-    if lines.is_empty() {
-        return;
-    }
-
-    let released = tokio::time::timeout(BUDGET, async {
-        for line in lines {
-            let line_id = line.binding().line_id;
-            if line.secondary_data.interface().await.is_none() {
-                continue;
-            }
-            info!(line_id = %line_id, "Releasing DATA bearer for shutdown");
-            line.secondary_data.stop().await;
-        }
-    })
-    .await;
-
-    if released.is_err() {
-        warn!(
-            timeout_s = BUDGET.as_secs(),
-            "DATA bearer release did not finish before the shutdown budget; \
-             the next start will reclaim any netdev left in a namespace"
-        );
-    }
-}
-
-/// 绑定端口，如果被占用则轮询等待
-fn display_bind_addr(host: &str, port: u16) -> String {
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
-async fn bind_listener(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
-    let normalized_host = host.trim_matches(|c| c == '[' || c == ']');
-    if normalized_host == "::" {
-        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_reuse_address(true)?;
-        socket.set_only_v6(false)?;
-        socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())?;
-        socket.listen(1024)?;
-        socket.set_nonblocking(true)?;
-        let listener: std::net::TcpListener = socket.into();
-        return tokio::net::TcpListener::from_std(listener);
-    }
-
-    tokio::net::TcpListener::bind((normalized_host, port)).await
-}
-
-async fn bind_with_retry(
-    host: &str,
-    port: u16,
-    max_retries: u32,
-) -> Result<tokio::net::TcpListener> {
-    use std::time::Duration;
-    let addr = display_bind_addr(host, port);
-
-    for i in 0..max_retries {
-        match bind_listener(host, port).await {
-            Ok(listener) => return Ok(listener),
-            Err(e) => {
-                if i == 0 {
-                    warn!(addr = %addr, "Port busy, waiting for release...");
-                }
-                if i + 1 < max_retries {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                } else {
-                    return Err(anyhow::anyhow!("Failed to bind to {}: {}", addr, e));
-                }
-            }
-        }
-    }
-    unreachable!()
-}
-
-/// 监听 Ctrl+C 和 SIGTERM 信号，用于优雅关闭
+/// ```text
+/// dbus-run-session -- env DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+///   cargo test --bin simadmin http_router
+/// ```
 ///
-/// Firing `controller` is what lets the drain finish at all. Axum waits for
-/// in-flight responses, and the SSE stream at `/api/events` never ends on its
-/// own, so an open browser tab would otherwise hold the drain until the
-/// watchdog below force-exits -- skipping the session teardown that returns
-/// DATA netdevs to the host namespace.
-async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownController) {
-    use tokio::signal;
-
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C signal handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
-    warn!("Shutdown signal received; starting graceful shutdown");
-    // Before the watchdog, so long-lived responses get the whole window to end.
-    controller.trigger();
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(8));
-        eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
-        std::process::exit(0);
-    });
-}
-
+/// Without a bus every test here skips rather than fails: a plain `cargo test`
+/// must stay green on a machine with no D-Bus, and CI does not run these.
 #[cfg(test)]
-mod udev_rule_tests {
-    use super::secondary_qmi_udev_rules;
+mod http_router_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// The two rules live in different subsystems and getting that wrong is
-    /// silent: a `net` device never matches `SUBSYSTEM=="wwan"`, so the rule
-    /// loads, does nothing, and the interface stays available to ModemManager.
-    #[test]
-    fn the_control_port_and_the_netdev_use_their_own_subsystems() {
-        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
-        assert_eq!(rules.len(), 2, "{rules:?}");
+    /// Distinct temp paths per test; several of these run in one process.
+    fn temp_path(tag: &str, extension: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "simadmin-router-{tag}-{}-{nonce}-{seq}.{extension}",
+            std::process::id()
+        ))
+    }
 
-        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
-        assert!(rules[0].contains(r#"KERNEL=="wwan0at2""#), "{rules:?}");
-
-        assert!(rules[1].contains(r#"SUBSYSTEM=="net""#), "{rules:?}");
-        assert!(rules[1].contains(r#"KERNEL=="wwan1""#), "{rules:?}");
-
-        for rule in &rules {
-            assert!(rule.contains(r#"ENV{ID_MM_PORT_IGNORE}="1""#), "{rule}");
+    /// Warn once, so a skipped run says why instead of looking like a pass.
+    fn note_missing_bus(error: &dyn std::fmt::Display) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "skipping http_router_tests: no system D-Bus ({error}). \
+                 Run under `dbus-run-session` with DBUS_SYSTEM_BUS_ADDRESS set."
+            );
         }
     }
 
-    /// Reserving the data interface is the whole point of the second rule:
-    /// ModemManager tags it ID_MM_CANDIDATE=1 and was observed binding its own
-    /// `ims` APN bearer to wwan1, after which every DATA6 activation failed
-    /// with CallFailed / PolicyMismatch.
-    #[test]
-    fn the_data_interface_is_reserved_whenever_one_is_known() {
-        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+    /// Files backing one test's state, removed on drop.
+    ///
+    /// `config_manager` is kept so a test can register a line without hardware:
+    /// `reconcile_line_profiles` creates a config entry, and the profile-selection
+    /// handler accepts a line that exists in config even when no modem is bound.
+    struct TempState {
+        router: Router,
+        config_manager: Arc<ConfigManager>,
+        paths: Vec<PathBuf>,
+    }
+
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Build the real router over throwaway storage, or `None` with no bus.
+    ///
+    /// Every dependency is constructed exactly as `main` does. Nothing is
+    /// stubbed, so what the test exercises is the shipped wiring.
+    async fn build_test_router() -> Option<TempState> {
+        let dbus_conn = match zbus::Connection::system().await {
+            Ok(connection) => Arc::new(connection),
+            Err(error) => {
+                note_missing_bus(&error);
+                return None;
+            }
+        };
+
+        let db_path = temp_path("db", "db");
+        let config_path = temp_path("config", "yaml");
+        let catalog_path = temp_path("catalog", "sqlite3");
+        let paths = vec![db_path.clone(), config_path.clone(), catalog_path.clone()];
+
+        let app_db = Arc::new(Database::new(db_path).expect("create test database"));
+        let sim_overrides = Arc::new(
+            connectivity::modems::ims::profile_override::SimOverrideStore::resolve(Arc::clone(
+                &app_db,
+            )),
+        );
+        let config_manager = Arc::new(
+            ConfigManager::try_new(config_path, Arc::clone(&app_db))
+                .expect("create test config manager"),
+        );
+        let config_manager_for_test = Arc::clone(&config_manager);
+        let carrier_catalog = Arc::new(
+            connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog::at_path(
+                &catalog_path,
+            ),
+        );
+        let cell_monitoring_active =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+        let line_registry = Arc::new(services::line_registry::LineRuntimeRegistry::with_config(
+            Arc::clone(&config_manager),
+            Arc::clone(&app_db),
+        ));
+        let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
+        let notification_sender = Arc::new(NotificationSender::new(
+            Arc::clone(&config_manager),
+            Arc::clone(&dbus_conn),
+            Arc::clone(&app_db),
+        ));
+        let diagnostic_log_sink =
+            services::system::diagnostic_log::spawn_diagnostic_logger(Arc::clone(&config_manager));
+        let event_bus = Arc::new(
+            AppEventBus::new(Arc::clone(&app_db))
+                .with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
+        );
+        let system_event_emitter = Arc::new(SystemEventEmitter::new(
+            Arc::clone(&notification_sender),
+            Arc::clone(&event_bus),
+        ));
+        let (sms_resync, _sms_resync_rx) = services::messaging::sms_listener::sms_resync_channel();
+        let ddns_manager = Arc::new(DdnsManager::new());
+        let e911 = Arc::new(services::e911::orchestrator::E911Orchestrator::new(
+            services::e911::state_store::E911StateStore::default(),
+            services::e911::registry::E911ProviderRegistry::default(),
+            Arc::new(services::e911::ts43::Ts43Transport::new()),
+        ));
+        let (_shutdown_controller, shutdown_signal) = platform::shutdown::channel();
+
+        let app_state = AppState::new(AppStateDependencies {
+            shutdown: shutdown_signal,
+            dbus_conn,
+            database: app_db,
+            config_manager,
+            diagnostic_log_sink,
+            notification_sender,
+            system_event_emitter,
+            event_bus,
+            ddns_manager,
+            esim_supervisor,
+            sms_resync,
+            line_registry,
+            cell_monitoring_active,
+            carrier_catalog,
+            sim_overrides,
+            e911,
+        });
+
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+
+        Some(TempState {
+            router: build_router(app_state, cors),
+            config_manager: config_manager_for_test,
+            paths,
+        })
+    }
+
+    /// Serve the router on an ephemeral port for the duration of one test.
+    ///
+    /// A real socket rather than `tower::ServiceExt::oneshot`: `tower` is only a
+    /// transitive dependency, and going over TCP also covers `axum::serve` and
+    /// the layers outside the router, which is the point of an integration test.
+    struct Served {
+        base: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn serve(router: Router) -> Served {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let address = listener.local_addr().expect("listener address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Served {
+            base: format!("http://{address}"),
+            handle,
+        }
+    }
+
+    /// One request, returning status, headers and body.
+    async fn send(
+        served: &Served,
+        method: reqwest::Method,
+        path: &str,
+    ) -> (StatusCode, reqwest::header::HeaderMap, String) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            // A redirect would hide which status the router actually chose.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+        let response = client
+            .request(method, format!("{}{path}", served.base))
+            .send()
+            .await
+            .expect("router must answer");
+        let status = StatusCode::from_u16(response.status().as_u16()).expect("valid status");
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        (status, headers, body)
+    }
+
+    /// POST a JSON body, optionally replaying a session cookie.
+    ///
+    /// The cookie is carried by hand rather than with `reqwest`'s cookie store,
+    /// which needs the `cookies` feature that this crate does not enable.
+    async fn post_json(
+        served: &Served,
+        path: &str,
+        body: serde_json::Value,
+        cookie: Option<&str>,
+    ) -> (StatusCode, reqwest::header::HeaderMap, String) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+        let mut request = client.post(format!("{}{path}", served.base)).json(&body);
+        if let Some(cookie) = cookie {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        let response = request.send().await.expect("router must answer");
+        let status = StatusCode::from_u16(response.status().as_u16()).expect("valid status");
+        let headers = response.headers().clone();
+        let text = response.text().await.unwrap_or_default();
+        (status, headers, text)
+    }
+
+    /// PUT a JSON body with a session cookie.
+    async fn put_json(
+        served: &Served,
+        path: &str,
+        body: serde_json::Value,
+        cookie: &str,
+    ) -> (StatusCode, String) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+        let response = client
+            .put(format!("{}{path}", served.base))
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&body)
+            .send()
+            .await
+            .expect("router must answer");
+        let status = StatusCode::from_u16(response.status().as_u16()).expect("valid status");
+        let text = response.text().await.unwrap_or_default();
+        (status, text)
+    }
+
+    /// GET with a session cookie.
+    async fn get_with_cookie(served: &Served, path: &str, cookie: &str) -> (StatusCode, String) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+        let response = client
+            .get(format!("{}{path}", served.base))
+            .header(reqwest::header::COOKIE, cookie)
+            .send()
+            .await
+            .expect("router must answer");
+        let status = StatusCode::from_u16(response.status().as_u16()).expect("valid status");
+        let text = response.text().await.unwrap_or_default();
+        (status, text)
+    }
+
+    /// Set the admin password on a fresh install and return the session cookie.
+    ///
+    /// A fresh database has no admin configured, which is why the protected
+    /// routes answer 401 with "管理员密码尚未设置" until this runs.
+    async fn authenticate(served: &Served) -> String {
+        let password = "test-only-password-ck2fF9";
+        let (status, headers, body) = post_json(
+            served,
+            "/api/auth/setup",
+            serde_json::json!({ "password": password }),
+            None,
+        )
+        .await;
         assert!(
-            rules.iter().any(|rule| rule.contains(r#"KERNEL=="wwan1""#)),
-            "the netdev must be hidden, not just the control port: {rules:?}"
+            status.is_success(),
+            "setup must succeed on a fresh database, got {status}: {body}"
+        );
+
+        // Setup already returns a session; prove login issues one too, since
+        // that is the path a returning operator takes.
+        let (status, headers_login, body) = post_json(
+            served,
+            "/api/auth/login",
+            serde_json::json!({ "password": password }),
+            None,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "login must succeed with the password just set, got {status}: {body}"
+        );
+
+        let cookie = headers_login
+            .get(reqwest::header::SET_COOKIE)
+            .or_else(|| headers.get(reqwest::header::SET_COOKIE))
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).to_string())
+            .expect("login must set a session cookie");
+        assert!(
+            cookie.starts_with("simadmin_session="),
+            "unexpected session cookie: {cookie}"
+        );
+        cookie
+    }
+
+    /// The whole auth gate end to end: a fresh install refuses, setup and login
+    /// issue a session, and that session opens the protected routes.
+    ///
+    /// This is what makes the harness useful beyond smoke tests -- every
+    /// authenticated endpoint test can now start from `authenticate`.
+    #[tokio::test]
+    async fn a_session_from_login_opens_the_protected_routes() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        let (status, _headers, body) = send(&served, reqwest::Method::GET, "/api/modems").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a fresh install must refuse first: {body}"
+        );
+
+        let cookie = authenticate(&served).await;
+
+        let (status, body) = get_with_cookie(&served, "/api/modems", &cookie).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the session must open a protected route, got {status}: {body}"
+        );
+
+        // A wrong cookie must still be refused, or the check above would pass
+        // for any string at all.
+        let (status, body) =
+            get_with_cookie(&served, "/api/modems", "simadmin_session=not-a-real-token").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a forged session must be refused, got {status}: {body}"
         );
     }
 
-    /// A platform may expose the control port without a paired interface.
-    /// Emitting a rule with an empty KERNEL== would match everything in the
-    /// `net` subsystem and hide every interface on the host.
-    #[test]
-    fn no_netdev_means_no_net_rule_at_all() {
-        let rules = secondary_qmi_udev_rules("wwan0qmi1", None);
-        assert_eq!(rules.len(), 1, "{rules:?}");
-        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
-        assert!(
-            !rules.iter().any(|rule| rule.contains(r#"SUBSYSTEM=="net""#)),
-            "{rules:?}"
+    /// A partial PUT body is refused at the boundary.
+    ///
+    /// The switches are tri-state in a bundle but plain `bool` in the record, so
+    /// a body missing one would let serde's default decide -- and four default to
+    /// `true`, which would cancel an operator's `omit` and turn a header back on
+    /// with no error. The handler reads the raw body to prevent that.
+    ///
+    /// Asserted through the live endpoint because that is where a real client
+    /// meets it; `profile_record::tests::the_api_parser_refuses_a_body_missing_register_switches`
+    /// covers the field-by-field detail.
+    #[tokio::test]
+    async fn a_partial_put_body_is_refused_by_the_live_endpoint() {
+        use crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord;
+        use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+
+        // Start from a valid record with the switch explicitly off. The
+        // profile_id and PLMN are left exactly as `from_profile` produced them,
+        // because validation cross-checks them.
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.ims.register.always_add_sip_instance = false;
+        let profile_id = record.meta.profile_id.clone();
+        let plmn = record.meta.plmn.clone();
+
+        let mut body = serde_json::to_value(&record).expect("serialize record");
+        let register = body
+            .pointer_mut("/ims/register")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("register object");
+        register.remove("always_add_sip_instance");
+        assert!(!register.contains_key("always_add_sip_instance"));
+
+        let (status, response) =
+            put_json(&served, "/api/vowifi/carrier-profiles", body, &cookie).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a partial body must be refused: {response}"
         );
         assert!(
-            !rules.iter().any(|rule| rule.contains(r#"KERNEL=="""#)),
-            "an empty KERNEL== would match every net device: {rules:?}"
+            response.contains("carrier_profile_register_switch_missing"),
+            "the refusal must say a switch is missing: {response}"
+        );
+        assert!(
+            response.contains("always_add_sip_instance"),
+            "the refusal must name the missing switch: {response}"
+        );
+
+        // Nothing was stored. Database browsing must answer 404 rather than
+        // manufacturing a derived runtime fallback for the PLMN.
+        let (status, resolved) = get_with_cookie(
+            &served,
+            &format!("/api/vowifi/carrier-profiles/resolve?plmn={plmn}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "strict stored lookup must not derive a profile: {resolved}"
+        );
+        assert!(
+            !resolved.contains(&profile_id) && !resolved.contains("derived"),
+            "the refused body must not be stored or inferred: {resolved}"
+        );
+
+        // The same record with every switch present is accepted, so the refusal
+        // above is about the missing field and not about the record itself.
+        let complete = serde_json::to_value(&record).expect("serialize complete record");
+        let (status, response) =
+            put_json(&served, "/api/vowifi/carrier-profiles", complete, &cookie).await;
+        assert!(
+            status.is_success(),
+            "a complete body must still be accepted, got {status}: {response}"
+        );
+
+        // And the operator's omit survived into stored state.
+        let (status, resolved) = get_with_cookie(
+            &served,
+            &format!("/api/vowifi/carrier-profiles/resolve?plmn={plmn}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "resolve must answer: {resolved}");
+        assert!(
+            resolved.contains("\"always_add_sip_instance\":false"),
+            "the stored record must keep the omit: {resolved}"
+        );
+
+        let (status, summaries) =
+            get_with_cookie(&served, "/api/vowifi/carrier-profiles", &cookie).await;
+        assert_eq!(status, StatusCode::OK, "summary list must answer: {summaries}");
+        assert!(
+            summaries.contains(&profile_id) && summaries.contains("\"origin\":\"database\""),
+            "summary list must contain the custom profile: {summaries}"
+        );
+        assert!(
+            !summaries.contains("\"record\":"),
+            "summary list must not transfer complete records: {summaries}"
+        );
+
+        let (status, detail) = get_with_cookie(
+            &served,
+            &format!("/api/vowifi/carrier-profiles/detail/database/{profile_id}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "database detail must answer: {detail}");
+        assert!(
+            detail.contains("\"always_add_sip_instance\":false"),
+            "detail lookup must return the stored record: {detail}"
         );
     }
 
-    /// Port names are per-platform, so nothing may be hardcoded: the same
-    /// channel surfaces as wwan0at2 here and wwan0qmi1 elsewhere.
-    #[test]
-    fn rules_follow_the_observed_names() {
-        let rules = secondary_qmi_udev_rules("wwan3qmi7", Some("wwan9"));
-        assert!(rules[0].contains(r#"KERNEL=="wwan3qmi7""#), "{rules:?}");
-        assert!(rules[1].contains(r#"KERNEL=="wwan9""#), "{rules:?}");
+    /// The profile-selection PUT error matrix, over HTTP.
+    ///
+    /// Section 14.6 lists the codes this endpoint must produce. A test machine
+    /// has no modem, but the handler accepts a line that exists in config even
+    /// with nothing bound, so `reconcile_line_profiles` unlocks every validation
+    /// error without hardware. Only the happy path needs a real line, because
+    /// saving starts a connection batch.
+    #[tokio::test]
+    async fn profile_selection_put_reports_each_validation_error() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+
+        // `line-` plus 32 hex digits is the only accepted shape.
+        let line_id = format!("line-{:032x}", 0x5eaf00du64);
+        let unknown_id = format!("line-{:032x}", 0xdeadbeefu64);
+        state
+            .config_manager
+            .reconcile_line_profiles(&[line_id.clone()])
+            .expect("register a config-only line");
+
+        let three_valid = serde_json::json!({
+            "attempts": [
+                { "source": "database" },
+                { "source": "carrier_catalog" },
+                { "source": "derived" },
+            ]
+        });
+
+        // An unknown line is refused before any policy is stored, so a typo
+        // cannot leave a selection nobody reads.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{unknown_id}/profile-selection"),
+            three_valid.clone(),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("line_not_found"), "{body}");
+
+        // Exactly three slots. The three-slot shape is the policy, so a shorter
+        // list must not be silently padded.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            serde_json::json!({ "attempts": [{ "source": "database" }] }),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("volte_profile_attempt_count_invalid"),
+            "{body}"
+        );
+
+        // `derived` is computed from the SIM's home PLMN, so pinning an id in
+        // that slot is a contradiction rather than a preference.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            serde_json::json!({
+                "attempts": [
+                    { "source": "derived", "profile_id": "some-profile" },
+                    { "source": "carrier_catalog" },
+                    { "source": "derived" },
+                ]
+            }),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("volte_derived_profile_id_not_allowed"),
+            "{body}"
+        );
+
+        // An explicit id that does not exist in the named source is refused,
+        // and the error names the source so a same-id row in the other origin
+        // cannot be mistaken for a match.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            serde_json::json!({
+                "attempts": [
+                    { "source": "database", "profile_id": "no-such-profile" },
+                    { "source": "carrier_catalog" },
+                    { "source": "derived" },
+                ]
+            }),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("volte_profile_not_found_in_source"), "{body}");
+        assert!(
+            body.contains("database"),
+            "the error must name the source it searched: {body}"
+        );
+
+        // An unrecognised source must be rejected, not defaulted.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            serde_json::json!({
+                "attempts": [
+                    { "source": "not_a_source" },
+                    { "source": "carrier_catalog" },
+                    { "source": "derived" },
+                ]
+            }),
+            &cookie,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unknown source must be refused: {body}"
+        );
+    }
+
+    /// GET profile-selection must answer for a config-only line, so the dialog
+    /// can be opened before a modem is present, and must still refuse an
+    /// unknown line.
+    #[tokio::test]
+    async fn profile_selection_get_answers_for_a_config_only_line() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+
+        let line_id = format!("line-{:032x}", 0xc0ffeeu64);
+        let unknown_id = format!("line-{:032x}", 0xbadf00du64);
+        state
+            .config_manager
+            .reconcile_line_profiles(&[line_id.clone()])
+            .expect("register a config-only line");
+
+        let (status, body) = get_with_cookie(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The three ordered slots are the contract the dialog renders.
+        assert!(
+            body.contains("attempts"),
+            "the response must carry the candidate slots: {body}"
+        );
+
+        let (status, body) = get_with_cookie(
+            &served,
+            &format!("/api/volte/lines/{unknown_id}/profile-selection"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    /// `/api/health` is public and must answer before any login. This is the
+    /// first test to exercise the assembled router over HTTP rather than
+    /// calling a handler directly.
+    #[tokio::test]
+    async fn health_is_reachable_without_authentication() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        let (status, _headers, body) = send(&served, reqwest::Method::GET, "/api/health").await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            body.contains("\"status\""),
+            "health payload should report a status: {body}"
+        );
+    }
+
+    /// The auth middleware is applied with `route_layer`, so it must guard the
+    /// protected routes while leaving the public ones alone. A regression here
+    /// would expose every device endpoint, and no test covered it.
+    #[tokio::test]
+    async fn protected_routes_reject_an_unauthenticated_request() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        // Three different subsystems, all registered without a path parameter
+        // so the request cannot 404 for an unrelated reason.
+        for uri in [
+            "/api/modems",
+            "/api/vowifi/carrier-profiles",
+            "/api/sms/list",
+            "/api/network/interfaces",
+        ] {
+            let (status, _headers, body) = send(&served, reqwest::Method::GET, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{uri} must not serve an unauthenticated caller, got {status}: {body}"
+            );
+            // A 404 here would mean the path never matched a route, so the
+            // assertion above would pass for the wrong reason on a renamed
+            // endpoint. Requiring the auth error body rules that out.
+            assert!(
+                body.contains("error"),
+                "{uri} must be refused by the auth layer, not fall through: {body}"
+            );
+        }
+    }
+
+    /// `spa_fallback` has two branches and picking the wrong one is silent: an
+    /// unmatched client route must be handed to the frontend, while an unmatched
+    /// `/api/` path must 404 rather than be answered with `index.html`.
+    ///
+    /// Both branches 404 in a test checkout, because `www/` holds no built
+    /// assets, so the status alone cannot tell them apart. Assert on the body,
+    /// which names the branch that ran.
+    #[tokio::test]
+    async fn unknown_paths_reach_the_spa_branch_but_unknown_api_paths_do_not() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        let (_status, _headers, body) =
+            send(&served, reqwest::Method::GET, "/some/client/route").await;
+        assert!(
+            body.contains("index.html"),
+            "a client route must reach the asset branch, got: {body}"
+        );
+
+        let (status, _headers, body) =
+            send(&served, reqwest::Method::GET, "/api/definitely-not-a-route").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unknown /api path must 404, got: {body}"
+        );
+        assert!(
+            !body.contains("index.html"),
+            "an /api path must never be answered with the SPA shell, got: {body}"
+        );
+    }
+
+    /// CORS is layered outside the router, so a preflight must be answered even
+    /// for a protected path -- the browser sends it before any credentials.
+    #[tokio::test]
+    async fn preflight_is_answered_on_a_protected_route() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        let (status, headers, body) = send(&served, reqwest::Method::OPTIONS, "/api/modems").await;
+
+        assert!(
+            status.is_success(),
+            "preflight must succeed, got {status}: {body}"
+        );
+        assert!(
+            headers.contains_key("access-control-allow-origin"),
+            "preflight response must carry CORS headers: {headers:?}"
+        );
     }
 }

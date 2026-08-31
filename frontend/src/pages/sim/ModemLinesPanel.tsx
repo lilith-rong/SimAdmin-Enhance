@@ -27,6 +27,7 @@ import {
   type SmsMessage,
   type TrunkProfileResponse,
   type VolteLineControlResponse,
+  type VolteProfileSelectionResponse,
   type VowifiLineConfigResponse,
   type VowifiRuntimeEventEntry,
 } from '../../api/current'
@@ -34,6 +35,7 @@ import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableM
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
 import DataProxyDialog from './DataProxyDialog'
+import VolteProfileDialog from './VolteProfileDialog'
 import { LineActivityLog, LineTrunkDetails, LineVolteDetails, LineVowifiDetails } from './LineRuntimeDetails'
 import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
@@ -264,6 +266,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [enableTrunkOnOpen, setEnableTrunkOnOpen] = useState(false)
   const [editingVowifiLine, setEditingVowifiLine] = useState<VowifiLineConfigResponse | null>(null)
   const [editingDataLineId, setEditingDataLineId] = useState<string | null>(null)
+  const [editingVolteProfileLineId, setEditingVolteProfileLineId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [supplementalStatus, setSupplementalStatus] = useState(INITIAL_SUPPLEMENTAL_STATUS)
   const [savingKey, setSavingKey] = useState<string | null>(null)
@@ -570,6 +573,20 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     } finally {
       setSavingKey(null)
     }
+  }
+
+  const handleVolteProfileSaved = (updated: VolteProfileSelectionResponse) => {
+    setLines((current) => current.map((line) => line.modem.line_id === updated.line_id
+      ? {
+          ...line,
+          profile: {
+            ...line.profile,
+            volte_profile_selection: updated.selection,
+          },
+          runtime: updated.runtime,
+        }
+      : line))
+    setSuccess(`${shortLineId(updated.line_id)} 的 VoLTE Profile 顺序已保存`)
   }
 
   const handleVowifiSaved = (updated: VowifiLineConfigResponse) => {
@@ -982,12 +999,22 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     {!isReader && (!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} flexDirection={{ xs: 'column', sm: 'row' }} gap={1} mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
                       <Box minWidth={0}>
                         <Typography variant="body2" fontWeight={600}>VoLTE IMS 连接</Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          独立于其他基带管理；连接阶段与地址族详情见线路活动日志
-                        </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
                         <Chip size="small" label={imsConnectionSummary(line)} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
+                        <Button
+                          size="small"
+                          variant="text"
+                          // A line card carries several buttons labelled 配置
+                          // (data proxy, VoLTE, VoWiFi, trunk). The test id
+                          // names this one so a browser test cannot pick the
+                          // wrong one and act on it.
+                          data-testid="volte-profile-config"
+                          onClick={() => setEditingVolteProfileLineId(line.modem.line_id)}
+                          disabled={savingKey !== null}
+                        >
+                          配置
+                        </Button>
                         {(volteBusy || retryBusy) && <CircularProgress size={18} />}
                         {line.profile.volte_connection_enabled && line.runtime.manual_retry_available && (
                           <Tooltip title={recoveryRunning ? '自动恢复正在进行' : `立即开始新的 ${line.runtime.retry_max || 3} 次恢复批次`}>
@@ -1127,6 +1154,12 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
         line={editingVowifiLine}
         onClose={() => setEditingVowifiLine(null)}
         onSaved={handleVowifiSaved}
+      />
+      <VolteProfileDialog
+        open={editingVolteProfileLineId !== null}
+        lineId={editingVolteProfileLineId}
+        onClose={() => setEditingVolteProfileLineId(null)}
+        onSaved={handleVolteProfileSaved}
       />
       <DataProxyDialog
         open={editingDataLineId !== null}

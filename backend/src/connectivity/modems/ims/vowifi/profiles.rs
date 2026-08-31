@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+use crate::connectivity::core::access_network::AccessIdentityPolicy;
 #[cfg(test)]
 use crate::connectivity::core::voice::AudioCodec;
 
@@ -84,6 +85,14 @@ pub struct Ikev2Policy {
     pub esp_proposals: &'static [&'static str],
     pub aka_challenge_mode: &'static str,
     pub include_epdg_idr: bool,
+    /// Optional RFC822 IDi template used for EAP-AKA. Public PLMNs may omit
+    /// this and use the standards-derived permanent NAI. Private PLMNs (MCC
+    /// 999) must provide their deployment's real template because a public
+    /// `3gppnetwork.org` realm cannot be inferred for them.
+    ///
+    /// Supported runtime placeholders: `{imsi}`, `{mcc}`, `{mnc}`, `{mnc3}`,
+    /// `{plmn}`, `{epdg_fqdn}`, `{ims_domain}`, and `{ims_realm}`.
+    pub identity_template: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -116,9 +125,16 @@ pub struct RegisterPolicy {
     /// Value of the REGISTER `Expires` header. Some carriers reject the common
     /// 3600 default and demand their own value.
     pub expires_seconds: u32,
-    /// Base of the `P-Access-Network-Info` header, e.g. `IEEE-802.11` or
-    /// `IEEE-802.11a`. Carriers that validate it reject a wrong access type.
+    /// Base/static value of `P-Access-Network-Info`, e.g. `IEEE-802.11` or
+    /// `3GPP-E-UTRAN-FDD`. The source policy below decides whether this value,
+    /// a real serving-cell identity, or no header is emitted.
     pub access_network_info: &'static str,
+    pub pani_identity_policy: AccessIdentityPolicy,
+    /// Optional static `Cellular-Network-Info` value. This is deliberately
+    /// separate from the WLAN PANI so VoWiFi never reuses a Wi-Fi string as a
+    /// cellular identity.
+    pub cellular_network_info: Option<&'static str>,
+    pub cni_identity_policy: AccessIdentityPolicy,
     /// `android_default` or `legacy` — controls the shape of the Contact header.
     pub contact_mode: &'static str,
     /// Order of Contact header parameters. Empty means "use the built-in order
@@ -373,6 +389,7 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes128-sha256", "aes128-sha1", "aes256-sha512"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc033.mcc234.3gppnetwork.org",
@@ -405,6 +422,9 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -472,6 +492,7 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes256-sha256"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc004.mcc204.3gppnetwork.org",
@@ -504,6 +525,9 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -568,6 +592,7 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes128-sha256", "aes128-sha1"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc260.mcc310.3gppnetwork.org",
@@ -600,6 +625,9 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -664,6 +692,7 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes128-sha256"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc410.mcc310.3gppnetwork.org",
@@ -696,6 +725,9 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -760,6 +792,7 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes256-sha256"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc007.mcc262.3gppnetwork.org",
@@ -792,6 +825,9 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -856,6 +892,7 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes256-sha256"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc005.mcc530.3gppnetwork.org",
@@ -888,6 +925,9 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -927,28 +967,124 @@ pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
 static DERIVED_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
     OnceLock::new();
 
-/// Generate an iPhone/IPCC-shaped fallback from public 3GPP naming rules.
-///
-/// This is an explicitly unverified last resort. The registration envelope is
-/// deliberately modelled on the smallest interoperable shape observed in the
-/// iPhone/IPCC catalog: PANI and Cellular-Network-Info are present, the Contact
-/// stays compact, and sec-agree is negotiated without adding the Pixel-style
-/// MMTEL feature set. The stable +sip.instance is retained as required by the
-/// iPhone bundle's flow-binding policy. It still does
-/// not guess a static P-CSCF, entitlement/XCAP endpoints or carrier-specific
-/// identities.
-pub fn derive_standard_3gpp_profile(
-    mcc: &str,
-    mnc: &str,
-    access: Standard3gppAccess,
-) -> Option<&'static CarrierProfile> {
+fn standard_public_plmn<'a>(mcc: &'a str, mnc: &str) -> Option<(&'a str, String)> {
+    let mcc = mcc.trim();
+    let mnc = mnc.trim();
     if mcc.len() != 3
         || !matches!(mnc.len(), 2 | 3)
+        || !mcc.bytes().all(|byte| byte.is_ascii_digit())
+        || !mnc.bytes().all(|byte| byte.is_ascii_digit())
+        // 3GPP reserves MCC 999 for private networks. Publishing an Internet
+        // fallback for it would turn a private deployment into a public-DNS
+        // guess, so those profiles must come from the user/catalog/UICC/modem.
+        || mcc == "999"
+    {
+        return None;
+    }
+    Some((mcc, format!("{:0>3}", mnc)))
+}
+
+/// Standard IMS home-network domain from 3GPP TS 23.003.
+pub fn standard_ims_home_domain(mcc: &str, mnc: &str) -> Option<String> {
+    let (mcc, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    Some(format!("ims.mnc{padded_mnc}.mcc{mcc}.3gppnetwork.org"))
+}
+
+/// Standard operator-identifier ePDG FQDN from 3GPP TS 23.003.
+pub fn standard_operator_epdg_fqdn(mcc: &str, mnc: &str) -> Option<String> {
+    let (mcc, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    Some(format!(
+        "epdg.epc.mnc{padded_mnc}.mcc{mcc}.pub.3gppnetwork.org"
+    ))
+}
+
+/// Parse a standard operator-identifier ePDG FQDN and return its MCC plus
+/// three-digit MNC encoding. Only the public 3GPP operator form is accepted;
+/// private/extension domains and emergency `sos.*` names are rejected.
+pub fn parse_standard_operator_epdg_fqdn(host: &str) -> Option<(String, String)> {
+    let labels = host
+        .trim()
+        .trim_end_matches('.')
+        .split('.')
+        .map(|label| label.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if labels.len() != 7
+        || labels[0] != "epdg"
+        || labels[1] != "epc"
+        || labels[4] != "pub"
+        || labels[5] != "3gppnetwork"
+        || labels[6] != "org"
+    {
+        return None;
+    }
+    let mnc = labels[2].strip_prefix("mnc")?;
+    let mcc = labels[3].strip_prefix("mcc")?;
+    if mcc.len() != 3
+        || mnc.len() != 3
         || !mcc.bytes().all(|byte| byte.is_ascii_digit())
         || !mnc.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
     }
+    let (_, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    Some((mcc.to_string(), padded_mnc))
+}
+
+/// Standard EAP-AKA NAI realm from 3GPP TS 23.003.
+pub fn standard_epc_nai_realm(mcc: &str, mnc: &str) -> Option<String> {
+    let (mcc, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    Some(format!("nai.epc.mnc{padded_mnc}.mcc{mcc}.3gppnetwork.org"))
+}
+
+/// Visited-country discovery FQDN from 3GPP TS 23.003.
+pub fn standard_visited_country_epdg_fqdn(mcc: &str) -> Option<String> {
+    let (mcc, _) = standard_public_plmn(mcc, "00")?;
+    Some(format!(
+        "epdg.epc.mcc{mcc}.visited-country.pub.3gppnetwork.org"
+    ))
+}
+
+/// Standard tracking-area ePDG FQDN from 3GPP TS 23.003.
+///
+/// This only formats a name. Callers must not use it merely because a TAC is
+/// available: TS 24.302 requires operator/UICC selection information to choose
+/// the location-based format.
+pub fn standard_tai_epdg_fqdn(mcc: &str, mnc: &str, tac: u32, technology: &str) -> Option<String> {
+    let (mcc, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    match technology.trim().to_ascii_lowercase().as_str() {
+        "lte" if tac <= 0xffff => Some(format!(
+            "tac-lb{:02x}.tac-hb{:02x}.tac.epdg.epc.mnc{padded_mnc}.mcc{mcc}.pub.3gppnetwork.org",
+            tac & 0xff,
+            (tac >> 8) & 0xff,
+        )),
+        "nr" if tac <= 0xff_ffff => Some(format!(
+            "tac-lb{:02x}.tac-mb{:02x}.tac-hb{:02x}.5gstac.epdg.epc.mnc{padded_mnc}.mcc{mcc}.pub.3gppnetwork.org",
+            tac & 0xff,
+            (tac >> 8) & 0xff,
+            (tac >> 16) & 0xff,
+        )),
+        _ => None,
+    }
+}
+
+/// Generate a conservative profile from public 3GPP naming rules.
+///
+/// This is an explicitly unverified last resort. It derives only standard
+/// domains and a portable IMS registration envelope: stable flow identity,
+/// access-type PANI and MMTEL capability for voice. On untrusted Wi-Fi, CNI is
+/// enabled only as a capability gate and is emitted only when a real serving-cell
+/// snapshot exists. Initial empty Authorization, visited-network identity and
+/// mandatory sec-agree remain disabled until a database/catalog profile opts in
+/// or the network challenges the UE.
+pub fn derive_standard_3gpp_profile(
+    mcc: &str,
+    mnc: &str,
+    access: Standard3gppAccess,
+) -> Option<&'static CarrierProfile> {
+    let mcc = mcc.trim();
+    let mnc = mnc.trim();
+    let epdg_host = standard_operator_epdg_fqdn(mcc, mnc)?;
+    let ims_domain = standard_ims_home_domain(mcc, mnc)?;
 
     let plmn = format!("{}{}", mcc, mnc);
     let cache_key = format!("{}:{plmn}", access.as_str());
@@ -961,13 +1097,8 @@ pub fn derive_standard_3gpp_profile(
         return Some(*profile);
     }
 
-    // 3GPP domains always pad the MNC to three digits.
-    let padded_mnc = format!("{:0>3}", mnc);
-    let epdg_host = Box::leak(
-        format!("epdg.epc.mnc{}.mcc{}.pub.3gppnetwork.org", padded_mnc, mcc).into_boxed_str(),
-    );
-    let ims_domain =
-        Box::leak(format!("ims.mnc{}.mcc{}.3gppnetwork.org", padded_mnc, mcc).into_boxed_str());
+    let epdg_host = Box::leak(epdg_host.into_boxed_str());
+    let ims_domain = Box::leak(ims_domain.into_boxed_str());
     let profile_id =
         Box::leak(format!("derived_3gpp_{}_{}", access.as_str(), plmn).into_boxed_str());
     let source_refs: &'static [&'static str] = match access {
@@ -1032,6 +1163,7 @@ pub fn derive_standard_3gpp_profile(
             ],
             aka_challenge_mode: "standard",
             include_epdg_idr: true,
+            identity_template: None,
         },
         ims: ImsPolicy {
             domain: ims_domain,
@@ -1053,35 +1185,50 @@ pub fn derive_standard_3gpp_profile(
                 request_uri_policy: "home_domain",
                 include_pani_initial: true,
                 include_pani_authenticated: true,
-                initial_authorization: "aka_empty",
-                include_mmtel_features: false,
+                initial_authorization: "none",
+                // Voice-capable fallback registrations advertise MMTEL/audio.
+                // A carrier-specific database profile can deliberately select
+                // an SMS-only Contact (as observed with some IPCC profiles).
+                include_mmtel_features: true,
                 include_route_header: false,
                 include_visited_network: false,
                 include_p_preferred_identity: true,
                 visited_network_header: None,
                 allow_methods: None,
-                strict_security_server_offer: true,
+                strict_security_server_offer: false,
                 enable_initial_reject_fallback: false,
                 use_plain_digest_placeholder: false,
-                require_sec_agree_headers: true,
-                proxy_require_sec_agree_headers: true,
-                sec_agree_mode: "required",
+                require_sec_agree_headers: false,
+                proxy_require_sec_agree_headers: false,
+                sec_agree_mode: "auto",
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
                 access_network_info: access.access_network_info(),
+                pani_identity_policy: match access {
+                    Standard3gppAccess::LteEpc => AccessIdentityPolicy::DynamicIfKnown,
+                    Standard3gppAccess::WifiEpdg => AccessIdentityPolicy::Static,
+                },
+                cellular_network_info: None,
+                cni_identity_policy: match access {
+                    Standard3gppAccess::LteEpc => AccessIdentityPolicy::Omit,
+                    Standard3gppAccess::WifiEpdg => AccessIdentityPolicy::DynamicIfKnown,
+                },
                 contact_mode: "standard",
-                contact_param_order: &[
-                    "+g.3gpp.mid-call",
-                    "+g.3gpp.srvcc-alerting",
-                    "+g.3gpp.ps2cs-srvcc-orig-pre-alerting",
-                ],
+                contact_param_order: match access {
+                    Standard3gppAccess::LteEpc => &[
+                        "+g.3gpp.mid-call",
+                        "+g.3gpp.srvcc-alerting",
+                        "+g.3gpp.ps2cs-srvcc-orig-pre-alerting",
+                    ],
+                    Standard3gppAccess::WifiEpdg => &[],
+                },
                 temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
                 forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
                 initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
                 temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
                 always_add_sip_instance: true,
-                enable_cellular_network_info: true,
+                enable_cellular_network_info: matches!(access, Standard3gppAccess::WifiEpdg),
                 security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
-                live_header_variant_set: "iphone_ipcc_fallback",
+                live_header_variant_set: "standard_3gpp_conservative",
             },
         },
         sms: SmsPolicy {
@@ -1158,11 +1305,7 @@ fn derive_standard_match(
                 && plmn.bytes().all(|byte| byte.is_ascii_digit())
                 && digits.starts_with(*plmn)
         })
-        .map(str::to_string)
-        .or_else(|| {
-            let length = if digits.starts_with("460") { 5 } else { 6 };
-            digits.get(..length).map(str::to_string)
-        })?;
+        .map(str::to_string)?;
     let profile = derive_standard_3gpp_profile(&plmn[..3], &plmn[3..], access)?;
     Some(CarrierMatch {
         profile,
@@ -1638,14 +1781,14 @@ mod tests {
         assert_ne!(lte.meta.profile_id, matched.profile.meta.profile_id);
         assert_eq!(lte.ims.register.access_network_info, "3GPP-E-UTRAN-FDD");
         assert_eq!(lte.ims.transport, "udp");
-        assert_eq!(lte.ims.register.sec_agree_mode, "required");
-        assert!(lte.ims.register.require_sec_agree_headers);
-        assert!(lte.ims.register.proxy_require_sec_agree_headers);
+        assert_eq!(lte.ims.register.sec_agree_mode, "auto");
+        assert!(!lte.ims.register.require_sec_agree_headers);
+        assert!(!lte.ims.register.proxy_require_sec_agree_headers);
         assert!(lte.ims.register.include_pani_initial);
         assert!(lte.ims.register.include_pani_authenticated);
-        assert!(lte.ims.register.enable_cellular_network_info);
+        assert!(!lte.ims.register.enable_cellular_network_info);
         assert!(lte.ims.register.always_add_sip_instance);
-        assert!(!lte.ims.register.include_mmtel_features);
+        assert!(lte.ims.register.include_mmtel_features);
         assert!(!lte.ims.register.include_route_header);
         assert_eq!(lte.ims.register.contact_mode, "standard");
         assert_eq!(
@@ -1658,9 +1801,44 @@ mod tests {
         );
         assert_eq!(
             lte.ims.register.live_header_variant_set,
-            "iphone_ipcc_fallback"
+            "standard_3gpp_conservative"
         );
+        let wifi = derive_standard_3gpp_profile("502", "12", Standard3gppAccess::WifiEpdg)
+            .expect("derive standard Wi-Fi profile");
+        assert!(wifi.ims.register.enable_cellular_network_info);
+        assert_eq!(wifi.ims.register.access_network_info, "IEEE-802.11");
         assert!(!lte.meta.source_refs[0].contains("legacy-test-profile"));
+    }
+
+    #[test]
+    fn standard_3gpp_domains_pad_mnc_and_reject_private_or_invalid_plmns() {
+        assert_eq!(
+            standard_ims_home_domain("502", "12").as_deref(),
+            Some("ims.mnc012.mcc502.3gppnetwork.org")
+        );
+        assert_eq!(
+            standard_operator_epdg_fqdn("310", "260").as_deref(),
+            Some("epdg.epc.mnc260.mcc310.pub.3gppnetwork.org")
+        );
+        assert!(standard_operator_epdg_fqdn("99", "01").is_none());
+        assert!(standard_operator_epdg_fqdn("310", "2a").is_none());
+        assert!(standard_operator_epdg_fqdn("999", "99").is_none());
+        assert!(derive_standard_3gpp_profile("999", "99", Standard3gppAccess::WifiEpdg).is_none());
+    }
+
+    #[test]
+    fn standard_tracking_area_epdg_names_use_3gpp_byte_order() {
+        assert_eq!(
+            standard_tai_epdg_fqdn("345", "12", 0x0b21, "lte").as_deref(),
+            Some("tac-lb21.tac-hb0b.tac.epdg.epc.mnc012.mcc345.pub.3gppnetwork.org")
+        );
+        assert_eq!(
+            standard_tai_epdg_fqdn("345", "12", 0x0b1a21, "nr").as_deref(),
+            Some("tac-lb21.tac-mb1a.tac-hb0b.5gstac.epdg.epc.mnc012.mcc345.pub.3gppnetwork.org")
+        );
+        assert!(standard_tai_epdg_fqdn("345", "12", 0x1_0000, "lte").is_none());
+        assert!(standard_tai_epdg_fqdn("345", "12", 0x100_0000, "nr").is_none());
+        assert!(standard_tai_epdg_fqdn("345", "12", 1, "wifi").is_none());
     }
 
     #[test]

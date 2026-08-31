@@ -39,10 +39,11 @@ import {
 } from '@mui/icons-material'
 import {
   api,
+  type CarrierCatalogAsset,
   type CarrierCatalogStatusResponse,
+  type CarrierProfileSummary,
   type CarrierProfileRecord,
   type ProfileOrigin,
-  type StoredCarrierProfile,
 } from '../../api/current'
 import CarrierProfileEditor from './CarrierProfileEditor'
 import GithubDownloadProxyControl from '../../components/GithubDownloadProxyControl'
@@ -54,38 +55,45 @@ const originLabels: Record<ProfileOrigin, string> = {
   derived: '推导',
 }
 
-const CATALOG_ASSETS = [
-  {
-    label: 'Pixel / Android（推荐）',
-    url: 'https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-pixel-mustang.sqlite3',
-  },
-  {
-    label: 'iPhone 16 Pro Max',
-    url: 'https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-iphone16promax-26.6.sqlite3',
-  },
-  {
-    label: 'iOS IPCC 汇总',
-    url: 'https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-ios-ipcc.sqlite3',
-  },
-]
+type SearchMode = 'plmn' | 'mcc' | 'name'
+
+const searchModeLabels: Record<SearchMode, string> = {
+  plmn: 'PLMN',
+  mcc: 'MCC',
+  name: '运营商名称',
+}
+
+/** MB, one decimal. Sizes come from the release, so they are exact byte counts. */
+function formatAssetSize(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
 
 export default function CarrierProfilesPanel() {
-  const [profiles, setProfiles] = useState<StoredCarrierProfile[]>([])
+  const [allProfiles, setAllProfiles] = useState<CarrierProfileSummary[]>([])
+  const [profiles, setProfiles] = useState<CarrierProfileSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [busyKey, setBusyKey] = useState<string | null>(null)
   const [catalogStatus, setCatalogStatus] = useState<CarrierCatalogStatusResponse | null>(null)
-  const [catalogAssetUrl, setCatalogAssetUrl] = useState(CATALOG_ASSETS[0].url)
+  const [catalogAssetUrl, setCatalogAssetUrl] = useState('')
   const [catalogDialogOpen, setCatalogDialogOpen] = useState(false)
+  // Databases are read from the release when the dialog opens, not compiled in:
+  // the upstream set changes, and a pinned filename silently 404s after a rename.
+  const [catalogAssets, setCatalogAssets] = useState<CarrierCatalogAsset[]>([])
+  const [catalogAssetsLoading, setCatalogAssetsLoading] = useState(false)
+  const [catalogAssetsError, setCatalogAssetsError] = useState<string | null>(null)
+  const [catalogReleaseTag, setCatalogReleaseTag] = useState('')
 
   const [editing, setEditing] = useState<CarrierProfileRecord | null>(null)
   const [editorOpen, setEditorOpen] = useState(false)
   const [editorReadOnly, setEditorReadOnly] = useState(true)
   const [profileIdLocked, setProfileIdLocked] = useState(true)
-  const [deleteTarget, setDeleteTarget] = useState<StoredCarrierProfile | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<CarrierProfileSummary | null>(null)
 
-  const [lookupPlmn, setLookupPlmn] = useState('')
+  const [searchMode, setSearchMode] = useState<SearchMode>('plmn')
+  const [searchValue, setSearchValue] = useState('')
+  const [activeSearch, setActiveSearch] = useState<string | null>(null)
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(20)
 
@@ -97,8 +105,11 @@ export default function CarrierProfilesPanel() {
         api.listVowifiCarrierProfiles(),
         api.getCarrierCatalogStatus(),
       ])
-      setProfiles(profileResponse.data ?? [])
+      const loadedProfiles = profileResponse.data ?? []
+      setAllProfiles(loadedProfiles)
+      setProfiles(loadedProfiles)
       setCatalogStatus(statusResponse.data ?? null)
+      setActiveSearch(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -114,6 +125,42 @@ export default function CarrierProfilesPanel() {
   useEffect(() => {
     if (page > 0 && page * rowsPerPage >= profiles.length) setPage(0)
   }, [page, profiles.length, rowsPerPage])
+
+  /** Read the release's databases. Called when the dialog opens so the list is
+   *  current, and available for a manual retry when GitHub is unreachable. */
+  const loadCatalogAssets = async () => {
+    setCatalogAssetsLoading(true)
+    setCatalogAssetsError(null)
+    try {
+      const response = await api.getCarrierCatalogAssets()
+      const listing = response.data
+      const assets = listing?.assets ?? []
+      setCatalogAssets(assets)
+      setCatalogReleaseTag(listing?.release_tag ?? '')
+      if (assets.length === 0) {
+        setCatalogAssetsError(listing?.message || '未能从 Release 读取到数据库文件')
+        setCatalogAssetUrl('')
+      } else {
+        // Keep the current pick only if the release still offers it; otherwise
+        // fall back to the first (largest) database.
+        setCatalogAssetUrl((current) =>
+          assets.some((asset) => asset.download_url === current)
+            ? current
+            : assets[0].download_url)
+      }
+    } catch (err) {
+      setCatalogAssets([])
+      setCatalogAssetUrl('')
+      setCatalogAssetsError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setCatalogAssetsLoading(false)
+    }
+  }
+
+  const openCatalogDialog = () => {
+    setCatalogDialogOpen(true)
+    void loadCatalogAssets()
+  }
 
   const installCatalog = async () => {
     setBusyKey('catalog')
@@ -148,26 +195,57 @@ export default function CarrierProfilesPanel() {
     setEditorOpen(true)
   }
 
-  const openForPlmn = async (plmn: string) => {
-    const digits = plmn.replace(/\D/g, '')
-    if (digits.length < 5 || digits.length > 6) {
-      setError('PLMN 必须是 5 或 6 位数字，例如 46001')
-      return
-    }
-    setBusyKey('lookup')
+  const openStoredProfile = async (
+    profile: CarrierProfileSummary,
+    options: { readOnly: boolean; lockProfileId: boolean },
+  ) => {
+    if (profile.origin !== 'database' && profile.origin !== 'carrier_catalog') return
+    const key = `open:${profile.origin}:${profile.profile_id}`
+    setBusyKey(key)
     setError(null)
     try {
-      const response = await api.resolveVowifiCarrierProfile(digits)
-      const resolved = response.data
-      if (!resolved) throw new Error('未能解析该 PLMN')
-      const readOnly = resolved.origin !== 'database'
-      openEditor(resolved.record, { readOnly, lockProfileId: true })
-      setSuccess(`${digits} 当前来自「${originLabels[resolved.origin]}」`)
+      const response = await api.getVowifiCarrierProfile(profile.origin, profile.profile_id)
+      if (!response.data) throw new Error('后端未返回 Profile 详情')
+      openEditor(response.data.record, options)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setBusyKey(null)
     }
+  }
+
+  const searchProfiles = () => {
+    const value = searchValue.trim()
+    if (searchMode === 'plmn' && !/^\d{5,6}$/.test(value)) {
+      setError('PLMN 必须是 5 或 6 位数字，例如 46001')
+      return
+    }
+    if (searchMode === 'mcc' && !/^\d{3}$/.test(value)) {
+      setError('MCC 必须是 3 位数字，例如 460')
+      return
+    }
+    if (searchMode === 'name' && !value) {
+      setError('请输入运营商名称')
+      return
+    }
+    setError(null)
+    setSuccess(null)
+    const normalizedName = value.toLocaleLowerCase()
+    const matches = allProfiles.filter((profile) => {
+      if (searchMode === 'plmn') return profile.plmn === value
+      if (searchMode === 'mcc') return profile.mcc === value
+      return [profile.brand, profile.operator_legal_name, profile.profile_id, ...profile.aliases]
+        .some((candidate) => candidate.toLocaleLowerCase().includes(normalizedName))
+    })
+    setProfiles(matches)
+    setPage(0)
+    setActiveSearch(`${searchModeLabels[searchMode]}：${value}`)
+  }
+
+  const showAllProfiles = () => {
+    setProfiles(allProfiles)
+    setActiveSearch(null)
+    setPage(0)
   }
 
   const deleteCustomProfile = async () => {
@@ -176,7 +254,7 @@ export default function CarrierProfilesPanel() {
     setError(null)
     try {
       await api.deleteVowifiCarrierProfile(deleteTarget.profile_id)
-      setSuccess(`已删除自定义 Profile：${deleteTarget.record.meta.brand || deleteTarget.profile_id}`)
+      setSuccess(`已删除自定义 Profile：${deleteTarget.brand || deleteTarget.profile_id}`)
       setDeleteTarget(null)
       await load()
     } catch (err) {
@@ -197,7 +275,7 @@ export default function CarrierProfilesPanel() {
               size="small"
               variant="outlined"
               startIcon={<Download />}
-              onClick={() => setCatalogDialogOpen(true)}
+              onClick={openCatalogDialog}
             >
               数据库下载
             </Button>
@@ -217,25 +295,52 @@ export default function CarrierProfilesPanel() {
 
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} alignItems="flex-start">
             <TextField
+              select
               size="small"
-              label="按 PLMN 查找"
-              value={lookupPlmn}
-              placeholder="46001"
-              helperText="填入 MCC+MNC，打开当前生效的配置"
-              onChange={(event) => setLookupPlmn(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') void openForPlmn(lookupPlmn)
+              label="查找方式"
+              value={searchMode}
+              onChange={(event) => {
+                setSearchMode(event.target.value as SearchMode)
+                setSearchValue('')
               }}
+              sx={{ minWidth: 140 }}
+            >
+              <MenuItem value="plmn">PLMN</MenuItem>
+              <MenuItem value="mcc">MCC（国家）</MenuItem>
+              <MenuItem value="name">运营商名称</MenuItem>
+            </TextField>
+            <TextField
+              size="small"
+              label={`按${searchModeLabels[searchMode]}查找`}
+              value={searchValue}
+              placeholder={searchMode === 'plmn' ? '46001' : searchMode === 'mcc' ? '460' : 'China Mobile'}
+              helperText="仅查找用户自定义和已下载数据库，不使用推断配置"
+              onChange={(event) => setSearchValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') searchProfiles()
+              }}
+              sx={{ minWidth: { xs: '100%', sm: 320 } }}
             />
             <Button
-              startIcon={busyKey === 'lookup' ? <CircularProgress size={16} /> : <Search />}
-              onClick={() => void openForPlmn(lookupPlmn)}
-              disabled={busyKey !== null}
+              startIcon={<Search />}
+              onClick={searchProfiles}
+              disabled={busyKey !== null || loading}
               sx={{ mt: 0.5 }}
             >
-              打开
+              查找
             </Button>
+            {activeSearch && (
+              <Button onClick={showAllProfiles} disabled={busyKey !== null || loading} sx={{ mt: 0.5 }}>
+                显示全部
+              </Button>
+            )}
           </Stack>
+
+          {activeSearch && (
+            <Typography variant="caption" color="text.secondary">
+              当前结果：{activeSearch}，共 {profiles.length} 条
+            </Typography>
+          )}
 
           {error && <Alert severity="error" onClose={() => setError(null)}>{error}</Alert>}
           {success && <Alert severity="success" onClose={() => setSuccess(null)}>{success}</Alert>}
@@ -261,7 +366,7 @@ export default function CarrierProfilesPanel() {
                   </TableHead>
                   <TableBody>
                     {pagedProfiles.map((profile) => (
-                      <TableRow key={profile.profile_id} hover>
+                      <TableRow key={`${profile.origin}:${profile.profile_id}`} hover>
                         <TableCell padding="checkbox">
                           <Avatar
                             variant="rounded"
@@ -274,7 +379,7 @@ export default function CarrierProfilesPanel() {
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" fontWeight={600}>
-                            {profile.record.meta.brand || profile.profile_id}
+                            {profile.brand || profile.profile_id}
                           </Typography>
                           <Typography variant="caption" color="text.secondary">
                             {profile.profile_id}
@@ -309,9 +414,12 @@ export default function CarrierProfilesPanel() {
                               <Tooltip title="编辑自定义 Profile">
                                 <IconButton
                                   size="small"
-                                  onClick={() => openEditor(profile.record, { readOnly: false, lockProfileId: true })}
+                                  onClick={() => void openStoredProfile(profile, { readOnly: false, lockProfileId: true })}
+                                  disabled={busyKey !== null}
                                 >
-                                  <Edit fontSize="small" />
+                                  {busyKey === `open:${profile.origin}:${profile.profile_id}`
+                                    ? <CircularProgress size={16} />
+                                    : <Edit fontSize="small" />}
                                 </IconButton>
                               </Tooltip>
                               <Tooltip title="删除自定义 Profile">
@@ -325,16 +433,20 @@ export default function CarrierProfilesPanel() {
                               <Tooltip title="查看 Profile">
                                 <IconButton
                                   size="small"
-                                  onClick={() => openEditor(profile.record, { readOnly: true, lockProfileId: true })}
+                                  onClick={() => void openStoredProfile(profile, { readOnly: true, lockProfileId: true })}
+                                  disabled={busyKey !== null}
                                 >
-                                  <Visibility fontSize="small" />
+                                  {busyKey === `open:${profile.origin}:${profile.profile_id}`
+                                    ? <CircularProgress size={16} />
+                                    : <Visibility fontSize="small" />}
                                 </IconButton>
                               </Tooltip>
                               <Tooltip title="复制为自定义 Profile">
                                 <IconButton
                                   size="small"
                                   color="primary"
-                                  onClick={() => openEditor(profile.record, { readOnly: false, lockProfileId: true })}
+                                  onClick={() => void openStoredProfile(profile, { readOnly: false, lockProfileId: true })}
+                                  disabled={busyKey !== null}
                                 >
                                   <ContentCopy fontSize="small" />
                                 </IconButton>
@@ -347,7 +459,7 @@ export default function CarrierProfilesPanel() {
                     {profiles.length === 0 && (
                       <TableRow>
                         <TableCell colSpan={7} align="center">
-                          尚无可用 Profile
+                          {activeSearch ? '数据库中没有匹配的 Profile' : '尚无可用 Profile'}
                         </TableCell>
                       </TableRow>
                     )}
@@ -399,12 +511,28 @@ export default function CarrierProfilesPanel() {
               size="small"
               label="数据库来源"
               value={catalogAssetUrl}
+              disabled={catalogAssetsLoading || catalogAssets.length === 0}
+              helperText={catalogAssetsLoading
+                ? '正在读取 Release 中的数据库…'
+                : catalogAssetsError
+                  ? catalogAssetsError
+                  : catalogReleaseTag
+                    ? `来自 Release ${catalogReleaseTag}，共 ${catalogAssets.length} 个数据库`
+                    : ' '}
+              error={Boolean(catalogAssetsError)}
               onChange={(event) => setCatalogAssetUrl(event.target.value)}
             >
-              {CATALOG_ASSETS.map((asset) => (
-                <MenuItem key={asset.url} value={asset.url}>{asset.label}</MenuItem>
+              {catalogAssets.map((asset) => (
+                <MenuItem key={asset.download_url} value={asset.download_url}>
+                  {asset.label} · {formatAssetSize(asset.size)}
+                </MenuItem>
               ))}
             </TextField>
+            {catalogAssetsError && (
+              <Button size="small" onClick={() => void loadCatalogAssets()} disabled={catalogAssetsLoading}>
+                重新读取数据库列表
+              </Button>
+            )}
             <GithubDownloadProxyControl compact />
             {catalogStatus?.path && (
               <Typography variant="caption" color="text.secondary">
@@ -419,7 +547,7 @@ export default function CarrierProfilesPanel() {
             variant="contained"
             startIcon={busyKey === 'catalog' ? <CircularProgress size={16} color="inherit" /> : <Download />}
             onClick={() => void installCatalog()}
-            disabled={busyKey !== null}
+            disabled={busyKey !== null || catalogAssetsLoading || !catalogAssetUrl}
           >
             {catalogStatus?.usable ? '下载并覆盖' : '下载并安装'}
           </Button>

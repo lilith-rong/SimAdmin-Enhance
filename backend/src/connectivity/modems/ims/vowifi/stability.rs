@@ -912,6 +912,7 @@ mod tests {
 
     #[test]
     fn audit_covers_all_profiles_without_live_permissions() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
         let report = build_readiness_audit_report(&NoopRuntimeExecutor.describe());
 
         assert_eq!(report.stage, "m10_multi_carrier_stability");

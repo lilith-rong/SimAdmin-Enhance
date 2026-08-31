@@ -18,7 +18,7 @@
   <br/>
 
   <details>
-    <summary>查看 v1.1.3 界面截图（当前开发分支界面可能不同）</summary>
+    <summary>查看 v1.1.4 界面截图（当前开发分支界面可能不同）</summary>
     <br/>
   <picture>
     <img src="./static/Dashboard.png" width="100%" alt="Dashboard" />
@@ -54,7 +54,8 @@
 	<br/><br/>
   </picture>
   </details>
-  
+
+
 </div>
 
 # SimAdmin - 多线路 SIM/eSIM 与 IMS 管理中枢
@@ -146,6 +147,7 @@ systemctl enable --now simadmin.service
 |------|------|----------------|
 | [手动安装与部署](./docs/INSTALL.md) | 构建产物、手动安装、升级和登录恢复 | 是，面向最终用户 |
 | [运行环境与系统管理](./docs/ENVIRONMENT.md) | 依赖、路径、systemd、数据与硬件约束 | 是，面向设备运维 |
+| [架构说明](./docs/ARCHITECTURE.md) | 线路模型、前端信息架构、路由隔离、profile 选择 | 是，读代码前先看这份 |
 | [开发者指南](./docs/DEVELOPER.md) | 架构、前后端开发、构建、测试、ADB 调试 | 是，前后端子 README 已归并于此 |
 | [Bruno API 集合](./bruno-api/README.md) | API 调试方法、环境变量和线路级请求说明 | 是，可执行请求以 `.bru` 文件为准 |
 | [未完成开发计划](./docs/DEVELOPMENT_PLAN.md) | 未完成功能、真实硬件验收和发布前门槛 | 是，当前唯一后续开发计划 |
@@ -188,28 +190,6 @@ systemctl enable --now simadmin.service
 
 严禁将本项目或其衍生版本闭源后作为专有软件分发。
 
-## 社区交流
-
-⚠️ 温馨提示：群聊仅限日常讨论和经验分享，如需反馈问题或提交新需求。
-
-<table>
-  <thead>
-    <tr>
-      <th width="50%">QQ 群</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="./static/Community/Community_QQ_Dark.png" />
-          <source media="(prefers-color-scheme: light)" srcset="./static/Community/Community_QQ_Light.png" />
-          <img src="./static/Community/Community_QQ_Light.png" />
-        </picture>
-      </td>
-    </tr>
-  </tbody>
-</table>
 
 ---
 

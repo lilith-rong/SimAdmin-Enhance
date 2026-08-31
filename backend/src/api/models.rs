@@ -144,6 +144,29 @@ pub struct CarrierCatalogStatusResponse {
     pub message: String,
 }
 
+/// One downloadable catalog database offered by the upstream release.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CarrierCatalogAsset {
+    pub name: String,
+    /// Human-readable name derived from the filename, for the picker.
+    pub label: String,
+    pub size: u64,
+    pub download_url: String,
+}
+
+/// Every catalog database in the upstream release, discovered at request time.
+///
+/// Enumerated rather than hardcoded: the release adds and renames databases
+/// (an `iphone16promax-26.6` became `26.6.1`, silently breaking a pinned URL),
+/// so a fixed list goes stale without any signal.
+#[derive(Debug, Default, Serialize)]
+pub struct CarrierCatalogAssetsResponse {
+    pub release_tag: String,
+    pub published_at: String,
+    pub assets: Vec<CarrierCatalogAsset>,
+    pub message: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct CarrierCatalogInstallRequest {
     pub proxy_prefix: Option<String>,
@@ -178,7 +201,7 @@ pub struct EsimDownloadRequest {
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct ServingCell {
     pub tech: String,
-    pub cell_id: u32,
+    pub cell_id: u64,
     pub tac: u32,
 }
 
@@ -187,7 +210,7 @@ pub struct CellInfo {
     pub is_serving: bool,
     pub tech: String,
     #[serde(default)]
-    pub cell_id: u32,
+    pub cell_id: u64,
     pub band: String,
     pub arfcn: String,
     pub pci: String,
@@ -741,7 +764,7 @@ pub struct CellLocationInfo {
     pub mcc: String,
     pub mnc: String,
     pub lac: u32,
-    pub cid: u32,
+    pub cid: u64,
     pub signal_strength: i32,
     pub radio_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]

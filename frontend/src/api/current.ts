@@ -12,10 +12,12 @@ import type {
   CallSettingsResponse,
   CarrierProfileImportRequest,
   CarrierProfileImportResult,
+  CarrierCatalogAssetsResponse,
   CarrierCatalogInstallRequest,
   CarrierCatalogInstallResponse,
   CarrierCatalogStatusResponse,
   CarrierProfileRecord,
+  CarrierProfileSummary,
   CellLocationResponse,
   ResolvedCarrierProfile,
   StoredCarrierProfile,
@@ -57,6 +59,8 @@ import type {
   SimImsOverride,
   TrunkProfileResponse,
   VolteLineControlResponse,
+  VolteProfileSelectionConfig,
+  VolteProfileSelectionResponse,
   NetworkInfo,
   NetworkInterfacesResponse,
   NotificationConfig,
@@ -685,6 +689,19 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<VolteLineControlResponse>>(`/volte/lines/${encodeURIComponent(lineId)}`)
   }
 
+  async getVolteProfileSelection(lineId: string) {
+    return request<ApiResponse<VolteProfileSelectionResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/profile-selection`,
+    )
+  }
+
+  async setVolteProfileSelection(lineId: string, selection: VolteProfileSelectionConfig) {
+    return request<ApiResponse<VolteProfileSelectionResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/profile-selection`,
+      { method: 'PUT', body: JSON.stringify(selection) },
+    )
+  }
+
   async setVolteLineConnection(lineId: string, enabled: boolean) {
     return request<ApiResponse<VolteLineControlResponse>>(
       `/volte/lines/${encodeURIComponent(lineId)}/connection`,
@@ -1109,18 +1126,33 @@ class SimAdminCurrentAPI {
   }
 
   // ---- VoWiFi carrier profile database ----
-  // These replace the compiled-in carrier constants. Carriers with no row fall
-  // back to the built-ins, and finally to 3GPP-derived defaults.
+  // The browser receives a lightweight stored-only index. Complete records are
+  // loaded from their source database only when the operator opens one.
 
   async listVowifiCarrierProfiles() {
-    return request<ApiResponse<StoredCarrierProfile[]>>('/vowifi/carrier-profiles', {
+    return request<ApiResponse<CarrierProfileSummary[]>>('/vowifi/carrier-profiles', {
       timeoutMs: 15000,
     })
+  }
+
+  async getVowifiCarrierProfile(origin: 'database' | 'carrier_catalog', profileId: string) {
+    return request<ApiResponse<StoredCarrierProfile>>(
+      `/vowifi/carrier-profiles/detail/${origin}/${encodeURIComponent(profileId)}`,
+      { timeoutMs: 15000 },
+    )
   }
 
   async getCarrierCatalogStatus() {
     return request<ApiResponse<CarrierCatalogStatusResponse>>('/vowifi/carrier-catalog/status', {
       timeoutMs: 15000,
+    })
+  }
+
+  /** List the databases in the upstream release. Reaches GitHub, so it is slower
+   *  than a local status read. */
+  async getCarrierCatalogAssets() {
+    return request<ApiResponse<CarrierCatalogAssetsResponse>>('/vowifi/carrier-catalog/assets', {
+      timeoutMs: 45000,
     })
   }
 

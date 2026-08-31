@@ -141,6 +141,16 @@ function validate(record: CarrierProfileRecord): string | null {
   if (!ims.domain.trim() || !ims.realm.trim()) return 'IMS domain 与 realm 不能为空'
   if (ikev2.ike_proposals.length === 0) return 'IKE 提案不能为空'
   if (ikev2.esp_proposals.length === 0) return 'ESP 提案不能为空'
+  if (meta.mcc === '999' && !ikev2.identity_template?.trim()) {
+    return '私有网络（MCC 999）必须显式填写 IKE IDi 模板'
+  }
+  if (ikev2.identity_template) {
+    const remainder = ikev2.identity_template.replace(
+      /\{(?:imsi|mcc|mnc|mnc3|plmn|epdg_fqdn|ims_domain|ims_realm)\}/g,
+      '',
+    )
+    if (/[{}]/.test(remainder)) return 'IKE IDi 模板包含不支持的占位符'
+  }
   if (ims.register.expires_seconds <= 0) return 'REGISTER Expires 必须大于 0'
   for (const server of epdg.dns_servers) {
     // Accept `1.1.1.1` or `1.1.1.1:53`; IPv6 must be bracketed when a port is given.
@@ -174,9 +184,17 @@ function validate(record: CarrierProfileRecord): string | null {
   }
   if (
     (ims.register.include_pani_initial || ims.register.include_pani_authenticated) &&
+    ims.register.pani_identity_policy !== 'omit' &&
     !ims.register.access_network_info.trim()
   ) {
     return '携带 PANI 时必须填写接入网类型'
+  }
+  if (
+    ims.register.enable_cellular_network_info &&
+    ims.register.cni_identity_policy === 'static' &&
+    !ims.register.cellular_network_info?.trim()
+  ) {
+    return 'CNI 使用 static 策略时必须填写静态蜂窝网络信息'
   }
   if (voice.preferred_codecs.length === 0) return '语音编解码优先级不能为空'
   if (ut.enabled && !ut.xcap_root?.trim()) return '启用补充业务后必须填写 XCAP root'
@@ -419,6 +437,16 @@ export default function CarrierProfileEditor({
                 }
               />
             </Stack>
+            <TextField
+              fullWidth
+              label="IKE IDi 模板"
+              value={draft.ikev2.identity_template ?? ''}
+              placeholder="0{imsi}@nai.epc.mnc{mnc3}.mcc{mcc}.3gppnetwork.org"
+              helperText="公开 PLMN 留空时使用 3GPP permanent NAI；MCC 999 必填。可用 {imsi}、{mcc}、{mnc}、{mnc3}、{plmn}、{epdg_fqdn}、{ims_domain}、{ims_realm}，值会结合当前线路 SIM/基带身份展开"
+              onChange={(e) =>
+                patch('ikev2', { identity_template: e.target.value.trim() || null })
+              }
+            />
             <ListField
               label="IKE 提案"
               value={draft.ikev2.ike_proposals}
@@ -662,31 +690,73 @@ export default function CarrierProfileEditor({
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
               <TextField
                 fullWidth
-                label="接入网类型"
+                label="PANI 静态接入网信息"
                 value={draft.ims.register.access_network_info}
-                placeholder="IEEE-802.11"
-                helperText="写入 P-Access-Network-Info，校验此头的运营商会拒绝错误值"
+                disabled={draft.ims.register.pani_identity_policy === 'omit'}
+                placeholder="IEEE-802.11 或 3GPP-E-UTRAN-FDD"
+                helperText="static 只使用此值；dynamic_if_known 使用实时接入信息，缺失时回退此值；required_dynamic 缺失实时信息时注册失败"
                 onChange={(e) => patchRegister({ access_network_info: e.target.value })}
               />
               <FormControl fullWidth>
-                <InputLabel>Contact 格式</InputLabel>
+                <InputLabel>PANI 身份策略</InputLabel>
                 <Select
-                  label="Contact 格式"
-                  value={draft.ims.register.contact_mode}
-                  onChange={(e) =>
-                    patchRegister({
-                      contact_mode: e.target
-                        .value,
-                    })
-                  }
+                  label="PANI 身份策略"
+                  value={draft.ims.register.pani_identity_policy}
+                  onChange={(e) => patchRegister({ pani_identity_policy: e.target.value })}
                 >
-                  <MenuItem value="android_default">android_default</MenuItem>
-                  <MenuItem value="standard">standard</MenuItem>
-                  <MenuItem value="legacy">legacy</MenuItem>
-                  <MenuItem value="custom">custom</MenuItem>
+                  <MenuItem value="omit">omit（不发送）</MenuItem>
+                  <MenuItem value="static">static（只用 Profile 静态值）</MenuItem>
+                  <MenuItem value="dynamic_if_known">dynamic_if_known（动态优先、静态兜底）</MenuItem>
+                  <MenuItem value="required_dynamic">required_dynamic（无实时信息则失败）</MenuItem>
                 </Select>
               </FormControl>
             </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                fullWidth
+                label="CNI 静态蜂窝网络信息"
+                value={draft.ims.register.cellular_network_info ?? ''}
+                disabled={
+                  !draft.ims.register.enable_cellular_network_info ||
+                  draft.ims.register.cni_identity_policy === 'omit'
+                }
+                placeholder="3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=..."
+                helperText="VoWiFi 的蜂窝 CNI 与 WLAN PANI 独立配置；static 需要填写此值"
+                onChange={(e) =>
+                  patchRegister({ cellular_network_info: e.target.value || null })
+                }
+              />
+              <FormControl fullWidth disabled={!draft.ims.register.enable_cellular_network_info}>
+                <InputLabel>CNI 身份策略</InputLabel>
+                <Select
+                  label="CNI 身份策略"
+                  value={draft.ims.register.cni_identity_policy}
+                  onChange={(e) => patchRegister({ cni_identity_policy: e.target.value })}
+                >
+                  <MenuItem value="omit">omit（不发送）</MenuItem>
+                  <MenuItem value="static">static（只用 Profile 静态值）</MenuItem>
+                  <MenuItem value="dynamic_if_known">dynamic_if_known（动态优先、静态兜底）</MenuItem>
+                  <MenuItem value="required_dynamic">required_dynamic（无实时信息则失败）</MenuItem>
+                </Select>
+              </FormControl>
+            </Stack>
+            <FormControl fullWidth>
+              <InputLabel>Contact 格式</InputLabel>
+              <Select
+                label="Contact 格式"
+                value={draft.ims.register.contact_mode}
+                onChange={(e) =>
+                  patchRegister({
+                    contact_mode: e.target.value,
+                  })
+                }
+              >
+                <MenuItem value="android_default">android_default</MenuItem>
+                <MenuItem value="standard">standard</MenuItem>
+                <MenuItem value="legacy">legacy</MenuItem>
+                <MenuItem value="custom">custom</MenuItem>
+              </Select>
+            </FormControl>
             <TextField
               label="Supported 头"
               value={draft.ims.register.supported_header}

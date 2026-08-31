@@ -24,7 +24,7 @@ use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
 use super::{
     errors::{code, VolteError},
     pcscf::ImsIpSettings,
-    plan::{FailureClass, ImsConnectionPlan, IpType},
+    plan::{FailureClass, ImsConnectionPlan, IpFamily, IpType},
 };
 
 /// Test default only. Production registration receives the IMS APN from the
@@ -234,6 +234,13 @@ where
                         error: result.as_ref().err().cloned(),
                     })
                     .await;
+                    // A connected dual-stack bearer may legitimately carry
+                    // only one family (for example, Maxis often rejects the
+                    // IPv6 leg with `prefix-unavailable`). It still has a
+                    // usable IMS data path, and creating another bearer while
+                    // this one is connected can exhaust the 410's small
+                    // WDS/DHCP pool. The SIP family loop below selects the
+                    // address that was actually delivered.
                     return result;
                 }
                 observe(BearerAttempt {
@@ -252,25 +259,30 @@ where
                             error: None,
                         })
                         .await;
+                        // Keep a reconnected partial dual bearer for the same
+                        // reason as a reused one: it already owns the IMS WDS
+                        // session and has at least one usable address. Starting
+                        // additional single-family bearers here can crash the
+                        // QCM410 DHCP manager; family selection happens later
+                        // in the SIP loop.
                         return Ok(bearer);
                     }
                     Err(error) => {
                         let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
                             .await
                             .unwrap_or_default();
-                        required_fallback =
-                            FailureClass::from_details(&after)
-                                .forced_family()
-                                .map(|f| {
-                                    match f {
-                                crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv6 => {
-                                    IpType::Ipv6
-                                }
-                                crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv4 => {
-                                    IpType::Ipv4
-                                }
+                        required_fallback = FailureClass::from_details(&format!(
+                            "{}\n{}", after, error
+                        ))
+                        .forced_family()
+                        .map(|f| match f {
+                            crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv6 => {
+                                IpType::Ipv6
                             }
-                                });
+                            crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv4 => {
+                                IpType::Ipv4
+                            }
+                        });
                         observe(BearerAttempt {
                             ip_type: "ipv4v6".to_string(),
                             source: "reconnected".to_string(),
@@ -320,9 +332,21 @@ where
                     error: None,
                 })
                 .await;
+                // `ipv4v6` can be reported connected with only one address
+                // family. That is a successful bearer, not a reason to open
+                // more WDS sessions: the 410 firmware can fault when a second
+                // IMS bearer is created while the first remains connected.
+                // Single-family fallbacks are reserved for a dual-stack
+                // connection failure (the Err branch below); a partial dual
+                // bearer proceeds to the per-family SIP loop.
                 return Ok(bearer);
             }
             Err(failure) => {
+                let class = if ip_type == "ipv4v6" {
+                    Some(classify_attempt_failure(&failure))
+                } else {
+                    None
+                };
                 observe(BearerAttempt {
                     ip_type: ip_type.to_string(),
                     source: "created".to_string(),
@@ -334,8 +358,7 @@ where
                 // Only fan out into single-family fallbacks after a dual-stack
                 // attempt fails. Single-family failures are terminal for that
                 // family; the plan already decided the order.
-                if ip_type == "ipv4v6" {
-                    let class = FailureClass::from_details(&failure.details);
+                if let Some(class) = class {
                     for fallback in plan.bearer_fallbacks_after(class) {
                         pending.push_back(fallback.as_mm_str());
                     }
@@ -399,6 +422,20 @@ struct BearerAttemptFailure {
     details: String,
 }
 
+/// Preserve an explicit network-family rejection even when `mmcli --create-bearer`
+/// fails before a bearer object exists. In that path there is no status dump to
+/// inspect, so the command error itself is the only source of the forced-family
+/// signal.
+fn classify_attempt_failure(failure: &BearerAttemptFailure) -> FailureClass {
+    let error = failure.error.to_string();
+    let details = if failure.details.is_empty() {
+        error
+    } else {
+        format!("{}\n{}", failure.details, error)
+    };
+    FailureClass::from_details(&details)
+}
+
 async fn create_and_connect_attempt(
     modem: &str,
     request: &BearerRequest,
@@ -411,8 +448,8 @@ async fn create_and_connect_attempt(
     )
     .await
     .map_err(|error| BearerAttemptFailure {
+        details: error.to_string(),
         error,
-        details: String::new(),
     })?;
     let path = parse_created_bearer_path(&created).ok_or_else(|| BearerAttemptFailure {
         error: VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING),
@@ -608,9 +645,13 @@ fn worker_host_route_op(
         .settings
         .local_addr_for_family(host)
         .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+    let via = bearer
+        .settings
+        .gateway_for_family(host)
+        .map(|gateway| gateway.to_string());
     Ok(NetConfigOp::RouteReplace {
         target: host_selector(host),
-        via: None,
+        via,
         dev: Some(bearer.interface.clone()),
         src: Some(source.to_string()),
         table: None,
@@ -661,10 +702,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
         };
         VolteError::with_detail(code::BEARER_NETDEV_RUNTIME_ERROR, detail)
     };
-    if !faults
-        .inspect_data_interface(interface)
-        .permits_bring_up()
-    {
+    if !faults.inspect_data_interface(interface).permits_bring_up() {
         return Err(latched_error(interface, "runtime_status=error before OPEN"));
     }
 
@@ -676,10 +714,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
             return Ok(());
         }
         return Err(
-            if !faults
-                .inspect_data_interface(interface)
-                .permits_bring_up()
-            {
+            if !faults.inspect_data_interface(interface).permits_bring_up() {
                 latched_error(interface, &error.to_string())
             } else {
                 VolteError::with_detail(
@@ -694,10 +729,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
         if interface_is_up(interface).await {
             return Ok(());
         }
-        if !faults
-            .inspect_data_interface(interface)
-            .permits_bring_up()
-        {
+        if !faults.inspect_data_interface(interface).permits_bring_up() {
             return Err(latched_error(interface, "runtime_status=error after OPEN"));
         }
         if attempt < 3 {
@@ -852,19 +884,19 @@ async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result
     let destination = host_selector(host);
     let family = if host.is_ipv6() { Some("-6") } else { None };
     let table = table.to_string();
+    let gateway = bearer
+        .settings
+        .gateway_for_family(host)
+        .map(|gateway| gateway.to_string());
     let mut args = Vec::new();
     if let Some(family) = family {
         args.push(family);
     }
-    args.extend_from_slice(&[
-        "route",
-        "replace",
-        &destination,
-        "dev",
-        &bearer.interface,
-        "table",
-        &table,
-    ]);
+    args.extend_from_slice(&["route", "replace", &destination]);
+    if let Some(gateway) = gateway.as_deref() {
+        args.extend_from_slice(&["via", gateway]);
+    }
+    args.extend_from_slice(&["dev", &bearer.interface, "table", &table]);
     run_ip(&args).await.map(|_| ())
 }
 
@@ -1275,6 +1307,37 @@ mod tests {
         assert_eq!(
             plan_v6.bearer_fallbacks_after(FailureClass::from_details(generic)),
             vec![super::IpType::Ipv6, super::IpType::Ipv4]
+        );
+    }
+
+    #[test]
+    fn create_command_family_rejection_is_not_replaced_by_default_fallback() {
+        use crate::platform::config::VolteIpFamilyPreference;
+
+        let ipv6 = BearerAttemptFailure {
+            error: VolteError::with_detail(
+                code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+                "org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed",
+            ),
+            details: String::new(),
+        };
+        let ipv4 = BearerAttemptFailure {
+            error: VolteError::with_detail(
+                code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+                "org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv4OnlyAllowed",
+            ),
+            details: String::new(),
+        };
+
+        assert_eq!(
+            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First)
+                .bearer_fallbacks_after(classify_attempt_failure(&ipv6)),
+            vec![IpType::Ipv6]
+        );
+        assert_eq!(
+            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First)
+                .bearer_fallbacks_after(classify_attempt_failure(&ipv4)),
+            vec![IpType::Ipv4]
         );
     }
 
