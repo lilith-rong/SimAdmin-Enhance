@@ -87,6 +87,7 @@ impl NetnsName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+<<<<<<< Updated upstream
 
     /// Adopt a namespace name that already exists on this host.
     ///
@@ -101,6 +102,8 @@ impl NetnsName {
         validate_namespace_name(name)?;
         Ok(Self(name.to_string()))
     }
+=======
+>>>>>>> Stashed changes
 }
 
 impl fmt::Display for NetnsName {
@@ -176,6 +179,7 @@ impl fmt::Display for NetnsError {
 
 impl std::error::Error for NetnsError {}
 
+<<<<<<< Updated upstream
 /// Validate a namespace name adopted from the filesystem.
 ///
 /// Namespace names are directory entries under `/run/netns`, so unlike
@@ -198,6 +202,8 @@ fn validate_namespace_name(name: &str) -> Result<(), NetnsError> {
     Ok(())
 }
 
+=======
+>>>>>>> Stashed changes
 fn validate_link_name(name: &str) -> Result<(), NetnsError> {
     if name.is_empty()
         || name.len() >= 16
@@ -424,6 +430,7 @@ pub async fn move_iface_out(namespace: &NetnsName, interface: &str) -> Result<()
     ))
 }
 
+<<<<<<< Updated upstream
 /// Every namespace currently present on this host, in a stable order.
 ///
 /// Both conventional mount points are read because `exists` accepts either.
@@ -634,6 +641,8 @@ pub async fn reclaim_all_stranded_hardware_links() {
 #[cfg(not(target_os = "linux"))]
 pub async fn reclaim_all_stranded_hardware_links() {}
 
+=======
+>>>>>>> Stashed changes
 /// Create a veth pair that gives the UE namespace an Internet egress through
 /// the host (used by VoWiFi and the per-UE proxy in later phases).
 ///
@@ -809,9 +818,13 @@ pub async fn teardown_veth(host_if: &str) -> Result<(), NetnsError> {
 /// inside the UE namespace egress through the host side of the veth pair;
 /// MASQUERADE makes that traffic routable when the host's primary interface
 /// uses a different subnet. Idempotent: the rule is only appended when the
+<<<<<<< Updated upstream
 /// check finds it missing. `iptables` is preferred for compatibility with
 /// embedded images (including the QCM410 image); systems that only expose
 /// nftables use the dedicated `simadmin_nat` table as a fallback.
+=======
+/// check finds it missing.
+>>>>>>> Stashed changes
 #[cfg(target_os = "linux")]
 pub async fn ensure_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError> {
     let cidr = format!("{host_addr}/30");
@@ -828,6 +841,7 @@ pub async fn ensure_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError>
             tracing::warn!(error = %error, "Failed to spawn sysctl for UE veth forwarding")
         }
     }
+<<<<<<< Updated upstream
     let iptables_error = match ensure_host_veth_nat_iptables(&cidr).await {
         Ok(()) => return Ok(()),
         Err(error) => Some(error),
@@ -875,13 +889,19 @@ const NFT_NAT_CHAIN: &str = "postrouting";
 
 #[cfg(target_os = "linux")]
 async fn ensure_host_veth_nat_iptables(cidr: &str) -> Result<(), NetnsError> {
+=======
+>>>>>>> Stashed changes
     let mut args = vec![
         "-t".to_string(),
         "nat".to_string(),
         "-C".to_string(),
         "POSTROUTING".to_string(),
         "-s".to_string(),
+<<<<<<< Updated upstream
         cidr.to_string(),
+=======
+        cidr.clone(),
+>>>>>>> Stashed changes
         "-j".to_string(),
         "MASQUERADE".to_string(),
     ];
@@ -916,15 +936,28 @@ async fn ensure_host_veth_nat_iptables(cidr: &str) -> Result<(), NetnsError> {
     ))
 }
 
+<<<<<<< Updated upstream
 #[cfg(target_os = "linux")]
 async fn remove_host_veth_nat_iptables(cidr: &str) -> Result<(), NetnsError> {
+=======
+/// Remove the host-side SNAT rule installed by [`ensure_host_veth_nat`].
+/// Missing rules are treated as success so teardown is safe after a partial
+/// setup or a previous process crash.
+#[cfg(target_os = "linux")]
+pub async fn remove_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError> {
+    let cidr = format!("{host_addr}/30");
+>>>>>>> Stashed changes
     let args = vec![
         "-t".to_string(),
         "nat".to_string(),
         "-D".to_string(),
         "POSTROUTING".to_string(),
         "-s".to_string(),
+<<<<<<< Updated upstream
         cidr.to_string(),
+=======
+        cidr,
+>>>>>>> Stashed changes
         "-j".to_string(),
         "MASQUERADE".to_string(),
     ];
@@ -954,6 +987,7 @@ async fn remove_host_veth_nat_iptables(cidr: &str) -> Result<(), NetnsError> {
     ))
 }
 
+<<<<<<< Updated upstream
 #[cfg(target_os = "linux")]
 async fn ensure_host_veth_nat_nft(cidr: &str) -> Result<(), NetnsError> {
     // Native nftables does not require a system-wide ruleset or a shell. The
@@ -1135,6 +1169,8 @@ fn combine_nat_errors(iptables_error: Option<NetnsError>, nft_error: NetnsError)
     }
 }
 
+=======
+>>>>>>> Stashed changes
 /// Remove the host-side SNAT rule for a UE veth subnet. Unsupported off
 /// Linux.
 #[cfg(not(target_os = "linux"))]
@@ -1268,6 +1304,7 @@ mod tests {
         assert!(validate_link_name("wwan0").is_ok());
     }
 
+<<<<<<< Updated upstream
     #[test]
     fn adopted_namespace_names_reject_path_traversal() {
         // These become `ip netns exec` arguments, so a separator or a relative
@@ -1349,6 +1386,8 @@ mod tests {
         assert_eq!(nft_rule_handle(listing, "10.200.12.156/30"), None);
     }
 
+=======
+>>>>>>> Stashed changes
     #[tokio::test]
     #[cfg(not(target_os = "linux"))]
     async fn non_linux_operations_report_unsupported() {

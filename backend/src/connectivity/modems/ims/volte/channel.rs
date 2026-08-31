@@ -15,11 +15,15 @@ use std::{
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
+<<<<<<< Updated upstream
 use crate::connectivity::core::{
     access::{ImsChannel, ImsRequeue},
     context::ImsRoute,
     ImsError,
 };
+=======
+use crate::connectivity::core::{access::ImsChannel, context::ImsRoute, ImsError};
+>>>>>>> Stashed changes
 use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
 
 const MAX_SIP_DATAGRAM: usize = 65_535;
@@ -28,10 +32,13 @@ pub struct VolteSipChannel {
     send_socket: Option<UdpSocket>,
     receive_socket: Option<UdpSocket>,
     reserved_receive_socket: Option<ReservedReceiveSocket>,
+<<<<<<< Updated upstream
     /// Complete frames set aside by a REGISTER transaction because they belong
     /// to a different dialog (NOTIFY/MESSAGE/MWI). They are handed back to the
     /// session loop after the transaction completes.
     requeued: ImsRequeue,
+=======
+>>>>>>> Stashed changes
     route: ImsRoute,
     /// Port to advertise in Via/Contact once a security association is active.
     /// TS 24.229 §5.1.1.2.2 b)/c): a UDP request protected by an SA is sourced
@@ -122,9 +129,13 @@ impl VolteSipChannel {
             send_socket: Some(socket),
             receive_socket: None,
             reserved_receive_socket: None,
+<<<<<<< Updated upstream
             requeued: ImsRequeue::default(),
             route,
             advertised_local_port: None,
+=======
+            route,
+>>>>>>> Stashed changes
             interface: interface.map(ToOwned::to_owned),
             security_verify,
         })
@@ -259,12 +270,16 @@ impl VolteSipChannel {
         self.send_socket = Some(send_socket);
         self.receive_socket = Some(receive_socket);
         self.route = send_route;
+<<<<<<< Updated upstream
         // Same rule as the host path: advertise the protected server port.
         self.advertised_local_port = Some(receive_local.port());
+=======
+>>>>>>> Stashed changes
         self.security_verify = security_verify;
         Ok(())
     }
 
+<<<<<<< Updated upstream
     /// Route to put in Via/Contact. Identical to [`Self::send_route`] until a
     /// security association is active, after which the local port becomes the
     /// protected server port while sends keep using the client port.
@@ -286,6 +301,8 @@ impl VolteSipChannel {
         self.route
     }
 
+=======
+>>>>>>> Stashed changes
     pub fn local_addr(&self) -> Result<SocketAddr, ImsError> {
         self.send_socket
             .as_ref()

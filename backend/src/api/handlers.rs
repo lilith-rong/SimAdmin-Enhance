@@ -28,9 +28,13 @@ use crate::{
     connectivity::modems::ims::vowifi::restore::RestorePhase,
     connectivity::modems::ims::vowifi::{
         live::{
+<<<<<<< Updated upstream
             clear_live_runtime_for_line, live_ims_refresh_failure_count_for_line,
             live_ims_refresh_rebuild_pending_for_line, live_xcap_access_for_line,
             mark_live_ims_refresh_rebuild_pending, record_live_ims_refresh_failure,
+=======
+            clear_live_runtime_for_line, live_xcap_access_for_line,
+>>>>>>> Stashed changes
             send_live_sms_over_ims_for_line, verify_live_sim_auth_access_for_line,
             LiveImsRefreshFailureDecision, LIVE_IMS_REFRESH_REBUILD_FAILURES,
         },
@@ -3482,6 +3486,35 @@ async fn prepare_line_data_slot_for_volte(
     let primary_data_active = primary_data_interface.is_some();
     let mut secondary_data_active = line.secondary_data.interface().await.is_some();
 
+<<<<<<< Updated upstream
+=======
+    if !primary_data_active {
+        let data_start_error = start_line_data_runtime_locked(app, line, profile)
+            .await
+            .err();
+        secondary_data_active = line.secondary_data.interface().await.is_some();
+        if let Some(error) = data_start_error {
+            line.data_proxy.record_error(error.clone()).await;
+            if secondary_data_active {
+                // The DATA6 bearer can be healthy even when the local proxy
+                // listener fails. Keep the real allocation in that case.
+                warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
+            } else {
+                warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; VoLTE allocation will use the observed slot state");
+            }
+        }
+    } else if let Some(interface) = primary_data_interface.as_deref() {
+        if let Err(error) = line
+            .data_proxy
+            .start_for_line(&binding.line_id, interface, &profile.data_proxy)
+            .await
+        {
+            line.data_proxy.record_error(error.clone()).await;
+            warn!(line_id = %binding.line_id, error = %error, "Primary data is active but its local proxy is unavailable");
+        }
+    }
+
+>>>>>>> Stashed changes
     let inputs = DataSlotInputs {
         data_requested: true,
         primary_data_active,
@@ -4472,6 +4505,7 @@ async fn send_sms_over_volte_path(
         return Err("line_volte_connection_disabled".to_string());
     }
     if !line.volte.status().await.registered {
+<<<<<<< Updated upstream
         if !line.begin_volte_retry() {
             return Err("volte_profile_restore_in_progress".to_string());
         }
@@ -4495,6 +4529,38 @@ async fn send_sms_over_volte_path(
             return Err(status
                 .last_error
                 .unwrap_or_else(|| "volte_profile_attempts_exhausted".to_string()));
+=======
+        let (_, sim_override) = ims_override_for_line(app, line_id).await?;
+        let ip_families = app.config_manager.get_line_volte_ip_families(line_id);
+        let device =
+            crate::connectivity::modems::ims::volte::live::VolteDeviceBinding::from_modem(&binding)
+                .map_err(|error| error.to_string())?;
+        let _bearer_guard = line.bearer_operation_lock.lock().await;
+        let data_slot_mode = prepare_line_data_slot_for_volte(app, &line, &profile)
+            .await
+            .map_err(|error| error.to_string())?;
+        let _guard = line.volte_connect_lock.lock().await;
+        if !line.volte.status().await.registered {
+            crate::connectivity::modems::ims::volte::live::connect_live_for_line(
+                &line.volte_live,
+                &device,
+                &line.volte,
+                app.config_manager.get_line_volte_voice_enabled(line_id),
+                &ip_families,
+                app.config_manager.get_line_volte_ip_families_auto(line_id),
+                profile.roaming_allowed,
+                data_slot_mode,
+                app.config_manager
+                    .get_line_sms_path_policy(line_id)
+                    .dedupe_enabled,
+                profile_store(app),
+                sim_override,
+                Arc::clone(&app.database),
+                Arc::clone(&app.notification_sender),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+>>>>>>> Stashed changes
         }
     }
     let sim =
@@ -9539,6 +9605,7 @@ fn line_volte_restore_enabled(
 ) -> bool {
     let profile = app.config_manager.get_line_profile(&line.binding().line_id);
     profile.enabled && profile.volte_connection_enabled && !profile.airplane_mode_enabled
+<<<<<<< Updated upstream
 }
 
 fn volte_profile_restart_is_current(
@@ -9662,6 +9729,8 @@ async fn wait_for_volte_batch_delay(
         }
         tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
     }
+=======
+>>>>>>> Stashed changes
 }
 
 async fn wait_for_line_modem(
@@ -9796,6 +9865,7 @@ async fn run_line_volte_restore_batch(
                 .await;
             return;
         }
+<<<<<<< Updated upstream
 
         line.volte.begin_profile_attempt(attempt, candidate).await;
         let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
@@ -9804,17 +9874,26 @@ async fn run_line_volte_restore_batch(
                 "volte_modem_refresh_failed",
                 error.to_string(),
             );
+=======
+        let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        if let Err(error) = refreshed {
+>>>>>>> Stashed changes
             line.volte
                 .update(|state| {
                     state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
                     state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Modem;
                     state.recovery_state =
                         crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
+<<<<<<< Updated upstream
                     state.last_error = Some(attempt_error.to_string());
+=======
+                    state.last_error = Some(format!("volte_modem_refresh_failed:{error}"));
+>>>>>>> Stashed changes
                     state.next_retry_at =
                         Some(volte_next_retry_at(VOLTE_MODEM_MISSING_POLL_DELAY_SECS));
                 })
                 .await;
+<<<<<<< Updated upstream
             line.volte
                 .finish_profile_attempt(attempt, candidate, "failed", Some(&attempt_error))
                 .await;
@@ -9828,6 +9907,10 @@ async fn run_line_volte_restore_batch(
                 {
                     return;
                 }
+=======
+            if attempt < max_attempts {
+                tokio::time::sleep(Duration::from_secs(VOLTE_MODEM_MISSING_POLL_DELAY_SECS)).await;
+>>>>>>> Stashed changes
                 continue;
             }
             break;
@@ -9905,6 +9988,32 @@ async fn run_line_volte_restore_batch(
                             )
                             .await
                         }
+<<<<<<< Updated upstream
+=======
+                        let ip_families = app
+                            .config_manager
+                            .get_line_volte_ip_families(&binding.line_id);
+                        crate::connectivity::modems::ims::volte::live::connect_live_for_line(
+                            &line.volte_live,
+                            &device,
+                            &line.volte,
+                            app.config_manager
+                                .get_line_volte_voice_enabled(&binding.line_id),
+                            &ip_families,
+                            app.config_manager
+                                .get_line_volte_ip_families_auto(&binding.line_id),
+                            profile.roaming_allowed,
+                            data_slot_mode,
+                            app.config_manager
+                                .get_line_sms_path_policy(&binding.line_id)
+                                .dedupe_enabled,
+                            profile_store(app),
+                            sim_override,
+                            Arc::clone(&app.database),
+                            Arc::clone(&app.notification_sender),
+                        )
+                        .await
+>>>>>>> Stashed changes
                     }
                 },
                 Err(error) => Err(error),
@@ -9963,6 +10072,7 @@ async fn run_line_volte_restore_batch(
                 // activation against it can escalate to a modem subsystem
                 // restart and take the whole device down, so stop the batch and
                 // wait for an explicit operator retry instead.
+<<<<<<< Updated upstream
                 if batch_action == VolteProfileBatchAction::AbortUnsafe {
                     // The crash this abort guards against re-enumerates the
                     // modem, and that hotplug resets the VoLTE snapshot. Record
@@ -9975,6 +10085,11 @@ async fn run_line_volte_restore_batch(
                     } else {
                         Some(line.note_baseband_wedged())
                     };
+=======
+                if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(&error)
+                    == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
+                {
+>>>>>>> Stashed changes
                     warn!(
                         line_id = %binding.line_id,
                         error = %error,

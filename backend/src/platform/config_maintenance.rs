@@ -761,6 +761,7 @@ fn maintenance_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{name}.{suffix}-{}", timestamp_tag()))
 }
 
+<<<<<<< Updated upstream
 fn sqlite_maintenance_path(path: &Path, suffix: &str) -> PathBuf {
     maintenance_path(path, suffix)
 }
@@ -782,4 +783,250 @@ fn paired_config_path(database_snapshot: &Path, config_path: &Path) -> PathBuf {
 
 fn timestamp_tag() -> String {
     chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+=======
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectivity::modems::ims::profile_override::{
+        SimBindingKey, SimOverride, SimOverrideStore,
+    };
+
+    fn test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-config-maintenance-{name}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn source_database(path: &Path, ttl: i64) {
+        let manager = ConfigManager::try_new(path.to_path_buf()).unwrap();
+        let mut security = manager.get_security();
+        security.session_ttl_seconds = ttl;
+        manager.set_security(security).unwrap();
+        let key = SimBindingKey::resolve(Some("89014103211118510720"), None).unwrap();
+        let mut override_ = SimOverride::default();
+        override_.ims_common.voicemail_number = Some("+18005551234".to_string());
+        SimOverrideStore::sqlite(path.to_path_buf())
+            .save(&key, &override_)
+            .unwrap();
+    }
+
+    #[test]
+    fn online_backup_contains_app_config_and_sim_overrides() {
+        let dir = test_dir("backup");
+        let source = dir.join("config.sqlite3");
+        let backup = dir.join("backup.sqlite3");
+        source_database(&source, 7_200);
+        assert_eq!(backup_database(&source, &backup).unwrap(), 1);
+        assert_eq!(
+            ConfigManager::try_new(backup.clone())
+                .unwrap()
+                .get_security()
+                .session_ttl_seconds,
+            7_200
+        );
+        let connection = open_read_only(&backup).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM ims_sim_overrides", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_export_import_replaces_atomically_and_retains_rollback() {
+        let dir = test_dir("import");
+        let source = dir.join("source.sqlite3");
+        let target = dir.join("target.sqlite3");
+        let export = dir.join("config-export.json");
+        source_database(&source, 7_200);
+        source_database(&target, 9_000);
+        assert_eq!(export_json(&source, &export).unwrap(), 1);
+        let rollback = import_json(&target, &export).unwrap().unwrap();
+        assert!(rollback.exists());
+        assert_eq!(
+            ConfigManager::try_new(target)
+                .unwrap()
+                .get_security()
+                .session_ttl_seconds,
+            7_200
+        );
+        assert_eq!(
+            ConfigManager::try_new(rollback)
+                .unwrap()
+                .get_security()
+                .session_ttl_seconds,
+            9_000
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_import_does_not_modify_target() {
+        let dir = test_dir("invalid-import");
+        let target = dir.join("target.sqlite3");
+        let invalid = dir.join("invalid.json");
+        source_database(&target, 8_000);
+        fs::write(&invalid, b"{not-json").unwrap();
+        assert!(import_json(&target, &invalid).is_err());
+        assert_eq!(
+            ConfigManager::try_new(target)
+                .unwrap()
+                .get_security()
+                .session_ttl_seconds,
+            8_000
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn destination_is_never_overwritten() {
+        let dir = test_dir("existing-destination");
+        let source = dir.join("source.sqlite3");
+        let destination = dir.join("existing.sqlite3");
+        source_database(&source, 7_200);
+        fs::write(&destination, b"sentinel").unwrap();
+        assert_eq!(
+            backup_database(&source, &destination).unwrap_err(),
+            "config_maintenance_destination_exists"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"sentinel");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn forged_override_binding_hash_is_rejected_before_target_write() {
+        let dir = test_dir("forged-binding");
+        let source = dir.join("source.sqlite3");
+        let target = dir.join("target.sqlite3");
+        let export = dir.join("config-export.json");
+        source_database(&source, 7_200);
+        source_database(&target, 9_000);
+        export_json(&source, &export).unwrap();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&export).unwrap()).unwrap();
+        document["overrides"][0]["binding_hash"] = serde_json::Value::String("0".repeat(64));
+        fs::write(&export, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let error = import_json(&target, &export).unwrap_err();
+        assert!(error.contains("sim_override_binding_hash_mismatch"));
+        assert_eq!(
+            ConfigManager::try_new(target)
+                .unwrap()
+                .get_security()
+                .session_ttl_seconds,
+            9_000
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupted_database_and_future_schema_are_rejected() {
+        let dir = test_dir("corruption-version");
+        let corrupt = dir.join("corrupt.sqlite3");
+        fs::write(&corrupt, b"not a sqlite database").unwrap();
+        let corrupt_backup = dir.join("corrupt-backup.sqlite3");
+        assert!(backup_database(&corrupt, &corrupt_backup).is_err());
+        assert!(!corrupt_backup.exists());
+
+        let future = dir.join("future.sqlite3");
+        source_database(&future, 7_200);
+        let connection = Connection::open(&future).unwrap();
+        connection
+            .execute(
+                "UPDATE app_config SET storage_schema_version = 999 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let future_backup = dir.join("future-backup.sqlite3");
+        assert_eq!(
+            backup_database(&future, &future_backup).unwrap_err(),
+            "config_maintenance_storage_schema_unsupported"
+        );
+        assert!(!future_backup.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn online_backup_takes_a_consistent_snapshot_during_writes() {
+        let dir = test_dir("concurrent-backup");
+        let source = dir.join("source.sqlite3");
+        source_database(&source, 7_200);
+        let writer_path = source.clone();
+        let writer = std::thread::spawn(move || {
+            let manager = ConfigManager::try_new(writer_path).unwrap();
+            for value in 7_201..7_221 {
+                let mut security = manager.get_security();
+                security.session_ttl_seconds = value;
+                manager.set_security(security).unwrap();
+            }
+        });
+        let backup = dir.join("backup.sqlite3");
+        backup_database(&source, &backup).unwrap();
+        writer.join().unwrap();
+
+        let ttl = ConfigManager::try_new(backup)
+            .unwrap()
+            .get_security()
+            .session_ttl_seconds;
+        assert!((7_200..=7_220).contains(&ttl));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_source_can_be_backed_up_without_wal_copying() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("readonly-source");
+        let source = dir.join("source.sqlite3");
+        source_database(&source, 7_200);
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o400)).unwrap();
+        let backup = dir.join("backup.sqlite3");
+        backup_database(&source, &backup).unwrap();
+        assert_eq!(
+            ConfigManager::try_new(backup)
+                .unwrap()
+                .get_security()
+                .session_ttl_seconds,
+            7_200
+        );
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sqlite_restore_replaces_config_and_retains_previous_snapshot() {
+        let dir = test_dir("restore");
+        let source = dir.join("source.sqlite3");
+        let target = dir.join("target.sqlite3");
+        source_database(&source, 7_200);
+        source_database(&target, 9_000);
+
+        let rollback = restore_database(&target, &source).unwrap().unwrap();
+        assert_eq!(
+            ConfigManager::try_new(target)
+                .unwrap()
+                .get_security()
+                .session_ttl_seconds,
+            7_200
+        );
+        assert_eq!(
+            ConfigManager::try_new(rollback)
+                .unwrap()
+                .get_security()
+                .session_ttl_seconds,
+            9_000
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+>>>>>>> Stashed changes
 }

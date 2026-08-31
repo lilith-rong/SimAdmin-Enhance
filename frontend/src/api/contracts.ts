@@ -597,10 +597,13 @@ export interface VolteRuntimeStatus {
   profile_id?: string
   profile_source?: 'carrier_catalog' | 'database' | 'derived'
   profile_fallback_reason?: string
+<<<<<<< Updated upstream
   profile_candidate_index?: number
   profile_candidate_source?: VolteProfileSource
   profile_candidate_profile_id?: string
   profile_attempt_results: VolteProfileAttemptResult[]
+=======
+>>>>>>> Stashed changes
   usim_aid?: string
   isim_aid?: string
   connection_attempts: VolteConnectionAttempt[]
@@ -1110,6 +1113,7 @@ export interface VowifiLineConfigResponse {
   matched_profile_id?: string | null
   matched_profile_source?: 'database' | 'derived' | null
   matched_profile_fallback_reason?: string | null
+<<<<<<< Updated upstream
 }
 
 export interface AccessNetworkRuntimeStatus {
@@ -1119,6 +1123,8 @@ export interface AccessNetworkRuntimeStatus {
   serving_plmn?: string | null
   age_seconds?: number | null
   last_error?: string | null
+=======
+>>>>>>> Stashed changes
 }
 
 export interface LineRuntimeStatus {

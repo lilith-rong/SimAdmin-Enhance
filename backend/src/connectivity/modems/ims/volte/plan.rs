@@ -150,7 +150,13 @@ fn is_baseband_wedge(lowercased: &str) -> bool {
         || lowercased.contains("endpoint hangup")
         || lowercased.contains("mobileequipment.unknown")
         || lowercased.contains(code::BEARER_NETDEV_RUNTIME_ERROR)
+<<<<<<< Updated upstream
         || (call_failed && internal_error)
+=======
+        || lowercased.contains(code::BEARER_NETDEV_NOT_UP)
+        || lowercased.contains(code::BEARER_NETDEV_NOT_READY)
+        || (lowercased.contains("call failed") && lowercased.contains("internal error"))
+>>>>>>> Stashed changes
 }
 
 impl FailureClass {
@@ -169,6 +175,7 @@ impl FailureClass {
             FailureClass::NetworkForcedIpv4
         } else if error.contains("prefix-unavailable") {
             FailureClass::PrefixUnavailable
+<<<<<<< Updated upstream
         } else if error.contains(code::BEARER_NETDEV_RUNTIME_ERROR) {
             FailureClass::BasebandWedged
         } else if error.contains(code::BEARER_NETDEV_NOT_UP)
@@ -177,6 +184,13 @@ impl FailureClass {
             // Interface bring-up races are recoverable. Only the kernel's
             // latched runtime-PM error is a confirmed permanent bam-dmux wedge.
             FailureClass::Other
+=======
+        } else if error.contains(code::BEARER_NETDEV_RUNTIME_ERROR)
+            || error.contains(code::BEARER_NETDEV_NOT_UP)
+            || error.contains(code::BEARER_NETDEV_NOT_READY)
+        {
+            FailureClass::BasebandWedged
+>>>>>>> Stashed changes
         } else if is_baseband_wedge(&error) {
             FailureClass::BasebandWedged
         } else {
@@ -188,7 +202,13 @@ impl FailureClass {
     /// loop (was `live::should_try_next_family`).
     pub fn from_error(error: &VolteError) -> Self {
         match error.code() {
+<<<<<<< Updated upstream
             code::BEARER_NETDEV_RUNTIME_ERROR => FailureClass::BasebandWedged,
+=======
+            code::BEARER_NETDEV_RUNTIME_ERROR
+            | code::BEARER_NETDEV_NOT_UP
+            | code::BEARER_NETDEV_NOT_READY => FailureClass::BasebandWedged,
+>>>>>>> Stashed changes
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
                 if error
                     .detail()
@@ -745,6 +765,23 @@ mod tests {
             assert_eq!(class, FailureClass::Other);
             assert!(!class.is_retryable_family());
             assert!(!class.is_unsafe_to_retry());
+        }
+    }
+
+    #[test]
+    fn bearer_netdev_errors_are_terminal_and_not_family_fallbacks() {
+        for code in [
+            code::BEARER_NETDEV_RUNTIME_ERROR,
+            code::BEARER_NETDEV_NOT_UP,
+            code::BEARER_NETDEV_NOT_READY,
+        ] {
+            let error = VolteError::with_detail(code, "interface=wwan0");
+            assert_eq!(
+                FailureClass::from_error(&error),
+                FailureClass::BasebandWedged
+            );
+            assert!(!FailureClass::from_error(&error).is_retryable_family());
+            assert!(FailureClass::from_error(&error).is_unsafe_to_retry());
         }
     }
 

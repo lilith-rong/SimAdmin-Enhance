@@ -85,7 +85,10 @@ impl VolteStage {
 /// (Bearer family fallback and REGISTER) without allowing a busy line to grow
 /// the in-memory status response indefinitely.
 const MAX_CONNECTION_ATTEMPTS: usize = 100;
+<<<<<<< Updated upstream
 const MAX_PROFILE_ATTEMPT_RESULTS: usize = 12;
+=======
+>>>>>>> Stashed changes
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VolteConnectionAttempt {
@@ -240,6 +243,7 @@ pub struct VolteSnapshot {
     pub at_cid: Option<u8>,
     pub current_ip_family: Option<String>,
     pub identity_source: Option<String>,
+<<<<<<< Updated upstream
     /// The public user identity actually in force after REGISTER.
     ///
     /// This starts out IMSI-derived, but the network's default P-Associated-URI
@@ -274,6 +278,11 @@ pub struct VolteSnapshot {
     pub profile_candidate_source: Option<String>,
     pub profile_candidate_profile_id: Option<String>,
     pub profile_attempt_results: Vec<VolteProfileAttemptResult>,
+=======
+    pub profile_id: Option<String>,
+    pub profile_source: Option<String>,
+    pub profile_fallback_reason: Option<String>,
+>>>>>>> Stashed changes
     pub usim_aid: Option<String>,
     pub isim_aid: Option<String>,
     pub connection_attempts: Vec<VolteConnectionAttempt>,
@@ -316,6 +325,7 @@ impl Default for VolteSnapshot {
             bearer_ip_type: None,
             current_ip_family: None,
             identity_source: None,
+<<<<<<< Updated upstream
             public_uri: None,
             associated_uris: Vec::new(),
             voice_service: ImsServiceState::Unknown.as_str(),
@@ -329,6 +339,11 @@ impl Default for VolteSnapshot {
             profile_candidate_source: None,
             profile_candidate_profile_id: None,
             profile_attempt_results: Vec::new(),
+=======
+            profile_id: None,
+            profile_source: None,
+            profile_fallback_reason: None,
+>>>>>>> Stashed changes
             usim_aid: None,
             isim_aid: None,
             connection_attempts: Vec::new(),
@@ -454,6 +469,12 @@ pub struct VolteRuntimeStatus {
     pub profile_candidate_profile_id: Option<String>,
     pub profile_attempt_results: Vec<VolteProfileAttemptResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_fallback_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usim_aid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isim_aid: Option<String>,
@@ -497,6 +518,7 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             bearer_ip_type: s.bearer_ip_type.clone(),
             current_ip_family: s.current_ip_family.clone(),
             identity_source: s.identity_source.clone(),
+<<<<<<< Updated upstream
             public_uri: s.public_uri.clone(),
             associated_uris: s.associated_uris.clone(),
             voice_service: s.voice_service.to_string(),
@@ -510,6 +532,11 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             profile_candidate_source: s.profile_candidate_source.clone(),
             profile_candidate_profile_id: s.profile_candidate_profile_id.clone(),
             profile_attempt_results: s.profile_attempt_results.clone(),
+=======
+            profile_id: s.profile_id.clone(),
+            profile_source: s.profile_source.clone(),
+            profile_fallback_reason: s.profile_fallback_reason.clone(),
+>>>>>>> Stashed changes
             usim_aid: s.usim_aid.clone(),
             isim_aid: s.isim_aid.clone(),
             connection_attempts: s.connection_attempts.clone(),

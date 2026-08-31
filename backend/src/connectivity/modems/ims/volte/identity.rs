@@ -323,14 +323,22 @@ mod tests {
 
     #[test]
     fn cmlink_roaming_on_china_mobile_keeps_its_two_digit_home_mnc() {
+<<<<<<< Updated upstream
         let home = resolve_home_plmn("234331234567890", None, Some(2)).unwrap();
+=======
+        let home = resolve_home_plmn("234331234567890", Some("46000"), Some(2)).unwrap();
+>>>>>>> Stashed changes
         assert_eq!(home.mcc, "234");
         assert_eq!(home.mnc, "33");
         assert_eq!(home.mnc_length_source, "sim_ef_ad");
     }
 
     #[test]
+<<<<<<< Updated upstream
     fn matching_sim_operator_can_supply_mnc_length() {
+=======
+    fn matching_registered_operator_can_supply_mnc_length() {
+>>>>>>> Stashed changes
         let home = resolve_home_plmn("310260123456789", Some("310260"), Some(2)).unwrap();
         assert_eq!(home.mcc, "310");
         assert_eq!(home.mnc, "260");

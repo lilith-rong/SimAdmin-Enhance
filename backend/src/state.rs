@@ -55,9 +55,12 @@ pub struct AppState {
     pub notification_sender: Arc<NotificationSender>,
     pub system_event_emitter: Arc<SystemEventEmitter>,
     pub event_bus: Arc<AppEventBus>,
+<<<<<<< Updated upstream
     /// On-disk diagnostic log writer. Producers hand it records without
     /// blocking; the background task owns the file handles.
     pub diagnostic_log_sink: Arc<DiagnosticLogSink>,
+=======
+>>>>>>> Stashed changes
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -94,7 +97,10 @@ pub struct AppStateDependencies {
     pub notification_sender: Arc<NotificationSender>,
     pub system_event_emitter: Arc<SystemEventEmitter>,
     pub event_bus: Arc<AppEventBus>,
+<<<<<<< Updated upstream
     pub diagnostic_log_sink: Arc<DiagnosticLogSink>,
+=======
+>>>>>>> Stashed changes
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -116,7 +122,10 @@ impl AppState {
             notification_sender,
             system_event_emitter,
             event_bus,
+<<<<<<< Updated upstream
             diagnostic_log_sink,
+=======
+>>>>>>> Stashed changes
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -134,7 +143,10 @@ impl AppState {
             notification_sender,
             system_event_emitter,
             event_bus,
+<<<<<<< Updated upstream
             diagnostic_log_sink,
+=======
+>>>>>>> Stashed changes
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -191,6 +203,7 @@ impl FromRef<AppState> for Arc<AppEventBus> {
     }
 }
 
+<<<<<<< Updated upstream
 impl FromRef<AppState> for Arc<DiagnosticLogSink> {
     fn from_ref(state: &AppState) -> Self {
         state.diagnostic_log_sink.clone()
@@ -203,6 +216,8 @@ impl FromRef<AppState> for ShutdownSignal {
     }
 }
 
+=======
+>>>>>>> Stashed changes
 impl FromRef<AppState> for Arc<DdnsManager> {
     fn from_ref(state: &AppState) -> Self {
         state.ddns_manager.clone()

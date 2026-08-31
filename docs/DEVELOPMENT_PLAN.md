@@ -1,8 +1,12 @@
 ﻿# SimAdmin 未完成开发计划
 
+<<<<<<< Updated upstream
 > 状态：2026-08-30 整理版。本文是本仓库唯一的后续开发与验收计划，只记录尚未完成、尚未通过外部验收或仍需收口的事项。
 >
 > 2026-08-30 合并了原先分散的四份清单（`IMS_REGISTER_FOLLOWUP_PLAN.md`、`BACKEND_REVIEW_TODO.md`、`IMS_ACCESS_REFACTOR_DEVICE_TESTS.md`、`HARDWARE_EXPANSION_TODO.md`）。已完成项和历史验收记录不再保留在文档里——那些在 git 历史中。架构设计说明移到 `ARCHITECTURE.md`。
+=======
+> 状态：2026-08-19 整理版。本文是本仓库唯一的后续开发与验收计划，只记录尚未完成、尚未通过外部验收或仍需收口的事项。
+>>>>>>> Stashed changes
 >
 > 本文不把代码中已有的基础能力直接视为产品完成。每项能力只有在对应的自动化测试、真实硬件、运营商网络或发布流程验收通过后，才能从本计划移除。
 
@@ -36,7 +40,11 @@ SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经�
 - [x] 本地协议测试覆盖双向 RTP、SIP INFO DTMF、telephone-event、媒体方向、hold/resume 和资源清理；[ ] 真实 VoWiFi 运营商验收仍待执行。
 - [ ] 将普通号码测试结果按线路、access、codec、SIP 状态、RTP 计数和脱敏 trace 独立记录（需要授权的真实测试号码）。
 
+<<<<<<< Updated upstream
 2026-08-19 已完成一轮 QCM410/50212 飞行模式实测：VoWiFi IMS、trunk、7201 绑定、`100/183` 和失败资源清理通过；运营商以 `480 Release Call received from CAP` 在接通前释放，故 RTP、DTMF、hold 和视频仍未验收。代码已补齐 trunk/API 呼叫的统一 `Started` 生命周期事件和历史记录竞态测试。
+=======
+2026-08-19 已完成一轮 QCM410/50212 飞行模式实测：VoWiFi IMS、trunk、7201 绑定、`100/183` 和失败资源清理通过；运营商以 `480 Release Call received from CAP` 在接通前释放，故 RTP、DTMF、hold 和视频仍未验收。代码已补齐 trunk/API 呼叫的统一 `Started` 生命周期事件和历史记录竞态测试。完整证据见 [VoWiFi 通话实机测试记录](./VOWIFI_CALL_TEST_2026-08-19.md)。
+>>>>>>> Stashed changes
 
 ### 视频
 

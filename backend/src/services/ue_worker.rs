@@ -141,6 +141,7 @@ const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// Maximum number of SCM_RIGHTS fds attached to one control frame.
 const MAX_SOCKET_FDS: usize = 4;
 
+<<<<<<< Updated upstream
 /// `recvmsg` flags used when collecting SCM_RIGHTS fds.
 ///
 /// The parent keeps IMS/RTP/proxy sockets alive for the life of a registration
@@ -153,6 +154,8 @@ const RECV_FD_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
 #[cfg(all(unix, not(target_os = "linux")))]
 const RECV_FD_FLAGS: libc::c_int = 0;
 
+=======
+>>>>>>> Stashed changes
 /// A single ordered network operation executed by the worker *inside its own
 /// UE network namespace*. The worker is already `setns`-ed, so every `ip`
 /// command here applies to the UE namespace only and cannot leak into another
@@ -484,10 +487,13 @@ struct WorkerCore {
     tx: StdMutex<Option<mpsc::UnboundedSender<UeWorkerMessage>>>,
     pending: StdMutex<HashMap<u64, PendingRequest>>,
     request_seq: AtomicU64,
+<<<<<<< Updated upstream
     /// Incremented on every successful spawn. Starts at 0, so a handle that
     /// has never spawned a process is distinguishable from the first
     /// generation. See [`UeWorkerBinding`] for why a counter is required.
     generation: AtomicU64,
+=======
+>>>>>>> Stashed changes
     state: StdMutex<UeWorkerStatus>,
 }
 
@@ -498,6 +504,7 @@ pub struct UeWorkerHandle {
     core: Arc<WorkerCore>,
 }
 
+<<<<<<< Updated upstream
 /// A worker handle captured together with the process generation that was live
 /// at capture time.
 ///
@@ -533,6 +540,8 @@ impl UeWorkerBinding {
     }
 }
 
+=======
+>>>>>>> Stashed changes
 impl UeWorkerHandle {
     /// Build a handle for a line. The control socket lives in the temp
     /// directory and is namespaced by the parent pid + line id so two SimAdmin
@@ -551,7 +560,10 @@ impl UeWorkerHandle {
                 tx: StdMutex::new(None),
                 pending: StdMutex::new(HashMap::new()),
                 request_seq: AtomicU64::new(1),
+<<<<<<< Updated upstream
                 generation: AtomicU64::new(0),
+=======
+>>>>>>> Stashed changes
                 state: StdMutex::new(UeWorkerStatus {
                     line_id: line_id.to_string(),
                     control_socket,
@@ -569,6 +581,7 @@ impl UeWorkerHandle {
         &self.core.namespace
     }
 
+<<<<<<< Updated upstream
     /// Whether two handles refer to the same worker lifecycle/connection.
     ///
     /// A line refresh can replace the registry entry with a new handle while
@@ -598,6 +611,8 @@ impl UeWorkerHandle {
         }
     }
 
+=======
+>>>>>>> Stashed changes
     pub async fn status(&self) -> UeWorkerStatus {
         self.core.state.lock().unwrap().clone()
     }
@@ -735,6 +750,7 @@ impl UeWorkerHandle {
         let fd = outcome.fd.ok_or_else(|| {
             UeWorkerError::Protocol("socket create ok but fd missing".to_string())
         })?;
+<<<<<<< Updated upstream
         // `tokio::net::*::from_std` REQUIRES a non-blocking fd: it registers the
         // fd with the reactor but never sets the flag itself. These fds arrive
         // over SCM_RIGHTS from the worker, and O_NONBLOCK lives on the shared
@@ -749,11 +765,19 @@ impl UeWorkerHandle {
             UeSocketKind::Udp => {
                 let std_socket = std::net::UdpSocket::from(fd);
                 std_socket.set_nonblocking(true)?;
+=======
+        match spec.kind {
+            UeSocketKind::Udp => {
+                let std_socket = std::net::UdpSocket::from(fd);
+>>>>>>> Stashed changes
                 Ok(UeSocket::Udp(tokio::net::UdpSocket::from_std(std_socket)?))
             }
             UeSocketKind::Tcp => {
                 let std_stream = std::net::TcpStream::from(fd);
+<<<<<<< Updated upstream
                 std_stream.set_nonblocking(true)?;
+=======
+>>>>>>> Stashed changes
                 Ok(UeSocket::Tcp(tokio::net::TcpStream::from_std(std_stream)?))
             }
         }
@@ -880,9 +904,12 @@ impl UeWorkerHandle {
             let mut guard = self.core.child.lock().await;
             *guard = Some(child);
         }
+<<<<<<< Updated upstream
         // Publish the new generation before the status update so any consumer
         // that observes a live pid also observes the generation owning it.
         self.core.generation.fetch_add(1, Ordering::SeqCst);
+=======
+>>>>>>> Stashed changes
         {
             let mut state = self.core.state.lock().unwrap();
             state.pid = Some(pid);
@@ -1631,6 +1658,7 @@ fn create_socket_fd(spec: &UeSocketSpec) -> std::io::Result<std::os::fd::OwnedFd
             }
         }
     }
+<<<<<<< Updated upstream
     // O_NONBLOCK must be set before this fd crosses SCM_RIGHTS: the flag lives on
     // the open file description, so the parent inherits whatever we leave here,
     // and the parent hands the fd straight to `tokio::net::*::from_std`, which
@@ -1641,6 +1669,8 @@ fn create_socket_fd(spec: &UeSocketSpec) -> std::io::Result<std::os::fd::OwnedFd
     // non-blocking mode internally and restores the socket to *blocking* before
     // it returns, so setting the flag any earlier would be silently undone.
     socket.set_nonblocking(true)?;
+=======
+>>>>>>> Stashed changes
     Ok(socket.into())
 }
 
@@ -1805,7 +1835,11 @@ fn recv_control_frame(
         .len()
         .try_into()
         .expect("control message buffer exceeds platform limit");
+<<<<<<< Updated upstream
     let received = unsafe { libc::recvmsg(fd, &mut header_msg, RECV_FD_FLAGS) };
+=======
+    let received = unsafe { libc::recvmsg(fd, &mut header_msg, 0) };
+>>>>>>> Stashed changes
     if received < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -2369,6 +2403,7 @@ mod tests {
         assert!(!worker_generation_matches(None, 41));
     }
 
+<<<<<<< Updated upstream
     /// A handle is created once per line and reused for every respawn, so two
     /// clones always share one core. Only the captured generation can tell a
     /// restarted worker from the one a runtime bound its sockets to.
@@ -2398,6 +2433,8 @@ mod tests {
         assert!(!first.same_instance(&second));
     }
 
+=======
+>>>>>>> Stashed changes
     #[test]
     fn failed_generation_marker_does_not_touch_a_replacement() {
         let mut current = UeWorkerStatus {
@@ -2464,6 +2501,7 @@ mod tests {
             Err(UeWorkerError::Unsupported)
         ));
     }
+<<<<<<< Updated upstream
 
     /// Read `O_NONBLOCK` back off an fd the way the kernel reports it, rather
     /// than trusting the value we think we set.
@@ -2526,4 +2564,6 @@ mod tests {
             "connect_timeout leaves the socket blocking; the flag must be set after it"
         );
     }
+=======
+>>>>>>> Stashed changes
 }

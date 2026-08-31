@@ -49,12 +49,15 @@ use super::{
     voice,
 };
 use crate::connectivity::core::{
+<<<<<<< Updated upstream
     access::ImsChannel,
     access_network::{
         access_type_token, resolve_access_identity, sanitize_header_value, AccessIdentityPolicy,
         EpdgLocationSnapshot, ImsAccessNetworkContext, ImsAccessNetworkRuntime,
     },
     contact::{complete_contact_parameters, ContactCompletion},
+=======
+>>>>>>> Stashed changes
     media::OperatorSocketCreator,
     register::{
         run_register_observed, status_is_terminal_register_failure, RegisterAuthenticator,
@@ -83,8 +86,11 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 const LIVE_DNS_TIMEOUT: Duration = Duration::from_secs(8);
+<<<<<<< Updated upstream
 const LIVE_EPDG_MAX_HOST_CANDIDATES: usize = 8;
 const LIVE_UICC_EPDG_CACHE_TTL: Duration = Duration::from_secs(300);
+=======
+>>>>>>> Stashed changes
 
 impl super::operator::MediaRouteInstaller for TunGatewayRuntime {
     fn ensure_media_route(&self, remote: IpAddr) -> Result<(), String> {
@@ -1422,6 +1428,7 @@ pub(crate) fn operator_socket_creator_for_line(
     })
 }
 
+<<<<<<< Updated upstream
 fn publish_line_sim_device(line_id: &str, device: LiveSimDevice) {
     let changed = {
         let mut devices = line_sim_devices()
@@ -1442,6 +1449,8 @@ fn publish_line_sim_device(line_id: &str, device: LiveSimDevice) {
     }
 }
 
+=======
+>>>>>>> Stashed changes
 /// Record which reader a line owns. Called when lines are discovered/refreshed.
 pub fn register_line_sim_device(line_id: &str, qmi_device: &str, uim_slot: u8, modem_path: &str) {
     if line_id.is_empty() || (qmi_device.is_empty() && modem_path.is_empty()) {
@@ -1576,6 +1585,15 @@ pub fn forget_line_sim_device_mapping(line_id: &str) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(line_id);
     forget_live_uicc_epdg_config(line_id);
+}
+
+/// Forget all live state for a line (line removed or its UE torn down).
+pub fn forget_line_sim_device(line_id: &str) {
+    forget_line_sim_device_mapping(line_id);
+    line_ue_socket_contexts()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(line_id);
 }
 
 /// Forget all live state for a line (line removed or its UE torn down).

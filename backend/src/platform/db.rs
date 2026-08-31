@@ -3239,12 +3239,15 @@ impl Database {
             [],
         )?;
 
+<<<<<<< Updated upstream
         // Settings the program rewrites on its own — per-line profiles, the
         // modem/reader slot map, notification and automation records — live in
         // this database rather than the text configuration file. See
         // `platform::config_store` for why.
         crate::platform::config_store::initialize_schema(&conn)?;
 
+=======
+>>>>>>> Stashed changes
         let (app_event_tx, _) = broadcast::channel(512);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

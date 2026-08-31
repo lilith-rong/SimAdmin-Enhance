@@ -154,10 +154,13 @@ pub struct LineRuntime {
     /// net-config batch is skipped to avoid flooding the worker with
     /// redundant operations.
     egress_fingerprint: Mutex<Option<String>>,
+<<<<<<< Updated upstream
     /// Serializes namespace/worker/socket-context transitions for this line.
     /// Refresh runs outside the registry map lock, so this per-line lock keeps
     /// a slow reconcile from racing a later refresh teardown or worker restart.
     ue_lifecycle_lock: Mutex<()>,
+=======
+>>>>>>> Stashed changes
 }
 
 impl LineRuntime {
@@ -219,7 +222,10 @@ impl LineRuntime {
             data_watchdog: Mutex::new(LineDataWatchdogState::default()),
             secondary_data: Arc::new(SecondaryDataRuntime::default()),
             egress_fingerprint: Mutex::new(None),
+<<<<<<< Updated upstream
             ue_lifecycle_lock: Mutex::new(()),
+=======
+>>>>>>> Stashed changes
         }
     }
 
@@ -686,6 +692,7 @@ impl LineRuntimeRegistry {
                 tracing::warn!(error = %error, "Failed to reconcile discovered line profiles");
             }
         }
+<<<<<<< Updated upstream
 
         // A modem/reader discovery pass can report the same stable line more
         // than once (for example when a legacy reader alias and its automatic
@@ -701,6 +708,14 @@ impl LineRuntimeRegistry {
             *physical_slot_counts
                 .entry((binding.hardware_key.clone(), binding.uim_slot))
                 .or_insert(0usize) += 1;
+=======
+        let mut lines = self.lines.write().await;
+        for line in lines.values() {
+            crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
+                &line.binding().line_id,
+            );
+            line.mark_absent();
+>>>>>>> Stashed changes
         }
         let mut unique_bindings: BTreeMap<String, ModemBinding> = BTreeMap::new();
         for binding in discovered {
@@ -809,6 +824,7 @@ impl LineRuntimeRegistry {
                     line.voice_access
                         .set_policy(config_manager.get_line_voice_path_policy(&binding.line_id));
                 }
+<<<<<<< Updated upstream
                 line.replace_binding(binding.clone());
                 Self::publish_sim_device_mapping(binding);
                 Self::publish_ue_context(line, &binding.line_id, prepared);
@@ -850,6 +866,34 @@ impl LineRuntimeRegistry {
                         error = %error,
                         "Failed to stop per-UE worker for absent line"
                     );
+=======
+                line.replace_binding(binding);
+                self.reconcile_ue_context(line, &line.binding()).await;
+                continue;
+            }
+            let runtime = Arc::new(VolteRuntime::new());
+            let live = VolteLiveHandle::new();
+            let line_id = binding.line_id.clone();
+            let voice_policy = self
+                .config_manager
+                .as_ref()
+                .map(|config| config.get_line_voice_path_policy(&line_id))
+                .unwrap_or_default();
+            let line = Arc::new(LineRuntime::new(binding, runtime, live, voice_policy));
+            self.reconcile_ue_context(&line, &line.binding()).await;
+            // Seed the traffic counters from disk the first time we see a line,
+            // so the reported totals are cumulative rather than per-boot.
+            if let Some(database) = &self.database {
+                if let Ok(stored) = database.get_line_data_traffic(&line_id) {
+                    line.data_proxy
+                        .restore_persisted_traffic(DataProxyTraffic {
+                            uplink_bytes: stored.uplink_bytes,
+                            downlink_bytes: stored.downlink_bytes,
+                            total_connections: stored.total_connections,
+                            active_connections: 0,
+                        })
+                        .await;
+>>>>>>> Stashed changes
                 }
             }
             self.teardown_ue_isolation_locked(line, &binding.line_id)
@@ -926,6 +970,27 @@ impl LineRuntimeRegistry {
                 &binding.modem_path,
             );
         }
+<<<<<<< Updated upstream
+=======
+        // Shut down the UE worker of any line whose anchor disappeared in this
+        // refresh; a later rediscovery re-spawns it. Present lines were already
+        // reconciled above, so their workers are kept running.
+        for line in lines.values().filter(|line| !line.binding().present) {
+            let line_id = line.binding().line_id;
+            let worker = line.ue_worker.clone();
+            if worker.is_running().await {
+                if let Err(error) = worker.shutdown().await {
+                    tracing::warn!(
+                        line_id = %line_id,
+                        error = %error,
+                        "Failed to stop per-UE worker for absent line"
+                    );
+                }
+            }
+            self.teardown_ue_isolation(line, &line_id).await;
+        }
+        Ok(lines.values().filter(|line| line.binding().present).count())
+>>>>>>> Stashed changes
     }
 
     pub async fn get(&self, line_id: &str) -> Option<Arc<LineRuntime>> {
@@ -1032,12 +1097,16 @@ impl LineRuntimeRegistry {
     /// master switch. Namespace creation is idempotent; a failure only drops
     /// the isolation guarantee and leaves the existing host-namespace path
     /// fully functional.
+<<<<<<< Updated upstream
     async fn reconcile_ue_context(
         &self,
         line: &LineRuntime,
         binding: &ModemBinding,
     ) -> PreparedUePublication {
         let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
+=======
+    async fn reconcile_ue_context(&self, line: &LineRuntime, binding: &ModemBinding) {
+>>>>>>> Stashed changes
         let isolation = self
             .config_manager
             .as_ref()
@@ -1063,12 +1132,22 @@ impl LineRuntimeRegistry {
                 "Failed to prepare per-UE network namespace"
             );
         }
+<<<<<<< Updated upstream
         let ue_ready = ue.isolation_enabled && ue.netns_ready;
         let worker = line.ue_worker.clone();
         // A worker spawned in this pass has not completed its handshake yet.
         // Reconciling its egress in the same pass would only wait out the ready
         // timeout, and the timeout is what used to dismantle the line.
         let mut worker_spawned_this_pass = false;
+=======
+        *line
+            .ue
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ue;
+        let ue = line.ue();
+        let ue_ready = ue.isolation_enabled && ue.netns_ready;
+        let worker = line.ue_worker.clone();
+>>>>>>> Stashed changes
         if ue_ready && !worker.is_running().await {
             // Clear the egress fingerprint so the freshly spawned worker
             // receives its initial net-config even if the plan is unchanged.
@@ -1076,6 +1155,7 @@ impl LineRuntimeRegistry {
                 let mut fp = line.egress_fingerprint.lock().await;
                 *fp = None;
             }
+<<<<<<< Updated upstream
             match worker.spawn().await {
                 Ok(()) => worker_spawned_this_pass = true,
                 Err(error) => {
@@ -1093,6 +1173,16 @@ impl LineRuntimeRegistry {
             if line.secondary_data.is_worker_bound().await {
                 line.secondary_data.stop().await;
             }
+=======
+            if let Err(error) = worker.spawn().await {
+                tracing::warn!(
+                    line_id = %binding.line_id,
+                    error = %error,
+                    "Failed to start per-UE worker inside its namespace"
+                );
+            }
+        } else if !ue_ready && worker.is_running().await {
+>>>>>>> Stashed changes
             if let Err(error) = worker.shutdown().await {
                 tracing::warn!(
                     line_id = %binding.line_id,
@@ -1117,6 +1207,7 @@ impl LineRuntimeRegistry {
             None
         };
         let worker_available = worker_registration.is_some();
+<<<<<<< Updated upstream
         // Operator RTP can only enter a worker after the 3GPP bearer itself
         // has moved there.  Warn once per process rather than on every line
         // refresh, which would bury real failures during regression runs.
@@ -1134,6 +1225,21 @@ impl LineRuntimeRegistry {
             trunk_sockets: isolation.effective_trunk_sockets_in_worker(),
         };
         if !worker_available {
+=======
+        crate::services::ue_worker::register_line_worker(
+            &line_id,
+            worker_registration,
+            crate::services::ue_worker::UeWorkerFeatures {
+                three_gpp_ims: isolation.three_gpp_ims_sockets_in_worker,
+                data_proxy: isolation.data_proxy_in_worker,
+                trunk_sockets: isolation.trunk_sockets_in_worker,
+            },
+        );
+        if !worker_available {
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                &line_id, None,
+            );
+>>>>>>> Stashed changes
             // A cached TUN/SIP channel may still belong to the dead worker's
             // namespace. Tear the live access runtime down before allowing a
             // host-path retry, otherwise a host socket can bind a UE-only TUN
@@ -1145,6 +1251,7 @@ impl LineRuntimeRegistry {
                 .await;
             }
         }
+<<<<<<< Updated upstream
         if ue_ready && worker_spawned_this_pass {
             // Let the worker finish its handshake on its own time. Everything
             // this pass built -- namespace, veth, a running child -- stays, and
@@ -1188,11 +1295,24 @@ impl LineRuntimeRegistry {
                 // published; a first isolated reconcile can still be serving
                 // the legacy host path and must not tear that runtime down.
                 if had_ue_socket_context {
+=======
+        if ue_ready {
+            if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
+                crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                    &line_id, None,
+                );
+                // The failed reconcile must only tear down an isolated live
+                // runtime that was actually published before this refresh.
+                // With no prior UE socket context, the line may still be
+                // using the legacy host path and should remain untouched.
+                if worker_available && had_ue_socket_context {
+>>>>>>> Stashed changes
                     crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
                         &line_id,
                     )
                     .await;
                 }
+<<<<<<< Updated upstream
                 // Stop the DATA6 bearer while the worker is still alive: its
                 // teardown deletes the in-namespace address and routes over
                 // the control channel before moving the interface back to the
@@ -1214,19 +1334,25 @@ impl LineRuntimeRegistry {
                     }
                 }
                 self.teardown_ue_isolation_locked(line, &line_id).await;
+=======
+>>>>>>> Stashed changes
                 tracing::warn!(
                     line_id = %line_id,
                     error = %error,
                     "Failed to reconcile UE egress/worker net-config; falling back to host path"
                 );
+<<<<<<< Updated upstream
                 return PreparedUePublication {
                     ue: Some(ue),
                     ..PreparedUePublication::default()
                 };
+=======
+>>>>>>> Stashed changes
             }
         } else {
             // Fall back to the host-namespace VoWiFi path and best-effort
             // remove all resources from a previous isolated run.
+<<<<<<< Updated upstream
             self.teardown_ue_isolation_locked(line, &line_id).await;
             return PreparedUePublication {
                 ue: Some(ue),
@@ -1278,12 +1404,20 @@ impl LineRuntimeRegistry {
     }
 
     async fn teardown_ue_isolation_locked(&self, line: &LineRuntime, line_id: &str) {
+=======
+            self.teardown_ue_isolation(line, &line_id).await;
+        }
+    }
+
+    async fn teardown_ue_isolation(&self, line: &LineRuntime, line_id: &str) {
+>>>>>>> Stashed changes
         let isolation = self
             .config_manager
             .as_ref()
             .map(|config| config.get_ue_isolation())
             .unwrap_or_default();
         let ue = line.ue();
+<<<<<<< Updated upstream
         // Only a DATA session that was actually migrated into the worker
         // namespace is tied to this lifecycle: its interface lives in a
         // namespace that is about to disappear. A host-side session belongs to
@@ -1294,6 +1428,8 @@ impl LineRuntimeRegistry {
         if line.secondary_data.is_worker_bound().await {
             line.secondary_data.stop().await;
         }
+=======
+>>>>>>> Stashed changes
         crate::services::ue_worker::register_line_worker(
             line_id,
             None,
@@ -1333,11 +1469,15 @@ impl LineRuntimeRegistry {
     /// Prepare the UE-side egress and ask the worker to apply it inside the
     /// namespace. The parent only creates the veth pair and configures the
     /// host side; the worker owns the UE side (address/link/default route).
+<<<<<<< Updated upstream
     async fn reconcile_ue_egress(
         &self,
         line: &LineRuntime,
         ue: &UeContext,
     ) -> Result<(), EgressError> {
+=======
+    async fn reconcile_ue_egress(&self, line: &LineRuntime, ue: &UeContext) -> Result<(), String> {
+>>>>>>> Stashed changes
         use std::time::Duration;
 
         let isolation = self
@@ -1354,7 +1494,11 @@ impl LineRuntimeRegistry {
             plan.mtu,
         )
         .await
+<<<<<<< Updated upstream
         .map_err(|error| EgressError::Terminal(error.to_string()))?;
+=======
+        .map_err(|error| error.to_string())?;
+>>>>>>> Stashed changes
 
         // Build a fingerprint from the plan + isolation settings so we can
         // skip the worker net-config batch when nothing has changed.
@@ -1369,13 +1513,18 @@ impl LineRuntimeRegistry {
         );
         let worker = line.ue_worker.clone();
         if !worker.is_running().await {
+<<<<<<< Updated upstream
             return Err(EgressError::WorkerNotReady(
                 "UE worker is not running; skipping egress apply".to_string(),
             ));
+=======
+            return Err("UE worker is not running; skipping egress apply".to_string());
+>>>>>>> Stashed changes
         }
         worker
             .wait_ready(Duration::from_secs(5))
             .await
+<<<<<<< Updated upstream
             .map_err(|error| EgressError::WorkerNotReady(error.to_string()))?;
         let unchanged =
             line.egress_fingerprint.lock().await.as_deref() == Some(fingerprint.as_str());
@@ -1395,6 +1544,26 @@ impl LineRuntimeRegistry {
                     .error
                     .unwrap_or_else(|| "net-config failed".to_string()),
             ));
+=======
+            .map_err(|error| error.to_string())?;
+        let unchanged =
+            line.egress_fingerprint.lock().await.as_deref() == Some(fingerprint.as_str());
+        if unchanged {
+            // The discovery refresh may have rebuilt only the reader map. Re-
+            // publish both UE registries even when the network plan itself is
+            // unchanged, so TUN, IKE, SIP and RTP resolve one owner together.
+            self.publish_ue_egress_context(&ue.ue_id, ue, &plan, &isolation, &worker);
+            return Ok(());
+        }
+        let result = worker
+            .apply_net_config(ue_netcfg::veth_ue_side_ops(&plan))
+            .await
+            .map_err(|error| error.to_string())?;
+        if !result.ok {
+            return Err(result
+                .error
+                .unwrap_or_else(|| "net-config failed".to_string()));
+>>>>>>> Stashed changes
         }
         // Persist the fingerprint so subsequent reconcile calls are no-ops.
         {
@@ -1417,6 +1586,10 @@ impl LineRuntimeRegistry {
         // Stage 2b is deliberately gated: only with this flag do the VoWiFi
         // TUN and every IKE/SIP/RTP socket move into the UE namespace through
         // the worker. Disabling keeps the previous host-namespace path.
+<<<<<<< Updated upstream
+=======
+        self.publish_ue_egress_context(&ue.ue_id, ue, &plan, &isolation, &worker);
+>>>>>>> Stashed changes
         tracing::info!(
             line_id = %ue.ue_id,
             netns = %ue.namespace,
@@ -1426,6 +1599,35 @@ impl LineRuntimeRegistry {
         );
         Ok(())
     }
+<<<<<<< Updated upstream
+=======
+
+    fn publish_ue_egress_context(
+        &self,
+        line_id: &str,
+        ue: &UeContext,
+        plan: &ue_netcfg::UeVethPlan,
+        isolation: &crate::platform::config::UeIsolationConfig,
+        worker: &UeWorkerHandle,
+    ) {
+        if isolation.vowifi_tun_in_namespace {
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                line_id,
+                Some(
+                    crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext {
+                        namespace: ue.namespace.as_str().to_string(),
+                        ue_veth: plan.ue_if.clone(),
+                        worker: worker.clone(),
+                    },
+                ),
+            );
+        } else {
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                line_id, None,
+            );
+        }
+    }
+>>>>>>> Stashed changes
 }
 
 #[cfg(test)]

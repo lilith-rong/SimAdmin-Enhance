@@ -22,7 +22,11 @@ use crate::{
             ImsAccessNetworkRuntime,
         },
         context::{ImsRoute, SipTransport},
+<<<<<<< Updated upstream
         ims_failure::{ImsFailureDiagnostic, ImsServiceState, ImsServiceVerdict},
+=======
+        ims_failure::ImsFailureDiagnostic,
+>>>>>>> Stashed changes
         ims_video::{negotiate_video, parse_video_sdp, VideoMediaDescription},
         media::{
             ActiveRtpRelay, MediaRelayMetrics, MediaRelayPolicy, OperatorSocketCreator,
@@ -46,6 +50,10 @@ use crate::{
         ImsError,
     },
     connectivity::modems::ims::vowifi::{
+<<<<<<< Updated upstream
+=======
+        carrier_catalog::CatalogAccessKind,
+>>>>>>> Stashed changes
         profile_store::{ProfileOrigin, ProfileStore},
         profiles::CarrierProfile,
     },
@@ -82,9 +90,15 @@ use crate::connectivity::modems::ims::{
 use super::{
     bearer::{
         configure_bearer_network, configure_bearer_network_in_worker, disconnect_bearer,
+<<<<<<< Updated upstream
         ensure_bearer_interface_ready, ensure_ims_bearer_observed, interface_still_holds_address,
         route_media_host, route_media_host_in_worker, route_pcscf, route_pcscf_in_worker,
         teardown_bearer_network, BearerAttempt, BearerConnection, BearerRequest,
+=======
+        ensure_bearer_interface_ready, ensure_ims_bearer_observed, route_media_host,
+        route_media_host_in_worker, route_pcscf, route_pcscf_in_worker, teardown_bearer_network,
+        BearerAttempt, BearerConnection, BearerRequest,
+>>>>>>> Stashed changes
     },
     channel::VolteSipChannel,
     data_slot::DataSlotMode,
@@ -464,10 +478,13 @@ struct VolteLiveSession {
     /// Runtime `P-Visited-Network-ID` derived from the currently registered
     /// PLMN. The home carrier profile remains unchanged while roaming.
     visited_network_header: Option<String>,
+<<<<<<< Updated upstream
     /// Serving-cell snapshot captured once for the REGISTER lifecycle. It is
     /// reused for authentication, refresh and unregister so one binding never
     /// changes identity halfway through an exchange.
     access_network: Option<ImsAccessNetworkContext>,
+=======
+>>>>>>> Stashed changes
     /// Operator-side RTP factory fixed when this session is created. It is
     /// intentionally immutable for the lifetime of a dialog so an access
     /// switch cannot move an established call to another UE.
@@ -949,10 +966,13 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             .supported_header
             .split(',')
             .any(|token| token.trim().eq_ignore_ascii_case("sec-agree"));
+<<<<<<< Updated upstream
     // PANI follows the profile's per-phase decision; an explicit omit (both
     // booleans false) suppresses the header even when MMTEL is advertised.
     let profile_includes_pani = profile.ims.register.include_pani_initial
         || profile.ims.register.include_pani_authenticated;
+=======
+>>>>>>> Stashed changes
     let primary = VolteRegisterVariant {
         label: profile.ims.register.live_header_variant_set,
         authorization,
@@ -983,16 +1003,24 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             advertise_sec_agree: false,
             require_sec_agree: false,
             proxy_require_sec_agree: false,
+<<<<<<< Updated upstream
             include_mmtel_features: profile.ims.register.include_mmtel_features,
             include_video_feature: false,
             include_route_header: profile.ims.register.include_route_header,
             include_visited_network: profile.ims.register.include_visited_network,
             include_access_network_info: profile_includes_pani,
             include_sip_instance: profile.ims.register.always_add_sip_instance,
+=======
+            include_mmtel_features: true,
+            include_video_feature: false,
+            include_route_header: true,
+            include_visited_network: profile.ims.register.include_visited_network,
+>>>>>>> Stashed changes
         },
         server_required_sec_agree: false,
         security_client_offer: VolteSecurityClientOffer::Full,
     };
+<<<<<<< Updated upstream
     let mut variants = vec![primary, fallback];
     // RFC 3455 §4.3.2.1 says a UA SHOULD NOT originate P-Visited-Network-ID.
     // Keep a single omission candidate for catalog rows that explicitly carry
@@ -1044,6 +1072,9 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
         });
     }
     variants
+=======
+    vec![primary, fallback]
+>>>>>>> Stashed changes
 }
 
 fn security_server_matches_profile(profile: &CarrierProfile, value: &str) -> bool {
@@ -1092,6 +1123,7 @@ struct VolteRegisterAuthenticator {
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
     visited_network_header: Option<String>,
+<<<<<<< Updated upstream
     access_network: Option<ImsAccessNetworkContext>,
     expires_seconds: u32,
     /// CSeq of the most recent REGISTER actually emitted by this exchange.
@@ -1106,6 +1138,9 @@ struct VolteRegisterAuthenticator {
     initial_authorization: Option<String>,
     /// Security-Client offered on the initial REGISTER, if any.
     initial_security_client: Option<String>,
+=======
+    expires_seconds: u32,
+>>>>>>> Stashed changes
     /// Optional per-line worker used for SIP/IPsec sockets. The parent still
     /// owns the bearer and AKA/QMI lifecycle; absence keeps the host path.
     worker: Option<UeWorkerHandle>,
@@ -1127,9 +1162,12 @@ impl VolteRegisterAuthenticator {
         profile: &'static CarrierProfile,
         effective_ims: EffectiveImsProfile,
         visited_network_header: Option<String>,
+<<<<<<< Updated upstream
         access_network: Option<ImsAccessNetworkContext>,
         initial_authorization: Option<String>,
         initial_security_client: Option<String>,
+=======
+>>>>>>> Stashed changes
         worker: Option<UeWorkerHandle>,
     ) -> Self {
         let last_cseq = ids.cseq;
@@ -1151,11 +1189,15 @@ impl VolteRegisterAuthenticator {
             profile,
             effective_ims,
             visited_network_header,
+<<<<<<< Updated upstream
             access_network,
             expires_seconds: profile.ims.register.expires_seconds,
             last_cseq,
             initial_authorization,
             initial_security_client,
+=======
+            expires_seconds: profile.ims.register.expires_seconds,
+>>>>>>> Stashed changes
             worker,
         }
     }
@@ -1410,8 +1452,12 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
+<<<<<<< Updated upstream
         self.last_cseq = ids.cseq;
         let request = sip::build_register_from_profile_with_target_visited_and_access(
+=======
+        Ok(sip::build_register_from_profile_with_target_and_visited(
+>>>>>>> Stashed changes
             self.profile,
             effective_register_target(&self.effective_ims),
             sip::RegisterPhase::Authenticated,
@@ -1423,6 +1469,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             prepared.security_client.as_deref(),
             prepared.security_verify.as_deref(),
             &self.sip_instance,
+<<<<<<< Updated upstream
             prepared.register_policy,
             self.visited_network_header.as_deref(),
             self.access_network.as_ref(),
@@ -1482,6 +1529,14 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 self.access_network.as_ref(),
             ),
         )
+=======
+            sip::RegisterRequestPolicy {
+                require_sec_agree: prepared.require_sec_agree,
+                ..self.register_policy
+            },
+            self.visited_network_header.as_deref(),
+        ))
+>>>>>>> Stashed changes
     }
 }
 
@@ -1652,7 +1707,11 @@ async fn connect_inner(
     generation: u64,
     device: &VolteDeviceBinding,
     mut plan: ImsConnectionPlan,
+<<<<<<< Updated upstream
     _line_ip_families_auto: bool,
+=======
+    line_ip_families_auto: bool,
+>>>>>>> Stashed changes
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     profile_store: &ProfileStore,
@@ -1680,6 +1739,7 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
+<<<<<<< Updated upstream
     let device_identity = load_device_identity(
         &device,
         runtime,
@@ -1691,6 +1751,22 @@ async fn connect_inner(
     // The line's ordered family list is authoritative. Catalog `ip_stack` is
     // profile metadata and must not reorder the default dual -> IPv6 -> IPv4
     // fallback sequence; only an explicit line setting changes that order.
+=======
+    let device_identity =
+        load_device_identity(&device, runtime, profile_store, sim_override).await?;
+    // A line's explicit order remains authoritative. The persisted default
+    // (`ipv4v6 -> ipv4 -> ipv6`) is the one case where the LTE catalog's
+    // `access.lte.ip_family` may provide a better first single-family hint;
+    // fallback still retains both families and is driven by network errors.
+    if line_ip_families_auto {
+        plan = plan.with_catalog_ip_stack_hint(&device_identity.effective_ims.ip_stack.value);
+        tracing::debug!(
+            ip_stack = %device_identity.effective_ims.ip_stack.value,
+            preference = ?plan.preference(),
+            "Applied LTE catalog IP-family hint to the default IMS plan"
+        );
+    }
+>>>>>>> Stashed changes
     let ims_apn = device_identity
         .effective_ims
         .ims_apn
@@ -2263,6 +2339,7 @@ async fn connect_family(
     } else {
         route_pcscf(bearer, pcscf).await?;
     }
+<<<<<<< Updated upstream
     // The policy rule that steers SIP onto this bearer is keyed on the source
     // address captured when the bearer settings were read. Maxis hands out a
     // fresh address on every IMS PDN activation, so if the bearer re-addressed
@@ -2279,6 +2356,8 @@ async fn connect_family(
             ),
         ));
     }
+=======
+>>>>>>> Stashed changes
     runtime
         .update(|state| {
             state.stage = VolteStage::RegisterInitial;
@@ -2372,6 +2451,10 @@ async fn connect_family(
             "Trying bounded VoLTE REGISTER interoperability candidate"
         );
         variant.policy.include_video_feature = video_capability_enabled;
+<<<<<<< Updated upstream
+=======
+        variant.policy.include_visited_network |= device_identity.visited_network_header.is_some();
+>>>>>>> Stashed changes
         let mut channel = if let Some(worker) = worker.as_ref() {
             match VolteSipChannel::bind_in_worker(route, worker, Some(&bearer.interface), None)
                 .await
@@ -2447,8 +2530,13 @@ async fn connect_family(
         );
         let initial_security_client = (profile.ims.register.sec_agree_mode != "disabled"
             && !profile.ims.register.security_client_mechanisms.is_empty())
+<<<<<<< Updated upstream
         .then_some(negotiated_security.clone());
         let initial = sip::build_register_from_profile_with_target_visited_and_access(
+=======
+        .then_some(negotiated_security.as_str());
+        let initial = sip::build_register_from_profile_with_target_and_visited(
+>>>>>>> Stashed changes
             profile,
             effective_register_target(&device_identity.effective_ims),
             sip::RegisterPhase::Initial,
@@ -2462,7 +2550,10 @@ async fn connect_family(
             &sip_instance,
             variant.policy,
             device_identity.visited_network_header.as_deref(),
+<<<<<<< Updated upstream
             access_network.as_ref(),
+=======
+>>>>>>> Stashed changes
         );
         log_volte_register_request_metadata(variant, &channel, &initial);
         runtime
@@ -2489,9 +2580,12 @@ async fn connect_family(
             profile,
             device_identity.effective_ims.clone(),
             device_identity.visited_network_header.clone(),
+<<<<<<< Updated upstream
             access_network.clone(),
             initial_authorization.clone(),
             initial_security_client,
+=======
+>>>>>>> Stashed changes
             socket_worker,
         );
         let registration = match run_register_observed(&mut channel, &initial, &mut authenticator)
@@ -2661,7 +2755,10 @@ async fn connect_family(
             profile,
             effective_ims: device_identity.effective_ims.clone(),
             visited_network_header: device_identity.visited_network_header.clone(),
+<<<<<<< Updated upstream
             access_network: authenticator.access_network,
+=======
+>>>>>>> Stashed changes
             media_operator_creator,
             voice_calls: HashMap::new(),
             mwi_subscription: None,
@@ -2738,7 +2835,11 @@ async fn unregister_live_session(
         require_sec_agree: security_verify.is_some(),
         ..session.register_variant.policy
     };
+<<<<<<< Updated upstream
     let request = sip::build_register_from_profile_with_target_visited_and_access(
+=======
+    let request = sip::build_register_from_profile_with_target_and_visited(
+>>>>>>> Stashed changes
         session.profile,
         effective_register_target(&session.effective_ims),
         sip::RegisterPhase::Refresh,
@@ -2752,7 +2853,10 @@ async fn unregister_live_session(
         &session.sip_instance,
         register_policy,
         session.visited_network_header.as_deref(),
+<<<<<<< Updated upstream
         session.access_network.as_ref(),
+=======
+>>>>>>> Stashed changes
     );
     let mut authenticator = VolteRegisterAuthenticator::new(
         session.identity.clone(),
@@ -2772,9 +2876,12 @@ async fn unregister_live_session(
         session.profile,
         session.effective_ims.clone(),
         session.visited_network_header.clone(),
+<<<<<<< Updated upstream
         session.access_network.clone(),
         initial_authorization,
         security_client,
+=======
+>>>>>>> Stashed changes
         None,
     )
     .with_expires_seconds(0);
@@ -3225,6 +3332,7 @@ async fn refresh_live_registration(
         )
         .await;
 
+<<<<<<< Updated upstream
     // A 423 negotiation on refresh may raise the accepted lease above the
     // profile default, so both the request and the fallback lease follow the
     // currently registered value (never below the profile floor).
@@ -3267,6 +3375,81 @@ async fn refresh_live_registration(
         let register_policy = sip::RegisterRequestPolicy {
             require_sec_agree,
             ..variant.policy
+=======
+    let mut ids = session.register_ids.clone();
+    ids.cseq = session.next_register_cseq;
+    let security_verify = session.channel.security_verify().map(str::to_string);
+    let require_sec_agree = security_verify.is_some();
+    let request_uri = sip::register_request_uri_with_target(
+        session.profile,
+        effective_register_target(&session.effective_ims),
+        &session.channel.route(),
+    );
+    let initial_authorization = session.register_variant.authorization.build(
+        &session.effective_ims.realm.value,
+        &session.identity,
+        &request_uri,
+    );
+    let register_policy = sip::RegisterRequestPolicy {
+        require_sec_agree,
+        ..session.register_variant.policy
+    };
+    let initial = sip::build_register_from_profile_with_target_and_visited(
+        session.profile,
+        effective_register_target(&session.effective_ims),
+        sip::RegisterPhase::Refresh,
+        &session.identity,
+        &session.channel.route(),
+        &ids,
+        session.profile.ims.register.expires_seconds,
+        initial_authorization.as_deref(),
+        None,
+        security_verify.as_deref(),
+        &session.sip_instance,
+        register_policy,
+        session.visited_network_header.as_deref(),
+    );
+    let mut authenticator = VolteRegisterAuthenticator::new(
+        session.identity.clone(),
+        ids.clone(),
+        session.sip_instance.clone(),
+        session.security_binding.clone(),
+        session
+            .register_variant
+            .security_client_offer
+            .build(session.security_binding, session.profile),
+        session.channel.route(),
+        session.device.clone(),
+        runtime.clone(),
+        true,
+        session.aka_aid.clone(),
+        register_policy,
+        session.profile,
+        session.effective_ims.clone(),
+        session.visited_network_header.clone(),
+        None,
+    );
+    let registration =
+        match run_register_observed(&mut session.channel, &initial, &mut authenticator).await {
+            Ok(registration) => registration,
+            Err(failure) => {
+                let loss_reason = RegistrationLossReason::from_register_failure(&failure);
+                let error = map_register_failure(&failure);
+                runtime
+                    .record_attempt(
+                        VolteStage::RegisterRefresh,
+                        Some(session.ip_family),
+                        "failed",
+                        Some(&error),
+                        None,
+                    )
+                    .await;
+                return VolteRefreshAttempt {
+                    outcome: RegistrationRefreshResult::RebuildAccess(loss_reason),
+                    error: Some(error),
+                };
+            }
+>>>>>>> Stashed changes
         };
         let initial = sip::build_register_from_profile_with_target_visited_and_access(
             session.profile,
@@ -5866,6 +6049,7 @@ async fn load_device_identity(
     };
     let registered_plmn =
         key_value(&modem, "modem.3gpp.operator-code").filter(|candidate| valid_plmn(candidate));
+<<<<<<< Updated upstream
     let registration_state =
         key_value(&modem, "modem.3gpp.registration-state").map(|state| state.to_ascii_lowercase());
     // The serving PLMN is subscription-owned evidence only when NAS explicitly
@@ -5882,11 +6066,21 @@ async fn load_device_identity(
         key_value(&sim, "sim.properties.operator-id"),
         key_value(&sim, "sim.properties.operator-identifier"),
         registered_home_plmn,
+=======
+    let mut home_plmn = [
+        key_value(&sim, "sim.properties.operator-code"),
+        key_value(&sim, "sim.properties.operator-id"),
+        key_value(&sim, "sim.properties.operator-identifier"),
+        registered_plmn.clone(),
+>>>>>>> Stashed changes
     ]
     .into_iter()
     .flatten()
     .find(|candidate| valid_home_plmn(&imsi, candidate));
+<<<<<<< Updated upstream
     let mut home_plmn = sim_home_plmn.clone();
+=======
+>>>>>>> Stashed changes
     let mut ef_ad_mnc_length = ef_ad_mnc_length;
     if home_plmn.is_none() && ef_ad_mnc_length.is_none() {
         if let Some(uim_identity) = read_uim_identity(device).await {
@@ -5895,10 +6089,17 @@ async fn load_device_identity(
             }
         }
     }
+<<<<<<< Updated upstream
     if home_plmn.is_none() {
         home_plmn = identity::resolve_home_plmn(
             &imsi,
             sim_home_plmn.as_deref(),
+=======
+    if home_plmn.is_none() && (ef_ad_mnc_length.is_some() || imsi.starts_with("460")) {
+        home_plmn = identity::resolve_home_plmn(
+            &imsi,
+            registered_plmn.as_deref(),
+>>>>>>> Stashed changes
             ef_ad_mnc_length.map(usize::from),
         )
         .ok()
@@ -5977,10 +6178,14 @@ async fn load_device_identity(
         &imsi,
         home_plmn.as_deref(),
         registered_plmn.as_deref(),
+<<<<<<< Updated upstream
         // The visited PLMN never changes the selected home IMS profile.  It is
         // exposed to SIP only for an explicit, carrier-tested exception;
         // standards-derived fallback leaves P-Visited-Network-ID to the P-CSCF.
         resolved.origin != ProfileOrigin::Derived && profile.ims.register.include_visited_network,
+=======
+        profile.ims.register.include_visited_network || resolved.origin == ProfileOrigin::Derived,
+>>>>>>> Stashed changes
     );
     let effective_device_identity = resolve_effective_device_identity(
         Some(sim_override),
@@ -5994,8 +6199,11 @@ async fn load_device_identity(
         ims_domain_source = ?effective_ims.domain.source,
         home_plmn = ?home_plmn,
         registered_plmn = ?registered_plmn,
+<<<<<<< Updated upstream
         registration_state = ?registration_state,
         roaming = home_plmn.as_deref().zip(registered_plmn.as_deref()).is_some_and(|(home, visited)| canonical_plmn(home) != canonical_plmn(visited)),
+=======
+>>>>>>> Stashed changes
         roaming_visited_network = ?visited_network_header,
         "Resolved native VoLTE carrier profile"
     );
@@ -6797,6 +7005,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn carrier_profile_failures_are_not_reported_as_sim_identity_failures() {
+        assert_eq!(
+            failure_stage(&VolteError::with_detail(
+                code::CARRIER_PROFILE_MISSING,
+                "home_plmn:46000:access:lte_epc:no_ready_profile",
+            )),
+            Some(VolteStage::CarrierProfile)
+        );
+        assert_eq!(
+            failure_stage(&VolteError::new(code::MM_IMSI_MISSING)),
+            Some(VolteStage::Identity)
+        );
+        for error_code in [
+            code::BEARER_NETDEV_RUNTIME_ERROR,
+            code::BEARER_NETDEV_NOT_UP,
+            code::BEARER_NETDEV_NOT_READY,
+        ] {
+            assert_eq!(
+                failure_stage(&VolteError::new(error_code)),
+                Some(VolteStage::IpConfig)
+            );
+        }
+    }
+
     fn register_variant(label: &str) -> VolteRegisterVariant {
         *VOLTE_REGISTER_VARIANTS
             .iter()
@@ -6944,7 +7177,10 @@ mod tests {
             profile,
             effective_ims: resolve_effective_ims_profile(profile, None),
             visited_network_header: None,
+<<<<<<< Updated upstream
             access_network: None,
+=======
+>>>>>>> Stashed changes
             media_operator_creator: None,
             voice_calls: HashMap::new(),
             mwi_subscription: None,
@@ -6966,7 +7202,11 @@ mod tests {
     fn production_register_variants_keep_a_generic_second_attempt() {
         let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         let variants = register_variants(&profile);
+<<<<<<< Updated upstream
         assert_eq!(variants.len(), 5);
+=======
+        assert_eq!(variants.len(), 2);
+>>>>>>> Stashed changes
         assert_eq!(
             variants[0].label,
             profile.ims.register.live_header_variant_set
@@ -6974,6 +7214,7 @@ mod tests {
         assert_eq!(variants[1].label, "generic_ims_register_fallback");
         assert_eq!(variants[1].authorization, VolteInitialAuthorization::None);
         assert!(!variants[1].policy.require_sec_agree);
+<<<<<<< Updated upstream
         assert_eq!(
             variants[2].label,
             "ims_features_aka_uri_first_no_visited_network"
@@ -7428,6 +7669,12 @@ mod tests {
     /// crashed the baseband -- see docs/QCM410_BAM_DMUX_MODEM_CRASH.md §10.
     #[test]
     fn no_allocation_selects_the_native_ims_bearer_backend() {
+=======
+    }
+
+    #[test]
+    fn bearer_backend_follows_the_selected_ims_endpoint() {
+>>>>>>> Stashed changes
         assert!(!native_ims_bearer_required(DataSlotMode::PrimaryImsOnly));
         assert!(!native_ims_bearer_required(
             DataSlotMode::PrimaryImsSecondaryData

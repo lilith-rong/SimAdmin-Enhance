@@ -10,10 +10,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+<<<<<<< Updated upstream
 use crate::{
     platform::{db::AppEventEntry, shutdown::ShutdownSignal},
     services::event_bus::AppEventBus,
 };
+=======
+use crate::{platform::db::AppEventEntry, services::event_bus::AppEventBus};
+>>>>>>> Stashed changes
 
 #[derive(Debug, Default, Deserialize)]
 pub struct EventStreamQuery {
@@ -55,10 +59,13 @@ struct EventStreamState {
     line_id: Option<String>,
     last_id: i64,
     replaying: bool,
+<<<<<<< Updated upstream
     /// Ends the stream when the process is going down. Without this the
     /// response never completes, and `with_graceful_shutdown` waits on it until
     /// the force-exit watchdog fires -- which skips every teardown path.
     shutdown: ShutdownSignal,
+=======
+>>>>>>> Stashed changes
 }
 
 fn event_matches_line(event: &AppEventEntry, line_id: Option<&str>) -> bool {
@@ -77,7 +84,10 @@ fn sse_event(event: AppEventEntry) -> Event {
 
 pub async fn stream_app_events(
     State(event_bus): State<Arc<AppEventBus>>,
+<<<<<<< Updated upstream
     State(shutdown): State<ShutdownSignal>,
+=======
+>>>>>>> Stashed changes
     Query(query): Query<EventStreamQuery>,
     headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -111,6 +121,7 @@ pub async fn stream_app_events(
         line_id,
         last_id,
         replaying: requested_after_id.is_some(),
+<<<<<<< Updated upstream
         shutdown,
     };
     let stream = stream::unfold(state, |mut state| async move {
@@ -121,6 +132,11 @@ pub async fn stream_app_events(
                 return None;
             }
 
+=======
+    };
+    let stream = stream::unfold(state, |mut state| async move {
+        loop {
+>>>>>>> Stashed changes
             if let Some(event) = state.pending.pop_front() {
                 if event.id <= state.last_id {
                     continue;
@@ -146,6 +162,7 @@ pub async fn stream_app_events(
                 }
             }
 
+<<<<<<< Updated upstream
             // `recv` on an idle bus parks indefinitely, so the shutdown signal
             // has to be raced against it rather than only polled around it.
             let received = tokio::select! {
@@ -155,6 +172,9 @@ pub async fn stream_app_events(
             };
 
             match received {
+=======
+            match state.receiver.recv().await {
+>>>>>>> Stashed changes
                 Ok(event) => {
                     if event.id <= state.last_id
                         || !event_matches_line(&event, state.line_id.as_deref())

@@ -95,6 +95,7 @@ fn spawn_runtime_event_bridge(app: AppState) {
             ticker.tick().await;
             for line in app.line_registry.all().await {
                 let line_id = line.binding().line_id;
+<<<<<<< Updated upstream
                 // This poller is one shared task, but everything it publishes in
                 // here describes a single line's UE. Scoping the body attributes
                 // those records to that UE instead of to the poller, which is
@@ -154,6 +155,59 @@ fn spawn_runtime_event_bridge(app: AppState) {
                     }
                 })
                 .await;
+=======
+                let volte = line.volte.snapshot().await;
+                let seen = seen_volte_attempts.entry(line_id.clone()).or_default();
+
+                for attempt in &volte.connection_attempts {
+                    let key = format!("{}:{}", attempt.sequence, attempt.at);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    if let Err(error) = app.event_bus.publish(
+                        "volte.connection_attempt",
+                        Some(&line_id),
+                        Some("volte_ims"),
+                        serde_json::json!({ "attempt": attempt }),
+                    ) {
+                        tracing::warn!(line_id, error = %error, "Failed to publish VoLTE connection event");
+                    }
+                    seen.push_back(key);
+                    while seen.len() > 200 {
+                        seen.pop_front();
+                    }
+                }
+
+                let trunk = line.trunk.status().await;
+                let fingerprint = serde_json::json!({
+                    "phase": &trunk.phase,
+                    "stage": &trunk.stage,
+                    "enabled": trunk.enabled,
+                    "registered": trunk.registered,
+                    "last_sip_status": trunk.last_sip_status,
+                    "last_error": &trunk.last_error,
+                    "register_attempts": trunk.register_attempts,
+                    "reconnect_count": trunk.reconnect_count,
+                    "active_calls": trunk.active_calls,
+                    "media_negotiations": trunk.media_negotiations,
+                    "video_negotiations": trunk.video_negotiations,
+                    "dtmf_events": trunk.dtmf_events,
+                })
+                .to_string();
+                let previous = trunk_fingerprints.insert(line_id.clone(), fingerprint.clone());
+                if previous.as_deref() != Some(&fingerprint)
+                    && (previous.is_some() || trunk.enabled || trunk.phase != "disabled")
+                {
+                    if let Err(error) = app.event_bus.publish(
+                        "trunk.status_changed",
+                        Some(&line_id),
+                        Some("trunk"),
+                        serde_json::to_value(&trunk).unwrap_or_else(|_| serde_json::json!({})),
+                    ) {
+                        tracing::warn!(line_id, error = %error, "Failed to publish Trunk status event");
+                    }
+                }
+>>>>>>> Stashed changes
             }
         }
     });
@@ -372,6 +426,7 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
     const STATE_DIR: &str = "/run/simadmin";
     const UDEV_RULE_PATH: &str = "/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules";
 
+<<<<<<< Updated upstream
     // Runs before the DATA6 gate on purpose. An older install may have left the
     // out-of-tree multi-port module loaded, and while it is loaded it keeps
     // auto-binding spare DATA*_CNTL channels at every boot -- which is what
@@ -382,17 +437,22 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         println!("secondary-qmi-init: removed the legacy multi-port RPMSG module");
     }
 
+=======
+>>>>>>> Stashed changes
     if !secondary_qmi::secondary_qmi_enabled() {
         // Do not enumerate, bind, probe, or open DATA6 on firmware where the
         // AT-labelled endpoint is known to take down the modem DSP.  The
         // ModemManager primary QMI bearer remains the supported IMS fallback.
         let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_STATE_FILE);
         let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_ENDPOINTS_STATE_FILE);
+<<<<<<< Updated upstream
         // Drop any rule from an earlier run: with DATA6 off, every port belongs
         // to ModemManager again and must not stay hidden.
         if write_udev_rule && !dry_run {
             reconcile_secondary_qmi_udev_rules(UDEV_RULE_PATH, &[]).await;
         }
+=======
+>>>>>>> Stashed changes
         println!("secondary-qmi-init: DATA6 disabled; using the ModemManager primary QMI bearer");
         if std::env::var_os("NOTIFY_SOCKET").is_some() {
             let _ = tokio::process::Command::new("systemd-notify")
@@ -938,6 +998,7 @@ async fn main() -> Result<()> {
         Arc::clone(&dbus_conn),
         Arc::clone(&app_db),
     ));
+<<<<<<< Updated upstream
     // On-disk diagnostic log. Created before the event bus so published events
     // can be mirrored to the file; the writer task owns the file and drains a
     // bounded queue, so a slow or full disk never blocks a request path.
@@ -946,6 +1007,9 @@ async fn main() -> Result<()> {
     let event_bus = Arc::new(
         AppEventBus::new(Arc::clone(&app_db)).with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
     );
+=======
+    let event_bus = Arc::new(AppEventBus::new(Arc::clone(&app_db)));
+>>>>>>> Stashed changes
     let system_event_emitter = Arc::new(SystemEventEmitter::new(
         Arc::clone(&notification_sender),
         Arc::clone(&event_bus),
@@ -1100,8 +1164,11 @@ async fn main() -> Result<()> {
 
     api::handlers::spawn_call_monitor(app_state.clone());
     spawn_runtime_event_bridge(app_state.clone());
+<<<<<<< Updated upstream
     spawn_trunk_sms_bridge(app_state.clone());
     spawn_modem_mt_sms_bridge(app_state.clone(), modem_mt_sms_rx);
+=======
+>>>>>>> Stashed changes
 
     // Restore only explicitly enabled per-line data and airplane-mode intents.
     {

@@ -12,19 +12,26 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::platform::db::{AppEventEntry, Database};
+<<<<<<< Updated upstream
 use crate::services::system::diagnostic_log::{self, DiagnosticLogSink};
+=======
+>>>>>>> Stashed changes
 use crate::services::system::system_event::SystemEvent;
 
 #[derive(Clone)]
 pub struct AppEventBus {
     database: Arc<Database>,
+<<<<<<< Updated upstream
     /// On-disk mirror of every published event, with the raw error string kept
     /// whole. Optional so tests and tools can build a bus without a writer.
     diagnostic_log: Option<Arc<DiagnosticLogSink>>,
+=======
+>>>>>>> Stashed changes
 }
 
 impl AppEventBus {
     pub fn new(database: Arc<Database>) -> Self {
+<<<<<<< Updated upstream
         Self {
             database,
             diagnostic_log: None,
@@ -35,6 +42,9 @@ impl AppEventBus {
     pub fn with_diagnostic_log(mut self, sink: Arc<DiagnosticLogSink>) -> Self {
         self.diagnostic_log = Some(sink);
         self
+=======
+        Self { database }
+>>>>>>> Stashed changes
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<AppEventEntry> {
@@ -56,6 +66,7 @@ impl AppEventBus {
         Ok(self.database.get_recent_app_events(line_id, limit)?)
     }
 
+<<<<<<< Updated upstream
     /// Publish an event to the durable outbox, the in-process broadcast channel,
     /// and the on-disk diagnostic log.
     ///
@@ -63,6 +74,8 @@ impl AppEventBus {
     /// because the main/UE-worker attribution comes from a task-local: a
     /// downstream subscriber runs in its own task and would label every record
     /// `main`, however the event was produced.
+=======
+>>>>>>> Stashed changes
     pub fn publish(
         &self,
         event_type: &str,
@@ -70,11 +83,14 @@ impl AppEventBus {
         transport: Option<&str>,
         payload: serde_json::Value,
     ) -> Result<i64> {
+<<<<<<< Updated upstream
         if let Some(sink) = &self.diagnostic_log {
             sink.record(diagnostic_log::record_for_app_event(
                 event_type, line_id, transport, &payload,
             ));
         }
+=======
+>>>>>>> Stashed changes
         Ok(self.database.insert_app_event(
             event_type,
             line_id,

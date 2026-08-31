@@ -645,6 +645,7 @@ fn worker_host_route_op(
         .settings
         .local_addr_for_family(host)
         .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+<<<<<<< Updated upstream
     let via = bearer
         .settings
         .gateway_for_family(host)
@@ -652,6 +653,11 @@ fn worker_host_route_op(
     Ok(NetConfigOp::RouteReplace {
         target: host_selector(host),
         via,
+=======
+    Ok(NetConfigOp::RouteReplace {
+        target: host_selector(host),
+        via: None,
+>>>>>>> Stashed changes
         dev: Some(bearer.interface.clone()),
         src: Some(source.to_string()),
         table: None,
@@ -679,6 +685,7 @@ async fn apply_worker_ops(
 
 /// Ensure that the kernel data path is usable before installing policy routes.
 ///
+<<<<<<< Updated upstream
 /// ModemManager reports a connected QMI bearer before the netdev has necessarily
 /// completed its remote OPEN handshake, so one administrative UP plus polling is
 /// the portable part of this function.
@@ -689,10 +696,18 @@ async fn apply_worker_ops(
 /// used to be hard-coded here, which made a generic IMS path assert something
 /// true of exactly one SoC and left other hardware nowhere to describe its own
 /// firmware defects. See `hardware/devices/baseband_faults.rs`.
+=======
+/// ModemManager reports a connected QMI bearer before the bam-dmux netdev has
+/// necessarily completed its remote OPEN handshake. On Qualcomm SoCs an
+/// administrative OPEN can also fail with EINVAL when the driver's runtime-PM
+/// state is already `error`; continuing in that state only turns the real
+/// failure into a misleading route error and can race the modem firmware.
+>>>>>>> Stashed changes
 pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(), VolteError> {
     if interface_is_up(interface).await {
         return Ok(());
     }
+<<<<<<< Updated upstream
     let faults = crate::hardware::devices::baseband_faults::detected_fault_policy();
     let latched_error = |interface: &str, when: &str| {
         let fault = faults.inspect_data_interface(interface);
@@ -708,11 +723,23 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
 
     // One administrative UP is one remote OPEN request. Never issue several
     // OPENs in a readiness loop: duplicate requests can race the modem
+=======
+    if bam_dmux_runtime_is_error(interface) {
+        return Err(VolteError::with_detail(
+            code::BEARER_NETDEV_RUNTIME_ERROR,
+            format!("interface={interface}: runtime_status=error before OPEN"),
+        ));
+    }
+
+    // One administrative UP is one remote bam-dmux OPEN request. Never issue
+    // several OPENs in a readiness loop: duplicate requests can race the modem
+>>>>>>> Stashed changes
     // firmware. Polling below only observes the result of this single request.
     if let Err(error) = run_ip(&["link", "set", "dev", interface, "up"]).await {
         if interface_is_up(interface).await {
             return Ok(());
         }
+<<<<<<< Updated upstream
         return Err(
             if !faults.inspect_data_interface(interface).permits_bring_up() {
                 latched_error(interface, &error.to_string())
@@ -723,14 +750,35 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
                 )
             },
         );
+=======
+        return Err(if bam_dmux_runtime_is_error(interface) {
+            VolteError::with_detail(
+                code::BEARER_NETDEV_RUNTIME_ERROR,
+                format!("interface={interface}: {error}"),
+            )
+        } else {
+            VolteError::with_detail(
+                code::BEARER_NETDEV_NOT_UP,
+                format!("interface={interface}: {error}"),
+            )
+        });
+>>>>>>> Stashed changes
     }
 
     for attempt in 0..4 {
         if interface_is_up(interface).await {
             return Ok(());
         }
+<<<<<<< Updated upstream
         if !faults.inspect_data_interface(interface).permits_bring_up() {
             return Err(latched_error(interface, "runtime_status=error after OPEN"));
+=======
+        if bam_dmux_runtime_is_error(interface) {
+            return Err(VolteError::with_detail(
+                code::BEARER_NETDEV_RUNTIME_ERROR,
+                format!("interface={interface}: runtime_status=error after OPEN"),
+            ));
+>>>>>>> Stashed changes
         }
         if attempt < 3 {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -770,6 +818,7 @@ fn link_output_is_up(output: &str) -> bool {
     })
 }
 
+<<<<<<< Updated upstream
 /// Confirm the address the policy routing was built around is still the one on
 /// the interface.
 ///
@@ -805,6 +854,20 @@ fn addr_output_contains(output: &str, address: IpAddr) -> bool {
                 })
             })
     })
+=======
+fn bam_dmux_runtime_is_error(interface: &str) -> bool {
+    // The WWAN class exposes the owning bam-dmux power state through the
+    // interface's device symlink, so this remains correct for other remoteproc
+    // addresses and does not hard-code a platform path.
+    std::fs::read_to_string(format!(
+        "/sys/class/net/{interface}/device/power/runtime_status"
+    ))
+    .is_ok_and(|status| runtime_status_is_error(&status))
+}
+
+fn runtime_status_is_error(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("error")
+>>>>>>> Stashed changes
 }
 
 async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
@@ -884,19 +947,34 @@ async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result
     let destination = host_selector(host);
     let family = if host.is_ipv6() { Some("-6") } else { None };
     let table = table.to_string();
+<<<<<<< Updated upstream
     let gateway = bearer
         .settings
         .gateway_for_family(host)
         .map(|gateway| gateway.to_string());
+=======
+>>>>>>> Stashed changes
     let mut args = Vec::new();
     if let Some(family) = family {
         args.push(family);
     }
+<<<<<<< Updated upstream
     args.extend_from_slice(&["route", "replace", &destination]);
     if let Some(gateway) = gateway.as_deref() {
         args.extend_from_slice(&["via", gateway]);
     }
     args.extend_from_slice(&["dev", &bearer.interface, "table", &table]);
+=======
+    args.extend_from_slice(&[
+        "route",
+        "replace",
+        &destination,
+        "dev",
+        &bearer.interface,
+        "table",
+        &table,
+    ]);
+>>>>>>> Stashed changes
     run_ip(&args).await.map(|_| ())
 }
 
@@ -1206,9 +1284,18 @@ mod tests {
         assert!(!link_output_is_up("not-json"));
     }
 
+<<<<<<< Updated upstream
     // Runtime-PM latch detection moved to
     // hardware/devices/qcm410/baseband_faults.rs, which owns both the sysfs
     // parsing and its tests. This module is platform-agnostic again.
+=======
+    #[test]
+    fn runtime_pm_error_detection_is_trimmed_and_case_insensitive() {
+        assert!(runtime_status_is_error("error\n"));
+        assert!(runtime_status_is_error(" ERROR "));
+        assert!(!runtime_status_is_error("active\n"));
+    }
+>>>>>>> Stashed changes
 
     #[test]
     fn default_request_uses_ims_apn() {
